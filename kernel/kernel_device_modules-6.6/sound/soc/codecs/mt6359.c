@@ -491,6 +491,58 @@ static int dmic_used_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
+/*
+ * The 4.19-era audio HAL on this device switches the mic input type at
+ * record time through the "Mic_Type_Mux_0/1/2" mixer controls (internal
+ * mics DCC; headset mic DCC_ECM_SINGLE behind accdet).  This BSP dropped
+ * the controls -- the type now comes only from DT, and this board's
+ * top-level mt6359_snd node carries neither mediatek,mic-type nor
+ * mediatek,dmic-mode, so every mux sits on the DCC default and the HAL's
+ * writes fail silently.  Restore them with the 4.19 names and semantics:
+ * they only write priv->mux_select[], whose value the capture DAPM
+ * events turn into the analog register sequence, and whose DT-derived
+ * default (DCC) is what the internal mics need anyway.
+ */
+static const char * const mic_type_mux_map[] = {
+	"Idle", "ACC", "DMIC", "DCC", "DCC_ECM_DIFF", "DCC_ECM_SINGLE",
+};
+
+static const struct soc_enum mic_type_mux_enum[] = {
+	SOC_ENUM_SINGLE_EXT(ARRAY_SIZE(mic_type_mux_map), mic_type_mux_map),
+};
+
+static int mic_type_get(struct snd_kcontrol *kcontrol,
+			struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *cmpnt = snd_soc_kcontrol_component(kcontrol);
+	struct mt6359_priv *priv = snd_soc_component_get_drvdata(cmpnt);
+
+	ucontrol->value.enumerated.item[0] =
+		priv->mux_select[kcontrol->id.device];
+
+	return 0;
+}
+
+static int mic_type_set(struct snd_kcontrol *kcontrol,
+			struct snd_ctl_elem_value *ucontrol)
+{
+	struct snd_soc_component *cmpnt = snd_soc_kcontrol_component(kcontrol);
+	struct mt6359_priv *priv = snd_soc_component_get_drvdata(cmpnt);
+	struct soc_enum *e = (struct soc_enum *)kcontrol->private_value;
+
+	dev_info(cmpnt->dev, "%s(), id %d, index %u\n",
+		 __func__, kcontrol->id.device,
+		 ucontrol->value.enumerated.item[0]);
+
+	if (ucontrol->value.enumerated.item[0] >= e->items)
+		return -EINVAL;
+
+	priv->mux_select[kcontrol->id.device] =
+		ucontrol->value.enumerated.item[0];
+
+	return 0;
+}
+
 #if IS_ENABLED(CONFIG_MTK_VOW_SUPPORT)
 
 static int vow_pbuf_ch_get(struct snd_kcontrol *kcontrol,
@@ -664,6 +716,20 @@ static const struct snd_kcontrol_new mt6359_snd_controls[] = {
 	SOC_SINGLE_EXT_TLV("PGA3 Volume",
 			   MT6359_AUDENC_ANA_CON2, RG_AUDPREAMP3GAIN_SFT, 4, 0,
 			   snd_soc_get_volsw, mt6359_put_volsw, capture_tlv),
+
+	/* 4.19 HAL compat; the .device field carries the MUX_MIC_TYPE_x id */
+	{.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Mic_Type_Mux_0",
+	 .device = MUX_MIC_TYPE_0, .info = snd_soc_info_enum_double,
+	 .get = mic_type_get, .put = mic_type_set,
+	 .private_value = (unsigned long)&mic_type_mux_enum[0]},
+	{.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Mic_Type_Mux_1",
+	 .device = MUX_MIC_TYPE_1, .info = snd_soc_info_enum_double,
+	 .get = mic_type_get, .put = mic_type_set,
+	 .private_value = (unsigned long)&mic_type_mux_enum[0]},
+	{.iface = SNDRV_CTL_ELEM_IFACE_MIXER, .name = "Mic_Type_Mux_2",
+	 .device = MUX_MIC_TYPE_2, .info = snd_soc_info_enum_double,
+	 .get = mic_type_get, .put = mic_type_set,
+	 .private_value = (unsigned long)&mic_type_mux_enum[0]},
 };
 
 /* LOL MUX */
