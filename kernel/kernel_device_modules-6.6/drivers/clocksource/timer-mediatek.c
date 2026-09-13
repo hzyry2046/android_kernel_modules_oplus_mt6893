@@ -23,6 +23,19 @@
 #define CREATE_TRACE_POINTS
 #include "timer-mediatek-trace.h"
 
+/*
+ * op6893: mtk_timer_match_table carries these as .data and is plain rodata, so
+ * in the MODULE build a deferred probe would call them after module init text
+ * has been freed.  Our systimer's only clock is a DT fixed-clock, so it does
+ * not actually defer -- but the section mismatch is real and a boot crash here
+ * costs a flash cycle.  The built-in path keeps __init.
+ */
+#ifdef MODULE
+#define __timer_init
+#else
+#define __timer_init __init
+#endif
+
 #define TIMER_CLK_EVT           (1)
 #define TIMER_CLK_SRC           (2)
 
@@ -293,7 +306,7 @@ static struct timer_of to = {
 	},
 };
 
-static int __init mtk_syst_init(struct device_node *node)
+static int __timer_init mtk_syst_init(struct device_node *node)
 {
 	int ret;
 
@@ -315,7 +328,7 @@ static int __init mtk_syst_init(struct device_node *node)
 }
 
 #ifndef MODULE
-static int __init mtk_gpt_init(struct device_node *node)
+static int __timer_init mtk_gpt_init(struct device_node *node)
 {
 	int ret;
 
