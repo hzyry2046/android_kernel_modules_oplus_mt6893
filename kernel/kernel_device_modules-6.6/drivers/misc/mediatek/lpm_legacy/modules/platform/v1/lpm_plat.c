@@ -12,6 +12,8 @@
 #include <lpm_module.h>
 #include "lpm_plat.h"
 #include "lpm_plat_suspend.h"
+/* op6893 6.6 bring-up: see idles/lpm_mcusys.c. */
+#include "idles/lpm_mcusys.h"
 
 static unsigned int lpm_pwr_state;
 
@@ -65,6 +67,15 @@ static int __init lpm_late_initcall(void)
 {
 	lpm_plat_apmcu_init();
 	lpm_model_suspend_init();
+	/*
+	 * op6893 6.6 bring-up: after apmcu_init, which is what sets up the
+	 * per-core/per-cluster bookkeeping the model reads through
+	 * lpm_plat_is_mcusys_off().  Non-fatal: without the model the idle
+	 * path is exactly what it was before, MCUSYS-off requested and
+	 * silently serviced shallower.
+	 */
+	if (lpm_model_mcusys_init())
+		pr_notice("[name:mtk_lpm][P] - mcusys idle model not registered\n");
 
 	cpuidle_pause_and_lock();
 	lpm_smc_cpu_pm(VALIDATE_PWR_STATE_CTRL, MT_LPM_SMC_ACT_SET,
@@ -106,6 +117,7 @@ lpm_plat_init_fail:
 
 static void __exit lpm_plat_exit(void)
 {
+	lpm_model_mcusys_deinit();
 }
 
 module_init(lpm_plat_init);
