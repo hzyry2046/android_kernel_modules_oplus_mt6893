@@ -73,6 +73,7 @@ static u64 lpm_mcusys_dbg_last_ns;
 static unsigned int lpm_mcusys_dbg_min = UINT_MAX;
 static unsigned long lpm_mcusys_in_mask;
 static unsigned long lpm_mcusys_miss_mask;
+static unsigned int lpm_mcusys_dbg_lastcore;
 
 static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
 			   unsigned int status)
@@ -118,6 +119,33 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 
 	smc_res = lpm_smc_cpu_pm(MCUSYS_STATUS, MT_LPM_SMC_ACT_GET,
 				 MCUSYS_STATUS_PDN, 0);
+
+	/*
+	 * op6893 bring-up: the one line we have never managed to read.
+	 *
+	 * Everything else about this state is now understood -- with the
+	 * tick-broadcast device in place the count does reach 0, and cluster
+	 * power-down went from never to 649170 -- but the machine hangs on the
+	 * first real MCUSYS-off and the watchdog resets it, so the interesting
+	 * moment is also the last one.  The 5 s rate limit below has meant that
+	 * in every run so far this branch executed and printed nothing: `min`
+	 * dropped to 0 unseen and the sampled line still said min=1.
+	 *
+	 * smc_res is the MT_RM_CONSTRAINT_ALLOW_* mask ATF's resource manager
+	 * answers with.  4.19 services every MCUSYS-off under a constraint
+	 * (rc/state count:823, all of it cpu-buck-ldo) and wakes via SPM's
+	 * R12_SYS_TIMER_EVENT_B; ours reports count:0.  If smc_res is 0 here
+	 * then ATF is allowing no constraint at all, which would mean it powers
+	 * MCUSYS down without SPM being programmed to wake it -- exactly the
+	 * observed hang.  Unconditional for the first few, because console
+	 * ramoops survives the hang and a rate-limited line does not.
+	 */
+	if (lpm_mcusys_dbg_lastcore < 20) {
+		lpm_mcusys_dbg_lastcore++;
+		pr_info("[name:mtk_lpm][P] - mcusys LAST CORE #%u cpu=%d smc_res=0x%x in=0x%lx online=0x%lx\n",
+			lpm_mcusys_dbg_lastcore, cpu, smc_res,
+			lpm_mcusys_in_mask, cpumask_bits(cpu_online_mask)[0]);
+	}
 
 	/*
 	 * Deepest allowance first -- these are ordered, not a bitmask test in
