@@ -631,6 +631,24 @@ static int __init lpm_init(void)
 					lpm_system.suspend.flag &=
 					(~LPM_REQ_NOSYSCORE_CB);
 				}
+			/*
+			 * op6893 6.6 bring-up: this board's preserved 4.19 DTB
+			 * says suspend-method = "s2idle".  That is the 4.19
+			 * vocabulary -- mtk_lpm_module.c took "s2idle" and
+			 * "system" and named the syscore behaviour directly,
+			 * where this version takes only "enable" and decides
+			 * from pm_suspend_default_s2idle() instead.  Falling
+			 * through to the else below would set NOSUSPEND, which
+			 * takes a permanent wakeup source ("device not support
+			 * kernel suspend") and stops the phone suspending at
+			 * all.  Keep accepting both old spellings.
+			 */
+			} else if (!strcmp(pMethod, "s2idle")) {
+				lpm_system.suspend.flag |=
+						LPM_REQ_NOSYSCORE_CB;
+			} else if (!strcmp(pMethod, "system")) {
+				lpm_system.suspend.flag &=
+						(~LPM_REQ_NOSYSCORE_CB);
 			} else {
 				lpm_system.suspend.flag |=
 						LPM_REQ_NOSUSPEND;
