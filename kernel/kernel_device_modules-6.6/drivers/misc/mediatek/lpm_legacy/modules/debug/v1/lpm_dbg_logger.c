@@ -34,6 +34,13 @@
 
 #define LPM_LOG_DEFAULT_MS		5000
 
+/*
+ * op6893 6.6 bring-up: what logger-enable-states falls back to when the DT
+ * does not carry it.  MTK's own mt6781.dts, mt6833.dts and mt6853.dtsi all say
+ * logger-enable-states = "mcusysoff" with mcusys-cnt-chk = <1>.
+ */
+#define LPM_LOGGER_DEFAULT_STATE	"mcusysoff"
+
 #define PCM_32K_TICKS_PER_SEC		(32768)
 #define PCM_TICK_TO_SEC(TICK)	(TICK / PCM_32K_TICKS_PER_SEC)
 
@@ -331,8 +338,26 @@ int lpm_logger_init(void)
 	if (drv && node) {
 		state_cnt = of_property_count_strings(node,
 				"logger-enable-states");
-		if (state_cnt)
-			info->state_name =
+		/*
+		 * op6893 6.6 bring-up: of_property_count_strings() returns
+		 * -EINVAL when the property is absent, and the original
+		 * `if (state_cnt)' reads that as a count -- so it allocated,
+		 * the loop below then iterated over a property that is not
+		 * there, logger_en_state stayed 0, and lpm_log_timer_func()
+		 * printed "LPM didn't enter low power scenario" every period
+		 * forever, whatever the hardware was actually doing.  Our
+		 * preserved 4.19 DTB has neither logger-enable-states nor
+		 * mcusys-cnt-chk.  MTK's own mt6781, mt6833 and mt6853 DTs all
+		 * spell the pair the same way, so fall back to that rather
+		 * than logging a fixed untruth.
+		 */
+		if (state_cnt < 0)
+			state_cnt = 0;
+		if (!state_cnt)
+			pr_info("[%s:%d] no logger-enable-states, defaulting to \"%s\"\n",
+				__func__, __LINE__, LPM_LOGGER_DEFAULT_STATE);
+
+		info->state_name =
 			kcalloc(1, sizeof(char *)*(drv->state_count),
 			GFP_KERNEL);
 
@@ -342,9 +367,18 @@ int lpm_logger_init(void)
 		for (idx = 0; idx < drv->state_count; idx++) {
 
 			if (!state_cnt) {
-				pr_info("[%s:%d] no logger-enable-states\n",
-						__func__, __LINE__);
-				break;
+				if (strcmp(LPM_LOGGER_DEFAULT_STATE,
+						drv->states[idx].name))
+					continue;
+				info->logger_en_state |= (1 << idx);
+				info->state_name[idx] =
+					kstrdup(drv->states[idx].name,
+						GFP_KERNEL);
+				if (!info->state_name[idx]) {
+					kfree(info->state_name);
+					return -ENOMEM;
+				}
+				continue;
 			}
 
 			of_property_for_each_string(node,
@@ -371,8 +405,9 @@ int lpm_logger_init(void)
 			}
 		}
 
-		of_property_read_u32(node, "mcusys-cnt-chk",
-					&info->mcusys_cnt_chk);
+		if (of_property_read_u32(node, "mcusys-cnt-chk",
+					&info->mcusys_cnt_chk) && !state_cnt)
+			info->mcusys_cnt_chk = 1;
 	}
 
 	if (node)
