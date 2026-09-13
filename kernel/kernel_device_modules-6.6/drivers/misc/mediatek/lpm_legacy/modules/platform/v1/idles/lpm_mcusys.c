@@ -59,14 +59,28 @@ static unsigned int lpm_mcusys_status;
  * resource manager refused everything, which would fit the SPM side reporting
  * spmfw ready: 0.  Rate-limited to one line per 5 s: this is the idle path.
  * Drop this once the answer is in.
+ *
+ * Measured with the counter alone: min settles at 1 within seconds of enabling
+ * the state and never once reaches 0, over hundreds of seconds and thousands
+ * of entries, and it stays at 1 even with cores taken offline (which makes
+ * cpuhp recompute the count).  That is one slot held permanently rather than a
+ * rendezvous the eight cores keep missing by luck -- so the useful question is
+ * no longer "how close does it get" but "which core is it".  in_mask is the
+ * set of cores currently inside mcusysoff, maintained under the same
+ * lpm_mod_locker that serialises prompt and reflect; miss_mask is the set that
+ * was still out at the moment the floor was reached.  A miss_mask that names
+ * the same core every time is a stuck slot; one that wanders is scheduling.
  */
 static u64 lpm_mcusys_dbg_last_ns;
 static unsigned int lpm_mcusys_dbg_min = UINT_MAX;
+static unsigned long lpm_mcusys_in_mask;
+static unsigned long lpm_mcusys_miss_mask;
 
 static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
 			   unsigned int status)
 {
 	unsigned int cnt = lpm_plat_mcusys_pwr_cnt();
+	unsigned long online = cpumask_bits(cpu_online_mask)[0];
 	u64 now;
 
 	/*
@@ -76,15 +90,18 @@ static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
 	 * the eight cores are simply never all in mcusysoff at once, which is
 	 * a scheduling problem and not a plumbing one.
 	 */
-	if (cnt < lpm_mcusys_dbg_min)
+	if (cnt <= lpm_mcusys_dbg_min) {
 		lpm_mcusys_dbg_min = cnt;
+		lpm_mcusys_miss_mask = online & ~lpm_mcusys_in_mask;
+	}
 
 	now = sched_clock();
 	if (now - lpm_mcusys_dbg_last_ns <= MCUSYS_DUMP_INFO_INTERVAL_NS)
 		return;
 	lpm_mcusys_dbg_last_ns = now;
-	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d cnt=%u min=%u smc_res=0x%x status=0x%x\n",
-		last_core, cnt, lpm_mcusys_dbg_min, smc_res, status);
+	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d cnt=%u min=%u in=0x%lx miss=0x%lx online=0x%lx smc_res=0x%x status=0x%x\n",
+		last_core, cnt, lpm_mcusys_dbg_min, lpm_mcusys_in_mask,
+		lpm_mcusys_miss_mask, online, smc_res, status);
 }
 
 static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
@@ -93,6 +110,7 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	unsigned int mcusys_status;
 
 	lpm_plat_set_mcusys_off(cpu);
+	lpm_mcusys_in_mask |= BIT(cpu);
 
 	/* Only the last core into idle can speak for the whole MCUSYS. */
 	if (!lpm_plat_is_mcusys_off()) {
@@ -151,6 +169,7 @@ static void lpm_mcusys_reflect(int cpu, const struct lpm_issuer *issuer)
 			}
 		}
 	}
+	lpm_mcusys_in_mask &= ~BIT(cpu);
 	lpm_plat_clr_mcusys_off(cpu);
 }
 
