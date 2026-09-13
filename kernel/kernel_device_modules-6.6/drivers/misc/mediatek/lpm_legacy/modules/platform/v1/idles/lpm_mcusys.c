@@ -61,17 +61,30 @@ static unsigned int lpm_mcusys_status;
  * Drop this once the answer is in.
  */
 static u64 lpm_mcusys_dbg_last_ns;
+static unsigned int lpm_mcusys_dbg_min = UINT_MAX;
 
 static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
 			   unsigned int status)
 {
-	u64 now = sched_clock();
+	unsigned int cnt = lpm_plat_mcusys_pwr_cnt();
+	u64 now;
 
+	/*
+	 * Track the floor on every call, not just the ones we print: the
+	 * whole question is whether the count ever gets close to 0.  Stuck at
+	 * the core count means nothing is decrementing; reaching 1 or 2 means
+	 * the eight cores are simply never all in mcusysoff at once, which is
+	 * a scheduling problem and not a plumbing one.
+	 */
+	if (cnt < lpm_mcusys_dbg_min)
+		lpm_mcusys_dbg_min = cnt;
+
+	now = sched_clock();
 	if (now - lpm_mcusys_dbg_last_ns <= MCUSYS_DUMP_INFO_INTERVAL_NS)
 		return;
 	lpm_mcusys_dbg_last_ns = now;
-	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d smc_res=0x%x status=0x%x\n",
-		last_core, smc_res, status);
+	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d cnt=%u min=%u smc_res=0x%x status=0x%x\n",
+		last_core, cnt, lpm_mcusys_dbg_min, smc_res, status);
 }
 
 static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)

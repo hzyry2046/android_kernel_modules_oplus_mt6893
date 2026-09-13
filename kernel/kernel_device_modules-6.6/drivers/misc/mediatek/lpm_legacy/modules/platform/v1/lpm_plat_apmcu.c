@@ -186,6 +186,13 @@ bool lpm_plat_is_mcusys_off(void)
 	return !lp_dev_mcusys.pwr_on.mcusys;
 }
 
+/* op6893 6.6 bring-up diagnostic -- see the header. */
+unsigned int lpm_plat_mcusys_pwr_cnt(void)
+{
+	return lp_dev_mcusys.pwr_on.mcusys;
+}
+EXPORT_SYMBOL(lpm_plat_mcusys_pwr_cnt);
+
 bool lpm_plat_is_cluster_off(int cpu)
 {
 	if (unlikely(cpu < 0 || cpu >= nr_cpu_ids || !lp_dev_cpu[cpu].parent))

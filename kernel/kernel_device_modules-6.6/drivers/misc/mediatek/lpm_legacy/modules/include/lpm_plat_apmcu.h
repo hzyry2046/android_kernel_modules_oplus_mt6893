@@ -46,6 +46,14 @@ void lpm_plat_clr_cluster_off(int cpu);
 
 bool lpm_plat_is_mcusys_off(void);
 bool lpm_plat_is_cluster_off(int cpu);
+/*
+ * op6893 6.6 bring-up: the raw MCUSYS power-on count, for diagnostics only.
+ * lpm_plat_is_mcusys_off() is just "this is 0", and when it never becomes 0
+ * there is no way from outside to tell a count stuck high (nothing is
+ * decrementing) from one that simply never reaches the floor (the eight cores
+ * are never all in mcusysoff at the same instant).
+ */
+unsigned int lpm_plat_mcusys_pwr_cnt(void);
 
 int lpm_plat_apmcu_init(void);
 int lpm_plat_apmcu_early_init(void);
