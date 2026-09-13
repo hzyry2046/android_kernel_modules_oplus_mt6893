@@ -26,9 +26,8 @@
  *
  * This is a port of the 4.19 file to the lpm_legacy API names.  The logic is
  * unchanged: on the last core in, ask ATF what the resource manager will allow
- * and set the matching PLAT_* status, and on the way out clear it.  The
- * issuer->log() in reflect is what produced 4.19's familiar
- * "[SPM] MCUSYSOFF wake up by ..." line.
+ * and set the matching PLAT_* status, and on the way out clear it.  Reporting
+ * is NOT this file's job -- see the comment above lpm_mcusys_reflect().
  */
 
 #include <linux/cpuidle.h>
@@ -44,10 +43,9 @@
 #include "lpm_plat.h"
 #include "lpm_plat_comm.h"
 
-/* Rate-limit the issuer log the same way 4.19 did: one line per 5 s. */
+/* Rate-limit for the bring-up diagnostic below: one line per 5 s. */
 #define MCUSYS_DUMP_INFO_INTERVAL_NS	5000000000ULL
 
-static u64 lpm_mcusysoff_last_ns;
 static unsigned int lpm_mcusys_status;
 
 /*
@@ -152,22 +150,31 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	return 0;
 }
 
+/*
+ * Deliberately does NOT call issuer->log().  An earlier version of this file
+ * did, and it crashed the device the first time a MCUSYS-off actually
+ * succeeded:
+ *
+ *   Unable to handle kernel NULL pointer dereference at virtual address 8
+ *   pc : lpm_show_message+0xcc [mtk_lpm_dbg_mt6893_legacy]
+ *
+ * -- because lpm_show_message() starts with
+ * `((struct lpm_issuer *)data)->log_type`, so the issuer has to be passed as
+ * `data`, and we passed NULL.  But the argument was not the real mistake: the
+ * whole call was.  lpm_dbg_logger.c already owns this, from its own 5 s timer
+ * in lpm_log_timer_func(): it compares the SYSRAM MCUSYS counter against the
+ * previous sample, sets issuer.log_type (LOG_MCUSYS_NOT_OFF when it did not
+ * move), and calls issuer.log(LPM_ISSUER_CPUIDLE, state_name, &issuer).  That
+ * is what emits 4.19's "[SPM] MCUSYSOFF wake up by ..." line -- not this
+ * function.  And reflect is the wrong place for it regardless: it runs under
+ * lpm_mod_locker with interrupts off, while lpm_show_message() formats the
+ * best part of a kilobyte.
+ */
 static void lpm_mcusys_reflect(int cpu, const struct lpm_issuer *issuer)
 {
-	if (lpm_plat_is_mcusys_off()) {
-		if (lpm_mcusys_status) {
-			lpm_do_mcusys_prepare_on();
-			lpm_mcusys_status = 0;
-		}
-		if (issuer) {
-			u64 delta_ns = sched_clock() - lpm_mcusysoff_last_ns;
-
-			if (delta_ns > MCUSYS_DUMP_INFO_INTERVAL_NS) {
-				issuer->log(LPM_ISSUER_CPUIDLE,
-					    "MCUSYSOFF", NULL);
-				lpm_mcusysoff_last_ns = sched_clock();
-			}
-		}
+	if (lpm_plat_is_mcusys_off() && lpm_mcusys_status) {
+		lpm_do_mcusys_prepare_on();
+		lpm_mcusys_status = 0;
 	}
 	lpm_mcusys_in_mask &= ~BIT(cpu);
 	lpm_plat_clr_mcusys_off(cpu);
