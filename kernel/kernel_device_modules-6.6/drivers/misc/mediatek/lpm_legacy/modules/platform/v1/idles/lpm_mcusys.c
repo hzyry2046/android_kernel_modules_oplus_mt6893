@@ -50,6 +50,30 @@
 static u64 lpm_mcusysoff_last_ns;
 static unsigned int lpm_mcusys_status;
 
+/*
+ * op6893 6.6 bring-up diagnostic.  Registering the model was necessary but is
+ * not on its own sufficient -- MCUSYS still does not power down -- and from
+ * outside there is no way to tell "we are never the last core in" from "ATF's
+ * resource manager allows nothing", because both end with mcusys_status 0 and
+ * no prepare.  smc_res is a mask of MT_RM_CONSTRAINT_ALLOW_*; 0 means the
+ * resource manager refused everything, which would fit the SPM side reporting
+ * spmfw ready: 0.  Rate-limited to one line per 5 s: this is the idle path.
+ * Drop this once the answer is in.
+ */
+static u64 lpm_mcusys_dbg_last_ns;
+
+static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
+			   unsigned int status)
+{
+	u64 now = sched_clock();
+
+	if (now - lpm_mcusys_dbg_last_ns <= MCUSYS_DUMP_INFO_INTERVAL_NS)
+		return;
+	lpm_mcusys_dbg_last_ns = now;
+	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d smc_res=0x%x status=0x%x\n",
+		last_core, smc_res, status);
+}
+
 static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 {
 	unsigned int smc_res;
@@ -58,8 +82,10 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	lpm_plat_set_mcusys_off(cpu);
 
 	/* Only the last core into idle can speak for the whole MCUSYS. */
-	if (!lpm_plat_is_mcusys_off())
+	if (!lpm_plat_is_mcusys_off()) {
+		lpm_mcusys_dbg(false, 0, 0);
 		return 0;
+	}
 
 	smc_res = lpm_smc_cpu_pm(MCUSYS_STATUS, MT_LPM_SMC_ACT_GET,
 				 MCUSYS_STATUS_PDN, 0);
@@ -89,6 +115,8 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	lpm_mcusys_status = mcusys_status;
 	if (lpm_mcusys_status)
 		lpm_do_mcusys_prepare_pdn(lpm_mcusys_status, &smc_res);
+
+	lpm_mcusys_dbg(true, smc_res, mcusys_status);
 
 	return 0;
 }
