@@ -532,6 +532,39 @@ static int lpm_rc_entry_nodes_basic(int IsSimple,
 
 struct LPM_RC_HANDLE rc_handle[5];
 
+/*
+ * op6893 6.6 bring-up: this file builds /proc/mtk_lpm/lpm/rc/<name>/ by
+ * walking the DT "constraints" phandles and reading "rc-name" and "cond-info"
+ * off each one.  The preserved 4.19 DTB carries neither -- its rc_bus26m,
+ * rc_syspll and rc_dram nodes have only "id" and "value" -- so every entry
+ * takes the "abnormal rc" path and the whole per-constraint view disappears,
+ * leaving just rc/state and rc/ratio.  4.19 did not need the properties
+ * because its per-SoC file hardcoded the names
+ * (mt6885_lpm_rc_entry_nodes("dram", MT_RM_CONSTRAINT_ID_DRAM, ...)).
+ *
+ * That view is not cosmetic.  Captured from 4.19 on this board while MCUSYS
+ * off was working: rc/state count:823, with cpu-buck-ldo "enable=1,
+ * count=823, rc-id=3" carrying every one of them and dram/syspll/bus26m all
+ * "blocked=1, count=0".  6.6 reports rc/state count:0 and cannot say which
+ * constraint is refusing or why.  Hardcode the same id->name table so it can.
+ *
+ * Note cpu-buck-ldo (id 3) is not in the DT constraint-list at all, on either
+ * kernel -- 4.19 registers it anyway, and it is the one that matters.
+ */
+static const char * const lpm_rc_default_names[] = {
+	[MT_RM_CONSTRAINT_ID_BUS26M]		= "bus26m",
+	[MT_RM_CONSTRAINT_ID_SYSPLL]		= "syspll",
+	[MT_RM_CONSTRAINT_ID_DRAM]		= "dram",
+	[MT_RM_CONSTRAINT_ID_CPU_BUCK_LDO]	= "cpu-buck-ldo",
+};
+
+static const char *lpm_rc_default_name(u32 rc_id)
+{
+	if (rc_id >= ARRAY_SIZE(lpm_rc_default_names))
+		return NULL;
+	return lpm_rc_default_names[rc_id];
+}
+
 int spm_cond_init(void)
 {
 	struct device_node *devnp = NULL;
@@ -562,12 +595,24 @@ int spm_cond_init(void)
 
 		while ((np = of_parse_phandle(devnp, "constraints", idx))) {
 			cond_info = 0;
-			ret = of_property_read_string(np, "rc-name", &rc_name);
-			if (ret == 0)
-				ret = of_property_read_u32(np, "id", &rc_id);
-			if (ret == 0)
-				ret = of_property_read_u32(np, "cond-info",
-						&cond_info);
+			rc_name = NULL;
+			ret = of_property_read_u32(np, "id", &rc_id);
+			if (ret == 0 &&
+			    of_property_read_string(np, "rc-name", &rc_name))
+				/* op6893: see lpm_rc_default_names above. */
+				rc_name = lpm_rc_default_name(rc_id);
+			/*
+			 * cond-info is optional in the same way: without it the
+			 * node is registered "simple", i.e. state+enable but no
+			 * cond/valid children.  Default it on for the ids that
+			 * have condition tables, which is every one except
+			 * cpu-buck-ldo -- that is exactly how mt6885 registers
+			 * them (entry_nodes vs entry_nodes_basic(IsSimple=1)).
+			 */
+			if (ret == 0 &&
+			    of_property_read_u32(np, "cond-info", &cond_info))
+				cond_info =
+				  (rc_id != MT_RM_CONSTRAINT_ID_CPU_BUCK_LDO);
 			of_node_put(np);
 
 			if (ret != 0 || rc_id == -1 || rc_name == NULL) {
@@ -609,6 +654,24 @@ int spm_cond_init(void)
 						&rc_handle[idx++].basic);
 			}
 		}
+
+		/*
+		 * op6893 6.6 bring-up: cpu-buck-ldo is not in the DT
+		 * constraint-list on this board -- 4.19's DTB does not list it
+		 * either, and mt6885_dbg_lpm_fs_init() registers it by hand.
+		 * Do the same, because on 4.19 it is the constraint that
+		 * carries every MCUSYS-off (rc-id=3, count=823 against 0 for
+		 * the three that are listed), so leaving it invisible hides
+		 * the only one doing any work.  Registered "simple" -- state
+		 * and enable, no cond/valid -- exactly as mt6885 does.
+		 */
+		if (idx < ARRAY_SIZE(rc_handle) &&
+		    !(rc_trace.bitmap & (1 << MT_RM_CONSTRAINT_ID_CPU_BUCK_LDO)))
+			lpm_rc_entry_nodes_basic(1,
+				lpm_rc_default_name(
+					MT_RM_CONSTRAINT_ID_CPU_BUCK_LDO),
+				MT_RM_CONSTRAINT_ID_CPU_BUCK_LDO,
+				&lpm_entry_rc, &rc_handle[idx++].basic);
 
 		idx = 0;
 		while ((np = of_parse_phandle(devnp, "spm-cond", idx))) {
