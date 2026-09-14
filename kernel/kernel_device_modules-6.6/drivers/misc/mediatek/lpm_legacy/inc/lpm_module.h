@@ -95,6 +95,33 @@ enum mt_lpm_smc_user_id {
 #define MCUSYS_STATUS_CPUSYS_PROTECT	(1 << 8UL)
 #define MCUSYS_STATUS_MCUSYS_PROTECT	(1 << 9UL)
 
+/*
+ * op6893: this enum is an ABI with BL31 and MUST NOT be made conditional.
+ *
+ * MBOX_INFO used to sit behind #if IS_ENABLED(CONFIG_MTK_LPM_MT6781), which is
+ * off here -- so the whole tail shifted down by one and VALIDATE_PWR_STATE_CTRL
+ * was sent as UID 5.  Our BL31 is the stock mt6893 one, built against the 4.19
+ * tree, whose enum (drivers/misc/mediatek/lpm/inc/mtk_lpm_module.h in
+ * android_kernel_oplus_mt6893) ends:
+ *
+ *     ... IRQ_REMAIN_IRQ_SUBMIT, MBOX_INFO,
+ *
+ * i.e. UID 5 is MBOX_INFO and there is nothing above it.  So every boot,
+ * lpm_late_initcall() was writing (SET, 0, 0) into ATF's MCUPM mailbox handler
+ * while believing it was bypassing PSCI power-state validation -- and the
+ * mailbox is part of the CPC/MCUSYS power path we cannot get to work.
+ * /proc/mtk_lpm/cpuidle/control/{buck,armpll}_mode (CPU_PM_CTRL) were landing
+ * on UID 6, which that BL31 does not implement at all, which is why they always
+ * read back mode 0, the value their enums mark as the default.
+ *
+ * Keeping MBOX_INFO unconditional restores the numbering: the two entries
+ * lpm_legacy added on top now sit at 6 and 7, outside what this BL31 knows, so
+ * they are cleanly unimplemented instead of aliasing something real.
+ *
+ * The SPM debug enum below was checked against the same 4.19 header and is
+ * identical for every UID either side actually uses -- the readings taken
+ * through it (rc counts, cond check/block, resource usage) are sound.
+ */
 enum MT_CPU_PM_SMC_UID {
 	/* cpu_pm function ID*/
 	MCUSYS_STATUS,
@@ -102,9 +129,7 @@ enum MT_CPU_PM_SMC_UID {
 	IRQ_REMAIN_LIST_ALLOC,
 	IRQ_REMAIN_IRQ_ADD,
 	IRQ_REMAIN_IRQ_SUBMIT,
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 	MBOX_INFO,
-#endif
 	VALIDATE_PWR_STATE_CTRL,
 	CPU_PM_CTRL,
 };

@@ -77,10 +77,19 @@ static int __init lpm_late_initcall(void)
 	if (lpm_model_mcusys_init())
 		pr_notice("[name:mtk_lpm][P] - mcusys idle model not registered\n");
 
-	cpuidle_pause_and_lock();
-	lpm_smc_cpu_pm(VALIDATE_PWR_STATE_CTRL, MT_LPM_SMC_ACT_SET,
-				PSCI_E_SUCCESS, 0);
-	cpuidle_resume_and_unlock();
+	/*
+	 * op6893: the VALIDATE_PWR_STATE_CTRL SET that used to be here is gone.
+	 *
+	 * Two reasons, either of which is sufficient.  It was landing on UID 5,
+	 * which this device's BL31 implements as MBOX_INFO -- see the comment on
+	 * enum MT_CPU_PM_SMC_UID -- so it was poking the MCUPM mailbox, not the
+	 * power-state validator.  And even correctly numbered it has no business
+	 * here: the 4.19 tree this BL31 was built against never issues it at all
+	 * (no VALIDATE_PWR_STATE_CTRL and no PSCI_E_SUCCESS anywhere under
+	 * drivers/misc/mediatek/lpm), and 4.19 does MCUSYS-off half a million
+	 * times a day without it.  Asking firmware to stop validating the power
+	 * states we hand it is not something to do on spec.
+	 */
 
 	return 0;
 }
