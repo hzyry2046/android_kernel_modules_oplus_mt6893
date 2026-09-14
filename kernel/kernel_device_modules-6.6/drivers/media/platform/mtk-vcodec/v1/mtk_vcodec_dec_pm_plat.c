@@ -448,9 +448,9 @@ void mtk_vdec_dvfs_sync_vsi_data(struct mtk_vcodec_ctx *ctx)
 		return;
 	}
 
-	dev->vdec_dvfs_params.target_freq = inst->vsi->target_freq;
-	ctx->dec_params.operating_rate = inst->vsi->op_rate;
-	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->vsi->cpu_hint);
+	dev->vdec_dvfs_params.target_freq = inst->priv.target_freq;
+	ctx->dec_params.operating_rate = inst->priv.op_rate;
+	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->priv.cpu_hint);
 }
 
 void mtk_vdec_dvfs_begin_inst(struct mtk_vcodec_ctx *ctx)
@@ -633,7 +633,7 @@ void mtk_vdec_prepare_vcp_dvfs_data(struct mtk_vcodec_ctx *ctx, unsigned long *i
 {
 	struct vcodec_inst *inst = 0;
 	struct vdec_inst *inst_handle;
-	struct vdec_vsi *vsi_data;
+	struct vdec_vsi_priv *vsi_data;
 
 	if (ctx == NULL)
 		return;
@@ -644,12 +644,16 @@ void mtk_vdec_prepare_vcp_dvfs_data(struct mtk_vcodec_ctx *ctx, unsigned long *i
 		return;
 	}
 
-	vsi_data = inst_handle->vsi;
+	vsi_data = &inst_handle->priv;
 
-	if (IS_ERR_OR_NULL(vsi_data)) {
-		mtk_v4l2_err("[VDVFS][%d] vsi is err or null", ctx->id);
-		return;
-	}
+	/*
+	 * op6893: these used to be written into the shared vsi for the VCP's
+	 * mmdvfs agent to read.  They cannot live there any more -- struct
+	 * vdec_vsi is back to the 4.19 13752-byte layout that vpud parses, and
+	 * that layout has no field past general_buf_size.  The consumer of this
+	 * data on this platform is the AP side (mtk_vdec_dvfs_sync_vsi_data
+	 * reads it straight back), so keep it in kernel-private state.
+	 */
 
 	inst = get_inst(ctx);
 	if (!inst)
@@ -688,14 +692,14 @@ void mtk_vdec_unprepare_vcp_dvfs_data(struct mtk_vcodec_ctx *ctx, unsigned long 
 void mtk_vdec_dvfs_set_vsi_dvfs_params(struct mtk_vcodec_ctx *ctx)
 {
 	struct vdec_inst *inst;
-	struct vdec_vsi *vsi_data;
+	struct vdec_vsi_priv *vsi_data;
 
 	if (ctx == NULL)
 		return;
 	mtk_v4l2_debug(4, "[VDVFS] ctx: %d vsi updated", ctx->id);
 
 	inst = (struct vdec_inst *) ctx->drv_handle;
-	vsi_data = inst->vsi;
+	vsi_data = &inst->priv;
 	vsi_data->is_active = ctx->is_active;
 	vsi_data->op_rate = ctx->dec_params.operating_rate;
 	vsi_data->op_rate_adaptive = ctx->op_rate_adaptive;

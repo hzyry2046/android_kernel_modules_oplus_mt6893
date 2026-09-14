@@ -19,13 +19,18 @@
  * @num_nalu : how many nalus be decoded
  * @ctx      : point to mtk_vcodec_ctx
  * @vcu      : VCU instance
- * @vsi      : VCU shared information
+ * @vsi      : VCU shared information -- allocated by vpud, read by vpud, so it
+ *             must stay exactly the 4.19 layout (see struct vdec_vsi)
+ * @priv     : this tree's per-instance state that the 4.19 daemon knows nothing
+ *             about.  It cannot live in @vsi: everything past
+ *             sizeof(struct vdec_vsi) is vpud's own private tail.
  */
 struct vdec_inst {
 	unsigned int num_nalu;
 	struct mtk_vcodec_ctx *ctx;
 	struct vdec_vcu_inst vcu;
 	struct vdec_vsi *vsi;
+	struct vdec_vsi_priv priv;
 
 	bool put_frame_async;
 	struct ring_fb_list list_disp_fb;

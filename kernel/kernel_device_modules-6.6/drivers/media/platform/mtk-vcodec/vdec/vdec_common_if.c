@@ -13,6 +13,7 @@
 #include "mtk_vcodec_dec.h"
 #include "mtk_vcodec_drv.h"
 #include "vdec_drv_if.h"
+#include "mtk_ion_compat.h"
 
 
 static void put_fb_to_free(struct vdec_inst *inst, struct vdec_fb *fb)
@@ -76,18 +77,18 @@ static void get_dpb_size(struct vdec_inst *inst, unsigned int *dpb_sz)
 		return;
 
 	*dpb_sz = inst->vsi->dec.dpb_sz;
-	if (inst->vsi->low_pw_mode)
+	if (inst->priv.low_pw_mode)
 		*dpb_sz += mtk_vdec_lpw_limit;
 	mtk_vcodec_debug(inst, "sz=%d", *dpb_sz);
 }
 
 static void check_error_code(struct vdec_inst *inst, unsigned int hw_id)
 {
-	if (inst->vsi->dec.error_code[hw_id] == 0)
+	if (inst->priv.error_code[hw_id] == 0)
 		return;
 
-	mtk_vcodec_debug(inst, "hw_id %d get error_code %d", hw_id, inst->vsi->dec.error_code[hw_id]);
-	mtk_vdec_queue_error_code_event(inst->ctx, inst->vsi->dec.error_code[hw_id]);
+	mtk_vcodec_debug(inst, "hw_id %d get error_code %d", hw_id, inst->priv.error_code[hw_id]);
+	mtk_vdec_queue_error_code_event(inst->ctx, inst->priv.error_code[hw_id]);
 }
 
 static int vdec_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
@@ -95,6 +96,7 @@ static int vdec_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
 	struct vdec_inst *inst = NULL;
 	int err = 0;
 	struct vcu_v4l2_callback_func cb;
+	u32 src_fourcc = 0;
 
 	inst = kzalloc(sizeof(*inst), GFP_KERNEL);
 	if (!inst)
@@ -104,8 +106,69 @@ static int vdec_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
 		goto error_free_inst;
 	}
 
+	if (ctx->q_data[MTK_Q_DATA_SRC].fmt)
+		src_fourcc = ctx->q_data[MTK_Q_DATA_SRC].fmt->fourcc;
+
 	inst->ctx = ctx;
+	/*
+	 * op6893: the 4.19 daemon hands each decoder instance its own IPI
+	 * channel, chosen by codec.  This tree sent every instance on
+	 * IPI_VDEC_COMMON instead, which is only the channel QUERY_CAP uses --
+	 * the daemon accepted the capability query there and rejected the INIT
+	 * that followed with status -1, leaving vcu->vsi unmapped.  Keep a
+	 * default so an unrecognised fourcc still lands somewhere the capability
+	 * query can promote.
+	 */
 	inst->vcu.id = IPI_VDEC_COMMON;
+	switch (src_fourcc) {
+	case V4L2_PIX_FMT_H264:
+		inst->vcu.id = IPI_VDEC_H264;
+		break;
+	case V4L2_PIX_FMT_HEVC:
+		inst->vcu.id = IPI_VDEC_H265;
+		break;
+	case V4L2_PIX_FMT_HEIF:
+		inst->vcu.id = IPI_VDEC_HEIF;
+		break;
+	case V4L2_PIX_FMT_VP8:
+		inst->vcu.id = IPI_VDEC_VP8;
+		break;
+	case V4L2_PIX_FMT_VP9:
+		inst->vcu.id = IPI_VDEC_VP9;
+		break;
+	case V4L2_PIX_FMT_MPEG4:
+		inst->vcu.id = IPI_VDEC_MPEG4;
+		break;
+	case V4L2_PIX_FMT_H263:
+		inst->vcu.id = IPI_VDEC_H263;
+		break;
+	case V4L2_PIX_FMT_MPEG1:
+	case V4L2_PIX_FMT_MPEG2:
+		inst->vcu.id = IPI_VDEC_MPEG12;
+		break;
+	case V4L2_PIX_FMT_WMV1:
+	case V4L2_PIX_FMT_WMV2:
+	case V4L2_PIX_FMT_WMV3:
+	case V4L2_PIX_FMT_WMVA:
+	case V4L2_PIX_FMT_WVC1:
+		inst->vcu.id = IPI_VDEC_WMV;
+		break;
+	case V4L2_PIX_FMT_RV30:
+		inst->vcu.id = IPI_VDEC_RV30;
+		break;
+	case V4L2_PIX_FMT_RV40:
+		inst->vcu.id = IPI_VDEC_RV40;
+		break;
+	case V4L2_PIX_FMT_AV1:
+		inst->vcu.id = IPI_VDEC_AV1;
+		break;
+	default:
+		mtk_vcodec_err(inst, "%s no fourcc for vcu id, using common channel",
+			__func__);
+		break;
+	}
+	mtk_vcodec_debug(inst, "vcu ipi channel %d for fourcc %s",
+		inst->vcu.id, FOURCC_STR(src_fourcc));
 	inst->vcu.dev = VCU_FPTR(vcu_get_plat_device)(ctx->dev->plat_dev);
 	if (inst->vcu.dev  == NULL) {
 		mtk_vcodec_err(inst, "vcu device is not ready");
@@ -131,10 +194,10 @@ static int vdec_init(struct mtk_vcodec_ctx *ctx, unsigned long *h_vdec)
 
 	inst->vsi = (struct vdec_vsi *)inst->vcu.vsi;
 	ctx->input_driven = inst->vsi->input_driven;
-	ctx->output_async = inst->vsi->output_async;
-	ctx->ipi_blocked = &inst->vsi->ipi_blocked;
+	ctx->output_async = inst->priv.output_async;
+	ctx->ipi_blocked = &inst->priv.ipi_blocked;
 	*(ctx->ipi_blocked) = 0;
-	ctx->low_pw_mode = inst->vsi->low_pw_mode;
+	ctx->low_pw_mode = inst->priv.low_pw_mode;
 
 	mtk_vcodec_debug(inst, "Decoder Instance >> %p", inst);
 
@@ -171,7 +234,7 @@ static int vdec_flush(unsigned long h_vdec, struct vdec_fb *fb,
 
 	mtk_vcodec_debug(inst, "+ flush with type %d", type);
 
-	inst->vsi->flush_type = type;
+	inst->priv.flush_type = type;
 	if (fb == NULL)
 		ret = vcu_dec_reset(vcu, VDEC_FLUSH); // flush (0)
 	else if (fb->status == 0)
@@ -180,11 +243,106 @@ static int vdec_flush(unsigned long h_vdec, struct vdec_fb *fb,
 		ret = vcu_dec_reset(vcu, VDEC_DRAIN_EOS); // drain & return EOS frame (2)
 
 	inst->ctx->input_driven = inst->vsi->input_driven;
-	inst->ctx->output_async = inst->vsi->output_async;
-	inst->ctx->low_pw_mode  = inst->vsi->low_pw_mode > 0;
+	inst->ctx->output_async = inst->priv.output_async;
+	inst->ctx->low_pw_mode  = inst->priv.low_pw_mode > 0;
 
 	mtk_vcodec_debug(inst, "+ flush ret %d", ret);
 	return ret;
+}
+
+/*
+ * op6893: publish the buffers the 4.19 vpud daemon is about to be told about.
+ *
+ * 4.19 filled vsi->dec.bs_fd / fb_fd[] with descriptors it installed straight
+ * into the daemon's own file table via get_mapped_fd().  That helper does not
+ * exist in 6.6 and cannot be ported, so the kernel publishes each buffer under
+ * a synthetic descriptor number instead and lets the daemon's ION_IOC_IMPORT
+ * resolve it -- see mtk_ion_compat.h.
+ *
+ * Without this the daemon reads bs_fd as zero, ion_import() on it fails, and
+ * every AP_IPIMSG_DEC_START comes back with status -1.
+ */
+static void vdec_publish_buffers(struct vdec_inst *inst,
+	struct mtk_vcodec_mem *bs, struct vdec_fb *fb, uint32_t num_planes)
+{
+	unsigned int i;
+	int fd;
+
+	inst->vsi->dec.bs_fd = 0;
+	if (bs->dmabuf) {
+		fd = mtk_ion_publish_dmabuf(bs->dmabuf);
+		if (fd < 0) {
+			mtk_vcodec_err(inst, "cannot publish bs dmabuf: %d", fd);
+		} else {
+			inst->vsi->dec.bs_fd = (u64)fd;
+			inst->priv.published_fds[VDEC_PUB_BS] = fd;
+		}
+	}
+
+	for (i = 0; i < VIDEO_MAX_PLANES; i++)
+		inst->vsi->dec.fb_fd[i] = 0;
+
+	if (fb == NULL)
+		return;
+
+	for (i = 0; i < num_planes && i < VIDEO_MAX_PLANES; i++) {
+		if (!fb->fb_base[i].dmabuf)
+			continue;
+
+		fd = mtk_ion_publish_dmabuf(fb->fb_base[i].dmabuf);
+		if (fd < 0) {
+			mtk_vcodec_err(inst, "cannot publish fb plane %u dmabuf: %d",
+				i, fd);
+			continue;
+		}
+		inst->vsi->dec.fb_fd[i] = (u64)fd;
+		inst->priv.published_fds[VDEC_PUB_FB(i)] = fd;
+	}
+
+	/*
+	 * The general (metadata) buffer too.  vdec_decode() has just copied the
+	 * caller's fd into vsi->general_buf_fd, but that descriptor lives in the
+	 * codec process, not in the daemon -- publishing it is the only way the
+	 * daemon can reach this buffer at all.  4.19 replaced the value in place
+	 * with get_mapped_fd()'s result; only the shared field is rewritten here
+	 * so fb->general_buf_fd keeps meaning what the rest of the driver thinks
+	 * it means.
+	 */
+	if (fb->dma_general_buf) {
+		fd = mtk_ion_publish_dmabuf(fb->dma_general_buf);
+		if (fd < 0) {
+			mtk_vcodec_err(inst, "cannot publish general dmabuf: %d", fd);
+			inst->vsi->general_buf_fd = -1;
+		} else {
+			inst->vsi->general_buf_fd = fd;
+			inst->priv.published_fds[VDEC_PUB_GENERAL] = fd;
+		}
+	}
+}
+
+/*
+ * Called once the daemon has answered the message that carried the descriptors.
+ * By then it has either imported them (and holds its own reference through the
+ * ion handle) or failed; 4.19 closed the injected descriptor at this same
+ * point.
+ */
+static void vdec_unpublish_buffers(struct vdec_inst *inst)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(inst->priv.published_fds); i++) {
+		if (inst->priv.published_fds[i] == 0)
+			continue;
+		mtk_ion_unpublish_dmabuf(inst->priv.published_fds[i]);
+		inst->priv.published_fds[i] = 0;
+	}
+
+	inst->vsi->dec.bs_fd = 0;
+	for (i = 0; i < VIDEO_MAX_PLANES; i++)
+		inst->vsi->dec.fb_fd[i] = 0;
+
+	/* -1 is this field's "no general buffer", matching vdec_decode(). */
+	inst->vsi->general_buf_fd = -1;
 }
 
 static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
@@ -247,24 +405,32 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 		}
 
 		if (fb->dma_meta_buf != 0) {
-			inst->vsi->meta_buf_fd = fb->meta_buf_fd;
-			inst->vsi->meta_buf_size = fb->dma_meta_buf->size;
-			inst->vsi->meta_buf_dma = fb->dma_meta_addr;
+			inst->priv.meta_buf_fd = fb->meta_buf_fd;
+			inst->priv.meta_buf_size = fb->dma_meta_buf->size;
+			inst->priv.meta_buf_dma = fb->dma_meta_addr;
 			mtk_vcodec_debug(inst, "meta_buf_dma dma_buf=%p fd=%d dma=%llx size=%zu",
-			    fb->dma_meta_buf, inst->vsi->meta_buf_fd,
-			    inst->vsi->meta_buf_dma,
+			    fb->dma_meta_buf, inst->priv.meta_buf_fd,
+			    inst->priv.meta_buf_dma,
 			    fb->dma_meta_buf->size);
 		} else {
 			fb->meta_buf_fd = -1;
-			inst->vsi->meta_buf_fd = -1;
-			inst->vsi->meta_buf_size = 0;
+			inst->priv.meta_buf_fd = -1;
+			inst->priv.meta_buf_size = 0;
 			mtk_vcodec_debug(inst, "no meta buf dmabuf");
 		}
 	}
 
-	inst->vsi->dec_params.queued_frame_buf_count = inst->ctx->dec_params.queued_frame_buf_count;
+	/*
+	 * op6893: 4.19 keeps this counter in vsi->dec, not in dec_params, and the
+	 * daemon reads it from there.  dec_params.queued_frame_buf_count is this
+	 * tree's private copy for the SET_PARAM path -- keep both in step.
+	 */
+	inst->priv.dec_params.queued_frame_buf_count = inst->ctx->dec_params.queued_frame_buf_count;
+	inst->vsi->dec.queued_frame_buf_count = inst->ctx->dec_params.queued_frame_buf_count;
 	inst->vsi->dec.timestamp = inst->ctx->timestamp;
-	memcpy(&inst->vsi->hdr10plus_buf, bs->hdr10plus_buf, sizeof(struct hdr10plus_info));
+	memcpy(&inst->priv.hdr10plus_buf, bs->hdr10plus_buf, sizeof(struct hdr10plus_info));
+
+	vdec_publish_buffers(inst, bs, fb, num_planes);
 
 	mtk_vcodec_debug(inst, "+ FB y_fd=%llx c_fd=%llx BS fd=%llx format=%c%c%c%c",
 		inst->vsi->dec.fb_fd[0], inst->vsi->dec.fb_fd[1],
@@ -282,6 +448,11 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 	data[5] =
 		inst->ctx->dec_params.fixed_max_frame_buffer_mode;
 	ret = vcu_dec_start(vcu, data, 6, bs, fb);
+	/*
+	 * The daemon has answered by now, so the synthetic descriptors are either
+	 * imported (it holds its own reference) or were never taken.
+	 */
+	vdec_unpublish_buffers(inst);
 
 	*src_chg = inst->vsi->dec.vdec_changed_info;
 	*(errormap_info + bs->index % VB2_MAX_FRAME) =
@@ -289,7 +460,7 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 
 	if (inst->ctx->dev->vdec_hw_ipm == VCODEC_IPM_V2)
 		check_error_code(inst, MTK_VDEC_LAT);
-	if (!inst->vsi->output_async)
+	if (!inst->priv.output_async)
 		check_error_code(inst, MTK_VDEC_CORE);
 
 	if ((*src_chg & VDEC_NEED_SEQ_HEADER) != 0U)
@@ -309,7 +480,7 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 		goto err_free_fb_out;
 
 	inst->ctx->input_driven = inst->vsi->input_driven;
-	inst->ctx->output_async = inst->vsi->output_async;
+	inst->ctx->output_async = inst->priv.output_async;
 	inst->num_nalu++;
 	return ret;
 
@@ -398,24 +569,22 @@ get_fb:
 	if (fb == NULL)
 		return;
 	fb->timestamp = list->fb_list[list->read_idx].timestamp;
-	fb->field = list->fb_list[list->read_idx].field;
-	fb->frame_type = list->fb_list[list->read_idx].frame_type;
-
-	if (disp_list) {
+	/*
+	 * op6893: the ring element is 4.19's struct vdec_ipi_fb, which has no
+	 * `field' / `frame_type' / `flags' -- those sat where 4.19 keeps
+	 * c_fb_dma, so the values this tree used to read were never anything but
+	 * halves of a dma address.  Only the display/free status is conveyed, as
+	 * the 4.19 kernel does.
+	 */
+	if (disp_list)
 		fb->status |= FB_ST_DISPLAY;
-		if (list->fb_list[list->read_idx].flags & VDEC_FB_NO_GENERATED)
-			fb->status |= FB_ST_NO_GENERATED;
-		if (list->fb_list[list->read_idx].flags & VDEC_FB_CROP_CHANGED)
-			fb->status |= FB_ST_CROP_CHANGED;
-	} else {
+	else
 		fb->status |= FB_ST_FREE;
-		if (list->fb_list[list->read_idx].flags & VDEC_FB_EOS)
-			fb->status |= FB_ST_EOS;
-	}
 
 	*out_fb = fb;
-	mtk_vcodec_debug(inst, "[FB] get %s fb st=%x id=%d ts=%llu %lld %lx gbuf fd %d dma %p",
+	mtk_vcodec_debug(inst, "[FB] get %s fb st=%x id=%d poc=%d ts=%llu %llx/%lx gbuf fd %d dma %p",
 		disp_list ? "disp" : "free", fb->status, list->read_idx,
+		list->fb_list[list->read_idx].poc,
 		list->fb_list[list->read_idx].timestamp,
 		list->fb_list[list->read_idx].vdec_fb_va, vdec_fb_va,
 		fb->general_buf_fd, fb->dma_general_buf);
@@ -514,7 +683,7 @@ static void get_interlacing_fieldseq(struct vdec_inst *inst, unsigned int *botto
 {
 	inst->vcu.ctx = inst->ctx;
 	if (inst->vsi != NULL)
-		*bottomFirst = inst->vsi->interlacing_fieldseq;
+		*bottomFirst = inst->priv.interlacing_fieldseq;
 }
 
 static void get_input_driven(struct vdec_inst *inst, unsigned int *input_driven)
@@ -528,35 +697,35 @@ static void get_output_async(struct vdec_inst *inst, bool *output_async)
 {
 	inst->vcu.ctx = inst->ctx;
 	if (inst->vsi != NULL)
-		*output_async = inst->vsi->output_async;
+		*output_async = inst->priv.output_async;
 }
 
 static void get_low_pw_mode(struct vdec_inst *inst, unsigned int *low_pw_mode)
 {
 	inst->vcu.ctx = inst->ctx;
 	if (inst->vsi != NULL)
-		*low_pw_mode = inst->vsi->low_pw_mode;
+		*low_pw_mode = inst->priv.low_pw_mode;
 }
 
 static void get_frame_interval(struct vdec_inst *inst, struct v4l2_fract *time_per_frame)
 {
 	inst->vcu.ctx = inst->ctx;
 	if (inst->vsi != NULL)
-		memcpy(time_per_frame, &inst->vsi->time_per_frame, sizeof(struct v4l2_fract));
+		memcpy(time_per_frame, &inst->priv.time_per_frame, sizeof(struct v4l2_fract));
 }
 
 static void get_res_info(struct vdec_inst *inst,
 			 struct vdec_resource_info *res_info)
 {
 	if (inst->vsi != NULL)
-		memcpy(res_info, &inst->vsi->res_info, sizeof(struct vdec_resource_info));
+		memcpy(res_info, &inst->priv.res_info, sizeof(struct vdec_resource_info));
 }
 
 static void get_bandwidth_info(struct vdec_inst *inst,
 			struct vdec_bandwidth_info *bandwidth_info)
 {
 	if (inst->vsi != NULL)
-		memcpy(bandwidth_info, &inst->vsi->bandwidth_info, sizeof(struct vdec_bandwidth_info));
+		memcpy(bandwidth_info, &inst->priv.bandwidth_info, sizeof(struct vdec_bandwidth_info));
 }
 
 static void get_max_buf_sizes(struct vdec_inst *inst,
@@ -571,7 +740,7 @@ static void get_trick_mode(struct vdec_inst *inst,
 {
 	inst->vcu.ctx = inst->ctx;
 	if (inst->vsi != NULL)
-		*trick_mode = inst->vsi->trick_mode;
+		*trick_mode = inst->priv.trick_mode;
 }
 
 static int vdec_get_param(unsigned long h_vdec,
@@ -702,45 +871,72 @@ static int vdec_set_param(unsigned long h_vdec,
 		return -EINVAL;
 
 	switch (type) {
+	case SET_PARAM_FRAME_SIZE:
+		/*
+		 * op6893: two words, container width then height -- exactly what
+		 * 4.19's vidioc_vdec_s_fmt() sends after vdec_if_init().
+		 */
+		ret = vcu_dec_set_param(&inst->vcu,
+			SET_PARAM_419_FRAME_SIZE, in, 2U);
+		break;
 	case SET_PARAM_FRAME_BUFFER:
 		vcu_dec_set_frame_buffer(&inst->vcu, in);
 		break;
 	case SET_PARAM_SET_FIXED_MAX_OUTPUT_BUFFER:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->dec_params.fixed_max_frame_size_width = (__u32)(*param_ptr);
-		inst->vsi->dec_params.fixed_max_frame_size_height = (__u32)(*(param_ptr + 1));
-		inst->vsi->dec_params.fixed_max_frame_buffer_mode = (__u32)(*(param_ptr + 2));
-		inst->vsi->dec_params.dec_param_change |= MTK_DEC_PARAM_FIXED_MAX_FRAME_SIZE;
+		inst->priv.dec_params.fixed_max_frame_size_width = (__u32)(*param_ptr);
+		inst->priv.dec_params.fixed_max_frame_size_height = (__u32)(*(param_ptr + 1));
+		inst->priv.dec_params.fixed_max_frame_buffer_mode = (__u32)(*(param_ptr + 2));
+		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_FIXED_MAX_FRAME_SIZE;
+		/* op6893: 4.19 carries only the two dimensions in this one. */
+		ret = vcu_dec_set_param(&inst->vcu,
+			SET_PARAM_419_SET_FIXED_MAX_OUTPUT_BUFFER, in, 2U);
 		break;
 	case SET_PARAM_DECODE_MODE:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->dec_params.decode_mode = (__u32)(*param_ptr);
-		inst->vsi->dec_params.dec_param_change |= MTK_DEC_PARAM_DECODE_MODE;
+		inst->priv.dec_params.decode_mode = (__u32)(*param_ptr);
+		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_DECODE_MODE;
+		ret = vcu_dec_set_param(&inst->vcu,
+			SET_PARAM_419_DECODE_MODE, in, 1U);
 		break;
 	case SET_PARAM_WAIT_KEY_FRAME:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->dec_params.wait_key_frame = (__u32)(*param_ptr);
-		inst->vsi->dec_params.dec_param_change |= MTK_DEC_PARAM_WAIT_KEY_FRAME;
+		inst->priv.dec_params.wait_key_frame = (__u32)(*param_ptr);
+		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_WAIT_KEY_FRAME;
+		ret = vcu_dec_set_param(&inst->vcu,
+			SET_PARAM_419_WAIT_KEY_FRAME, in, 1U);
 		break;
 	case SET_PARAM_DECODE_ERROR_HANDLE_MODE:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->dec_params.decode_error_handle_mode = (__u32)(*param_ptr);
-		inst->vsi->dec_params.dec_param_change |= MTK_DEC_PARAM_DECODE_ERROR_HANDLE_MODE;
+		/*
+		 * op6893: 4.19 has no such id.  The setting is only meaningful to
+		 * this tree's own firmware, so keep it local rather than send the
+		 * daemon a number it would reject as unknown.
+		 */
+		inst->priv.dec_params.decode_error_handle_mode = (__u32)(*param_ptr);
+		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_DECODE_ERROR_HANDLE_MODE;
 		break;
 	case SET_PARAM_OPERATING_RATE:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->dec_params.operating_rate = (__u32)(*param_ptr);
-		inst->vsi->dec_params.dec_param_change |= MTK_DEC_PARAM_OPERATING_RATE;
+		inst->priv.dec_params.operating_rate = (__u32)(*param_ptr);
+		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_OPERATING_RATE;
+		ret = vcu_dec_set_param(&inst->vcu,
+			SET_PARAM_419_OPERATING_RATE, in, 1U);
 		break;
 	case SET_PARAM_DEC_PARAMS:
-	case SET_PARAM_PUT_FB:
-		vcu_dec_set_param(&inst->vcu, (unsigned int)type, in, 0);
+		/*
+		 * op6893: this tree pushes the whole struct mtk_dec_params blob
+		 * here; the daemon has no such message and answers "unknown param
+		 * type (20)".  Every field it does understand is sent as its own
+		 * 4.19-id message above, so the blob has nothing left to carry.
+		 */
 		break;
+	case SET_PARAM_PUT_FB:
 	case SET_PARAM_TOTAL_BITSTREAM_BUFQ_COUNT:
 	case SET_PARAM_SET_DV:
 	case SET_PARAM_NO_REORDER:
@@ -751,7 +947,14 @@ static int vdec_set_param(unsigned long h_vdec,
 	case SET_PARAM_DISABLE_DEBLOCK:
 	case SET_PARAM_VDEC_LINECOUNT_THRESHOLD:
 	case SET_PARAM_COMPRESSED_MODE:
-		vcu_dec_set_param(&inst->vcu, (unsigned int)type, in, 1U);
+		/*
+		 * op6893: 6.6-only settings with no 4.19 id.  They used to be
+		 * forwarded anyway, which landed them on whatever 4.19 id happened
+		 * to share the number.  Drop them: sending a wrong number is worse
+		 * than not sending anything.
+		 */
+		mtk_vcodec_debug(inst, "dropping 6.6-only set param %d for the 4.19 daemon",
+			type);
 		break;
 	case SET_PARAM_CRC_PATH:
 		if (inst->vsi == NULL)
@@ -784,14 +987,14 @@ static int vdec_set_param(unsigned long h_vdec,
 		if (inst->vsi == NULL)
 			return -EINVAL;
 
-		memcpy(&inst->vsi->hdr10_info, hdr10_info, sizeof(struct v4l2_vdec_hdr10_info));
-		inst->vsi->hdr10_info_valid = true;
+		memcpy(&inst->priv.hdr10_info, hdr10_info, sizeof(struct v4l2_vdec_hdr10_info));
+		inst->priv.hdr10_info_valid = true;
 		break;
 	}
 	case SET_PARAM_TRICK_MODE:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->trick_mode = *(unsigned int *)in;
+		inst->priv.trick_mode = *(unsigned int *)in;
 		break;
 	case SET_PARAM_VDEC_VCU_VPUD_LOG:
 		ret = VCU_FPTR(vcu_set_log)((char *) in);
@@ -799,7 +1002,7 @@ static int vdec_set_param(unsigned long h_vdec,
 	case SET_PARAM_VDEC_IN_GROUP:
 		if (inst->vsi == NULL)
 			return -EINVAL;
-		inst->vsi->in_group = (bool)in;
+		inst->priv.in_group = (bool)in;
 		break;
 	case SET_PARAM_ACQUIRE_RESOURCE: {
 		struct v4l2_vdec_resource_parameter *res_param = in;
@@ -830,8 +1033,14 @@ static int vdec_set_param(unsigned long h_vdec,
 		// SET_PARAM_TOTAL_FRAME_BUFQ_COUNT for SW DEC(VDEC_DRV_DECODER_MTK_SOFTWARE=1)
 		if (inst->vsi == NULL)
 			return -EINVAL;
+		/*
+		 * op6893: 4.19's TOTAL_FRAME_BUFQ_COUNT is id 10, and it has no
+		 * codec_type guard -- the guard belongs to this tree's software
+		 * decoder concept, so keep it, but send the 4.19 id.
+		 */
 		if (inst->vsi->codec_type == 1)
-			ret = vcu_dec_set_param(&inst->vcu, (unsigned int)type, in, 1U);
+			ret = vcu_dec_set_param(&inst->vcu,
+				SET_PARAM_419_TOTAL_FRAME_BUFQ_COUNT, in, 1U);
 		break;
 	default:
 		mtk_vcodec_err(inst, "invalid set parameter type=%d\n", type);

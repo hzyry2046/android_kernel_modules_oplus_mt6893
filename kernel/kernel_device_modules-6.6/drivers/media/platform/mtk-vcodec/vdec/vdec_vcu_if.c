@@ -35,7 +35,7 @@ static void handle_init_ack_msg(struct vdec_vcu_inst *vcu, struct vdec_vcu_ipi_i
 	/* the content in vsi is initialized to 0 in VCU */
 	vcu->vsi = VCU_FPTR(vcu_mapping_dm_addr)(vcu->dev, msg->vcu_inst_addr);
 	vcu->inst_addr = msg->vcu_inst_addr;
-	mtk_v4l2_debug(0, "- vcu_inst_addr = 0x%llx", vcu->inst_addr);
+	mtk_v4l2_debug(0, "- vcu_inst_addr = 0x%x", vcu->inst_addr);
 }
 
 static void handle_query_cap_ack_msg(struct vdec_vcu_inst *vcu,
@@ -50,6 +50,15 @@ static void handle_query_cap_ack_msg(struct vdec_vcu_inst *vcu,
 		(uintptr_t)msg->ap_inst_addr, msg->vcu_data_addr, msg->id);
 	/* mapping VCU address to kernel virtual address */
 	data = VCU_FPTR(vcu_mapping_dm_addr)(vcu->dev, msg->vcu_data_addr);
+	/*
+	 * op6893: level 0 so this is always on.  The whole hardware-decode
+	 * bring-up hinges on this one reply being read correctly, and the failure
+	 * mode is silent -- an unmapped or mis-parsed answer leaves the format
+	 * tables empty and the only visible symptom is the HAL reporting
+	 * "Resolution not supported" much later.
+	 */
+	mtk_v4l2_debug(0, "query cap ack: id=%d vcu_data_addr=0x%x mapped=%p",
+		msg->id, msg->vcu_data_addr, data);
 	if (data == NULL)
 		return;
 	switch (msg->id) {
@@ -57,11 +66,21 @@ static void handle_query_cap_ack_msg(struct vdec_vcu_inst *vcu,
 		size = sizeof(struct mtk_video_fmt);
 		memcpy((void *)mtk_vdec_formats, data,
 			 size * MTK_MAX_DEC_CODECS_SUPPORT);
+		mtk_v4l2_debug(0, "query cap: formats, first fourcc=0x%x type=%d planes=%d",
+			mtk_vdec_formats[0].fourcc, mtk_vdec_formats[0].type,
+			mtk_vdec_formats[0].num_planes);
 		break;
 	case GET_PARAM_VDEC_CAP_FRAME_SIZES:
 		size = sizeof(struct mtk_codec_framesizes);
 		memcpy((void *)mtk_vdec_framesizes, data,
 			size * MTK_MAX_DEC_CODECS_SUPPORT);
+		mtk_v4l2_debug(0,
+			"query cap: framesizes, first fourcc=0x%x min=%dx%d max=%dx%d",
+			mtk_vdec_framesizes[0].fourcc,
+			mtk_vdec_framesizes[0].stepwise.min_width,
+			mtk_vdec_framesizes[0].stepwise.min_height,
+			mtk_vdec_framesizes[0].stepwise.max_width,
+			mtk_vdec_framesizes[0].stepwise.max_height);
 		break;
 	case GET_PARAM_VDEC_CAP_MAX_BUF_INFO:
 		size = sizeof(struct vdec_max_buf_info);
@@ -76,16 +95,16 @@ static void handle_query_cap_ack_msg(struct vdec_vcu_inst *vcu,
 	default:
 		break;
 	}
-	mtk_vcodec_debug(vcu, "- vcu_inst_addr = 0x%llx", vcu->inst_addr);
+	mtk_vcodec_debug(vcu, "- vcu_inst_addr = 0x%x", vcu->inst_addr);
 }
 
 static void check_error_code(struct vdec_inst *inst, unsigned int hw_id)
 {
-	if (inst->vsi->dec.error_code[hw_id] == 0)
+	if (inst->priv.error_code[hw_id] == 0)
 		return;
 
-	mtk_vcodec_debug(inst, "hw_id %d get error_code %d", hw_id, inst->vsi->dec.error_code[hw_id]);
-	mtk_vdec_queue_error_code_event(inst->ctx, inst->vsi->dec.error_code[hw_id]);
+	mtk_vcodec_debug(inst, "hw_id %d get error_code %d", hw_id, inst->priv.error_code[hw_id]);
+	mtk_vdec_queue_error_code_event(inst->ctx, inst->priv.error_code[hw_id]);
 }
 
 static int check_codec_id(struct vdec_vcu_ipi_ack *msg, unsigned int fmt, unsigned int svp)
@@ -294,23 +313,18 @@ int vcu_dec_ipi_handler(void *data, unsigned int len, void *priv)
 			ret = 1;
 			break;
 		case VCU_IPIMSG_DEC_LOCK_CORE:
-			if (msg->payload) {
-				mtk_vcodec_dec_pw_on(&vcu->ctx->dev->pm);
-				dev->dec_ao_pw_cnt++;
-			} else {
-				vdec_decode_prepare(vcu->ctx, MTK_VDEC_CORE);
-				atomic_set(&dev->dec_hw_active[MTK_VDEC_CORE], 1);
-			}
+			/*
+			 * op6893: the 4.19 ack has no payload word, so there is no
+			 * "power on the whole block" variant here -- always the
+			 * per-instance prepare/unprepare pair.
+			 */
+			vdec_decode_prepare(vcu->ctx, MTK_VDEC_CORE);
+			atomic_set(&dev->dec_hw_active[MTK_VDEC_CORE], 1);
 			ret = 1;
 			break;
 		case VCU_IPIMSG_DEC_UNLOCK_CORE:
-			if (msg->payload) {
-				dev->dec_ao_pw_cnt--;
-				mtk_vcodec_dec_pw_off(&vcu->ctx->dev->pm);
-			} else {
-				atomic_set(&dev->dec_hw_active[MTK_VDEC_CORE], 0);
-				vdec_decode_unprepare(vcu->ctx, MTK_VDEC_CORE);
-			}
+			atomic_set(&dev->dec_hw_active[MTK_VDEC_CORE], 0);
+			vdec_decode_unprepare(vcu->ctx, MTK_VDEC_CORE);
 			ret = 1;
 			break;
 		case VCU_IPIMSG_DEC_GET_FRAME_BUFFER:
@@ -406,7 +420,11 @@ int vcu_dec_ipi_handler(void *data, unsigned int len, void *priv)
 			break;
 		case VCU_IPIMSG_DEC_PUT_FRAME_BUFFER:
 			check_error_code(inst, MTK_VDEC_CORE);
-			mtk_vdec_put_fb(vcu->ctx, PUT_BUFFER_CALLBACK, msg->data != 0);
+			/*
+			 * op6893: the 4.19 ack carries no "no need to put" flag,
+			 * so the buffer always goes back.
+			 */
+			mtk_vdec_put_fb(vcu->ctx, PUT_BUFFER_CALLBACK, false);
 			ret = 1;
 			break;
 		case VCU_IPIMSG_DEC_SLICE_DONE_ISR: {
@@ -505,10 +523,9 @@ static int vcodec_send_ap_ipi(struct vdec_vcu_inst *vcu, unsigned int msg_id)
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = msg_id;
-	msg.ctx_id = vcu->ctx->id;
 	msg.vcu_inst_addr = vcu->inst_addr;
 
-	err = vcodec_vcu_send_msg(vcu, &msg, sizeof(msg));
+	err = vcodec_vcu_send_msg(vcu, &msg, VDEC_AP_IPI_CMD_LEN);
 	mtk_vcodec_debug(vcu, "- id=%X ret=%d", msg_id, err);
 	return err;
 }
@@ -581,10 +598,16 @@ int vcu_dec_init(struct vdec_vcu_inst *vcu)
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_DEC_INIT;
-	msg.ctx_id = vcu->ctx->id;
+	if (vcu->ctx->dec_params.svp_mode)
+		msg.reserved = vcu->ctx->dec_params.svp_mode;
+	/*
+	 * op6893: the daemon cannot dereference a kernel pointer, and this
+	 * driver's handler keys instances off ctx->id, so the context id is what
+	 * goes out here -- and comes back echoed in every ack.
+	 */
 	msg.ap_inst_addr = (unsigned long)vcu->ctx->id;
 
-	mtk_vcodec_debug(vcu, "vdec_inst=%p svp_mode=%d", vcu, vcu->ctx->dec_params.svp_mode);
+	mtk_vcodec_debug(vcu, "vdec_inst=%p svp_mode=%d", vcu, msg.reserved);
 
 	vcu_dec_set_pid(vcu);
 
@@ -606,15 +629,22 @@ int vcu_dec_start(struct vdec_vcu_inst *vcu,
 
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_DEC_START;
-	msg.ctx_id = vcu->ctx->id;
 	msg.vcu_inst_addr = vcu->inst_addr;
 
-	for (i = 0; i < len; i++)
+	/*
+	 * op6893: only the first three words are part of the 4.19 daemon's
+	 * struct.  This tree also passes the fixed max frame size in data[3..5];
+	 * it is kept alongside so nothing is silently dropped on the floor here,
+	 * but the daemon cannot see it -- 4.19 carries that through SET_PARAM.
+	 */
+	for (i = 0; i < len && i < 3; i++)
 		msg.data[i] = data[i];
+	for (i = 3; i < len && i < 6; i++)
+		msg.data_ext[i - 3] = data[i];
 
 	mutex_lock(vcu->ctx_ipi_lock);
 	vcu_dec_set_ctx(vcu, bs, fb);
-	err = vcodec_vcu_send_msg(vcu, (void *)&msg, sizeof(msg));
+	err = vcodec_vcu_send_msg(vcu, (void *)&msg, VDEC_AP_IPI_DEC_START_LEN);
 	mutex_unlock(vcu->ctx_ipi_lock);
 
 	mtk_vcodec_debug(vcu, "- ret=%d", err);
@@ -642,7 +672,6 @@ int vcu_dec_reset(struct vdec_vcu_inst *vcu, enum vdec_reset_type drain_type)
 	mtk_vcodec_debug(vcu, "drain_type %d", drain_type);
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_DEC_RESET;
-	msg.ctx_id = vcu->ctx->id;
 	msg.vcu_inst_addr = vcu->inst_addr;
 	msg.drain_type = drain_type;
 
@@ -702,15 +731,19 @@ int vcu_dec_set_param(struct vdec_vcu_inst *vcu, unsigned int id, void *param,
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_DEC_SET_PARAM;
 	msg.id = id;
-	msg.ctx_id = vcu->ctx->id;
 	msg.vcu_inst_addr = vcu->inst_addr;
-	for (i = 0; i < size; i++) {
+	/*
+	 * op6893: eight words are the daemon's `data'; anything past that is
+	 * this tree's appendage and is invisible to it.  The bound keeps the
+	 * loop inside the struct either way.
+	 */
+	for (i = 0; i < size && i < 8; i++) {
 		msg.data[i] = (__u32)(*(param_ptr + i));
 		mtk_vcodec_debug(vcu, "msg.id = 0x%X, msg.data[%d]=%d",
 			msg.id, i, msg.data[i]);
 	}
 
-	err = vcodec_vcu_send_msg(vcu, &msg, sizeof(msg));
+	err = vcodec_vcu_send_msg(vcu, &msg, VDEC_AP_IPI_SET_PARAM_LEN);
 	mtk_vcodec_debug(vcu, "- id=%X ret=%d", AP_IPIMSG_DEC_SET_PARAM, err);
 
 	return err;
@@ -721,7 +754,7 @@ int vcu_dec_set_frame_buffer(struct vdec_vcu_inst *vcu, void *fb)
 	int err = 0;
 	struct vdec_ap_ipi_set_param msg;
 	struct mtk_video_dec_buf *dst_buf_info = fb;
-	struct vdec_ipi_fb ipi_fb;
+	struct vdec_frame_buf_info ipi_fb;
 	struct vdec_fb *pfb = NULL;
 	bool dst_not_get = true;
 
@@ -731,7 +764,6 @@ int vcu_dec_set_frame_buffer(struct vdec_vcu_inst *vcu, void *fb)
 	memset(&ipi_fb, 0, sizeof(ipi_fb));
 	msg.msg_id = AP_IPIMSG_DEC_FRAME_BUFFER;
 	msg.id = 0;
-	msg.ctx_id = vcu->ctx->id;
 	msg.vcu_inst_addr = vcu->inst_addr;
 
 	do {
@@ -769,7 +801,8 @@ int vcu_dec_set_frame_buffer(struct vdec_vcu_inst *vcu, void *fb)
 		}
 
 		if (pfb != NULL || fb == NULL) {
-			memcpy(msg.data, &ipi_fb, sizeof(struct vdec_ipi_fb));
+			BUILD_BUG_ON(sizeof(ipi_fb) > sizeof(msg.raw));
+			memcpy(msg.raw, &ipi_fb, sizeof(struct vdec_frame_buf_info));
 			err = vcodec_vcu_send_msg(vcu, &msg, sizeof(msg));
 		}
 	} while (pfb != NULL);
