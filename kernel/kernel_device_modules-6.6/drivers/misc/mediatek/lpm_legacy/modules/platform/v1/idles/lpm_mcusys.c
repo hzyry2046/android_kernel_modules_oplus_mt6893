@@ -75,6 +75,11 @@ static unsigned long lpm_mcusys_in_mask;
 static unsigned long lpm_mcusys_miss_mask;
 static unsigned int lpm_mcusys_dbg_lastcore;
 
+static bool lpm_mcusys_oneshot = true;
+module_param_named(oneshot, lpm_mcusys_oneshot, bool, 0644);
+MODULE_PARM_DESC(oneshot,
+	"take exactly one MCUSYS-off then demote to WFI (1: default, survives; 0: free-run, hangs the SoC)");
+
 static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
 			   unsigned int status)
 {
@@ -115,6 +120,33 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	if (!lpm_plat_is_mcusys_off()) {
 		lpm_mcusys_dbg(false, 0, 0);
 		return 0;
+	}
+
+	/*
+	 * op6893 bring-up: one-shot mode, on by default.
+	 *
+	 * Letting MCUSYS-off run free hangs the SoC and the watchdog resets it,
+	 * within two or three all-eight events every time -- and always before
+	 * anything can be read back.  But the FIRST event is survived, reliably
+	 * (measured: died on #2, #2 and #3 across three runs).  So take exactly
+	 * one, then veto every later one: lpm_state_enter() demotes a negative
+	 * prompt return to WFI, which keeps MCUSYS up and leaves the machine
+	 * alive to be interrogated.
+	 *
+	 * That buys the readings that matter and that no run has survived to
+	 * take: /proc/mtk_lpm/lpm/trace/common (ATF's last constraint and its
+	 * valid mask -- 4.19 shows `rc_id:3, valid:0x203`),
+	 * /proc/mtk_lpm/lpm/rc/<name>/state counts, and the SYSRAM mcusys
+	 * counter in /proc/mtk_lpm/cpuidle/info.
+	 *
+	 * Undo the decrement by hand: after a veto lpm_state_enter() enters
+	 * index 0, so lpm_cpuidle_resume() looks up mod[0], finds NULL, and
+	 * never calls our reflect -- the count would leak upward forever.
+	 */
+	if (lpm_mcusys_oneshot && lpm_mcusys_dbg_lastcore >= 1) {
+		lpm_mcusys_in_mask &= ~BIT(cpu);
+		lpm_plat_clr_mcusys_off(cpu);
+		return -EBUSY;
 	}
 
 	smc_res = lpm_smc_cpu_pm(MCUSYS_STATUS, MT_LPM_SMC_ACT_GET,

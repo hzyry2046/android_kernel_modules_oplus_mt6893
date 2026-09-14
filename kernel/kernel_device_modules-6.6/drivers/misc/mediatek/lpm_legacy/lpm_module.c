@@ -303,7 +303,7 @@ static int lpm_cpuidle_prepare(struct cpuidle_driver *drv, int index)
 	struct lpm_models *lpmmods = NULL;
 	struct lpm_model *lpm = NULL;
 	struct lpm_nb_data nb_data;
-	int prompt = 0;
+	int prompt = 0, veto = 0;
 	unsigned int model_flags = 0;
 	unsigned long flags;
 	const int cpuid = smp_processor_id();
@@ -329,8 +329,22 @@ static int lpm_cpuidle_prepare(struct cpuidle_driver *drv, int index)
 
 	spin_lock_irqsave(&lpm_mod_locker, flags);
 
-	if (lpm && lpm->op.prompt)
+	if (lpm && lpm->op.prompt) {
 		prompt = lpm->op.prompt(cpuid, nb_data.issuer);
+		/*
+		 * op6893: let a model veto its own state.  lpm_state_enter()
+		 * already does `idx = ret ? 0 : idx`, i.e. a non-zero return
+		 * from here demotes the entry to WFI -- the same hook 4.19 had
+		 * as mtk_lp_cpuidle_prepare().  Nothing used it, because this
+		 * function returned 0 unconditionally.  Only negative returns
+		 * count, and every model in the tree returns 0, so this is inert
+		 * until a model asks for it.  Recorded rather than returned on
+		 * the spot: ct_cpuidle_exit() has already run and its
+		 * ct_cpuidle_enter() at the bottom must not be skipped.
+		 */
+		if (prompt < 0)
+			veto = prompt;
+	}
 
 	if (!unlikely(model_flags & LPM_REQ_NOBROADCAST)) {
 		prompt = lpm_notify_var(LPM_NB_AFTER_PROMPT, prompt);
@@ -347,7 +361,7 @@ static int lpm_cpuidle_prepare(struct cpuidle_driver *drv, int index)
 	if (!(target_state->flags & CPUIDLE_FLAG_RCU_IDLE))
 		ct_cpuidle_enter();
 
-	return 0;
+	return veto;
 }
 
 static void lpm_cpuidle_resume(struct cpuidle_driver *drv, int index, int ret)
