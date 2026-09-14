@@ -417,13 +417,35 @@ static int lpm_state_enter(int type, struct cpuidle_device *dev,
 {
 	int ret;
 	struct lpm_states_enter *cstate = this_cpu_ptr(&lpm_cstate);
+	state_enter enter;
 
 	ret = lpm_cpuidle_prepare(drv, idx);
 	idx = ret ? 0 : idx;
-	if (type == lpm_state_s2idle)
-		ret = cstate->s2idle[idx](dev, drv, idx);
-	else
-		ret = cstate->cpuidle[idx](dev, drv, idx);
+
+	/*
+	 * op6893: the demote-to-0 path above was dead code that crashed the
+	 * first time anything took it.
+	 *
+	 * lpm_cpuidle_state_percpu_set() fills cstate->cpuidle[] from index
+	 * **1** upward -- index 0 (WFI) is never registered because lpm has no
+	 * wrapper to install there -- so cstate->cpuidle[0] is NULL, and
+	 * `idx = ret ? 0 : idx` followed by cstate->cpuidle[idx]() is a NULL
+	 * call.  Measured as exactly that: a level-1 translation fault at
+	 * lpm_state_enter+0x1f0 on the idle task, the moment a model first
+	 * returned a veto.
+	 *
+	 * For idx 0 the driver's own enter function is still the original one
+	 * (percpu_set only swapped indices >= 1), so it is the right fallback.
+	 * For idx >= 1 drv->states[].enter is *this* wrapper, hence the NULL
+	 * check rather than always preferring the driver's.
+	 */
+	enter = (type == lpm_state_s2idle) ? cstate->s2idle[idx]
+					   : cstate->cpuidle[idx];
+	if (unlikely(!enter))
+		enter = (type == lpm_state_s2idle) ? drv->states[idx].enter_s2idle
+						   : drv->states[idx].enter;
+
+	ret = enter(dev, drv, idx);
 	lpm_cpuidle_resume(drv, idx, ret);
 
 	return ret;
