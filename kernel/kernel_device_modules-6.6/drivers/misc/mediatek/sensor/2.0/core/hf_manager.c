@@ -1690,6 +1690,94 @@ err_out:
 	return ret;
 }
 
+/* Legacy (4.19) ioctl_packet compat: same cmd numbers, _IOC_SIZE 68.
+ * Layout: sensor_type+padding (4B, identical offset) + 64B payload whose
+ * first bytes are status (bool), sensor_info, or custom_cmd -- the same
+ * offsets the split 6.6 packets use. Copy the 68B in, dispatch by _IOC_NR
+ * reusing the request_* helpers' logic inline, copy back.
+ */
+#define HF_LEGACY_PACKET_SIZE 68
+
+static long hf_manager_ioctl_legacy(struct file *filp,
+			unsigned int cmd, unsigned long arg)
+{
+	struct hf_client *client = filp->private_data;
+	void __user *ubuf = (void __user *)arg;
+	uint8_t raw[HF_LEGACY_PACKET_SIZE];
+	uint8_t sensor_type;
+	struct sensor_info info;
+	struct custom_cmd *cust_cmd;
+	struct hf_device *device = NULL;
+
+	if (_IOC_SIZE(cmd) != HF_LEGACY_PACKET_SIZE)
+		goto unknown;
+	memset(raw, 0, sizeof(raw));
+	if (copy_from_user(raw, ubuf, sizeof(raw)))
+		return -EFAULT;
+	sensor_type = raw[0];
+	if (unlikely(sensor_type >= SENSOR_TYPE_SENSOR_MAX))
+		return -EINVAL;
+
+	switch (_IOC_NR(cmd)) {
+	case _IOC_NR(HF_MANAGER_REQUEST_REGISTER_STATUS):
+		raw[4] = test_bit(sensor_type, sensor_list_bitmap);
+		if (copy_to_user(ubuf, raw, sizeof(raw)))
+			return -EFAULT;
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_BIAS_DATA):
+		hf_manager_update_bias(client, sensor_type, raw[4]);
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_CALI_DATA):
+		hf_manager_update_cali(client, sensor_type, raw[4]);
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_TEMP_DATA):
+		hf_manager_update_temp(client, sensor_type, raw[4]);
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_TEST_DATA):
+		hf_manager_update_test(client, sensor_type, raw[4]);
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_SENSOR_INFO):
+		if (!test_bit(sensor_type, sensor_list_bitmap))
+			return -EINVAL;
+		memset(&info, 0, sizeof(info));
+		if (hf_manager_get_sensor_info(client, sensor_type, &info))
+			return -EINVAL;
+		memcpy(raw + 4, &info, sizeof(info));
+		if (copy_to_user(ubuf, raw, sizeof(raw)))
+			return -EFAULT;
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_CUST_DATA):
+		if (!test_bit(sensor_type, sensor_list_bitmap))
+			return -EINVAL;
+		cust_cmd = (struct custom_cmd *)(raw + 4);
+		if (hf_manager_custom_cmd(client, sensor_type, cust_cmd))
+			return -EINVAL;
+		if (copy_to_user(ubuf, raw, sizeof(raw)))
+			return -EFAULT;
+		break;
+	case _IOC_NR(HF_MANAGER_REQUEST_READY_STATUS):
+		mutex_lock(&client->core->device_lock);
+		raw[4] = true;
+		list_for_each_entry(device, &client->core->device_list, list) {
+			if (!READ_ONCE(device->ready)) {
+				pr_err_ratelimited("Device:%s not ready\n",
+					device->dev_name);
+				raw[4] = false;
+				break;
+			}
+		}
+		mutex_unlock(&client->core->device_lock);
+		if (copy_to_user(ubuf, raw, sizeof(raw)))
+			return -EFAULT;
+		break;
+	default:
+unknown:
+		pr_err("Unknown command %u\n", cmd);
+		return -EINVAL;
+	}
+	return 0;
+}
+
 static long hf_manager_ioctl(struct file *filp,
 			unsigned int cmd, unsigned long arg)
 {
@@ -1713,8 +1801,17 @@ static long hf_manager_ioctl(struct file *filp,
 	case HF_MANAGER_REQUEST_DEBUG_INFO:
 		return hf_manager_ioctl_request_debug(filp, cmd, arg);
 	default:
-		pr_err("Unknown command %u\n", cmd);
-		return -EINVAL;
+		/* op6893 6.6 bring-up: the frozen vendor HAL was built
+		 * against the 4.19 hf_sensor_io.h, which funnels every
+		 * request through a single 68-byte ioctl_packet (cmd
+		 * numbers identical, _IOC_SIZE 68 instead of 8/44/68).
+		 * The headers share the 4-byte sensor_type+padding prefix
+		 * and the payload offsets (status at 4, sensor_info at 4,
+		 * custom_cmd at 4), so dispatch on _IOC_NR after
+		 * translating the size. DEBUG_INFO (cmd 9) is 6.6-only;
+		 * the old HAL never sends it.
+		 */
+		return hf_manager_ioctl_legacy(filp, cmd, arg);
 	}
 
 	return 0;

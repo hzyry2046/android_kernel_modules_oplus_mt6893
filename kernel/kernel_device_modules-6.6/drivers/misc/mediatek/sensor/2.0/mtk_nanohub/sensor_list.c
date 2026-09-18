@@ -22,6 +22,13 @@ enum sensorlist {
 	front_cct,
 	pwm_rgb,
 	flicker,
+	/* op6893 6.6 bring-up: hub-fed sensors the 4.19 baseline serves
+	 * (rear_als = mn29005, cct/sars companions). Without these the
+	 * get_devinfo loop skips them and they never reach the HAL.
+	 */
+	rear_als,
+	cct,
+	sars,
 	maxhandle,
 };
 
@@ -62,6 +69,15 @@ int sensorlist_sensor_to_handle(int sensor)
                 break;
 	case SENSOR_TYPE_FLICKER:
 		handle = flicker;
+		break;
+	case SENSOR_TYPE_REAR_ALS:
+		handle = rear_als;
+		break;
+	case SENSOR_TYPE_CCT:
+		handle = cct;
+		break;
+	case SENSOR_TYPE_SARS:
+		handle = sars;
 		break;
 	}
 	return handle;
@@ -104,6 +120,15 @@ int sensorlist_handle_to_sensor(int handle)
                 break;
 	case flicker:
 		type = SENSOR_TYPE_FLICKER;
+		break;
+	case rear_als:
+		type = SENSOR_TYPE_REAR_ALS;
+		break;
+	case cct:
+		type = SENSOR_TYPE_CCT;
+		break;
+	case sars:
+		type = SENSOR_TYPE_SARS;
 		break;
 	}
 	return type;
