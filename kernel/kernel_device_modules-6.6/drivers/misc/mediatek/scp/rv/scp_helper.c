@@ -1708,6 +1708,7 @@ static int scp_reserve_memory_ioremap(struct platform_device *pdev)
 	const char *mem_key;
 	unsigned int scp_mem_num = 0;
 	unsigned int i, m_idx, m_size, m_alignment;
+	int total_elems, elem_num;
 	int ret;
 
 	if (num != NUMS_MEM_ID) {
@@ -1757,19 +1758,47 @@ static int scp_reserve_memory_ioremap(struct platform_device *pdev)
 	}
 
 	/* Set reserved memory table */
-	scp_mem_num = scp_dt_count_u32_elems(
+	/* op6893 6.6 bring-up: the preserved 4.19 DTB spells this table as
+	 * (idx,size) pairs (4.19 MEMORY_TBL_ELEM_NUM 2); the 6.6 driver wants
+	 * (idx,size,align) triples. The two shapes cannot be told apart by
+	 * the element count (the live DTB's 18 u32s divide evenly by both 2
+	 * and 3), so validate the triple parse instead: every index must be
+	 * < NUMS_MEM_ID, and a shifted pairs-table fails that on the second
+	 * entry ("skip unexpected index, 304896"). On validation failure fall
+	 * back to pairs with alignment 1, which keeps the layout loop below
+	 * identical to 4.19 (plain append; the official mt6893.dtsi's align
+	 * 0 entries skip the round-up the same way).
+	 */
+	total_elems = scp_dt_count_u32_elems(
 				pdev->dev.of_node,
-				"scp-mem-tbl")
-				/ MEMORY_TBL_ELEM_NUM;
-	if (scp_mem_num <= 0) {
+				"scp-mem-tbl");
+	if (total_elems <= 0) {
 		pr_notice("[SCP] scp-mem-tbl not found\n");
 		scp_mem_num = 0;
+		elem_num = MEMORY_TBL_ELEM_NUM;
+	} else {
+		elem_num = MEMORY_TBL_ELEM_NUM;
+		scp_mem_num = total_elems / elem_num;
+		for (i = 0; i < scp_mem_num; i++) {
+			ret = scp_dt_read_u32_index(pdev->dev.of_node,
+					"scp-mem-tbl",
+					i * elem_num,
+					&m_idx);
+			if (ret || m_idx >= NUMS_MEM_ID)
+				break;
+		}
+		if (i < scp_mem_num && total_elems % 2 == 0) {
+			pr_notice("[SCP] scp-mem-tbl triple parse fails at entry %d (idx %d), legacy (idx,size) pairs\n",
+				i, ret ? -1 : (int)m_idx);
+			elem_num = 2;
+			scp_mem_num = total_elems / elem_num;
+		}
 	}
 
 	for (i = 0; i < scp_mem_num; i++) {
 		ret = scp_dt_read_u32_index(pdev->dev.of_node,
 				"scp-mem-tbl",
-				i * MEMORY_TBL_ELEM_NUM,
+				i * elem_num,
 				&m_idx);
 		if (ret) {
 			pr_notice("Cannot get memory index(%d)\n", i);
@@ -1789,7 +1818,7 @@ static int scp_reserve_memory_ioremap(struct platform_device *pdev)
 		} else {
 			ret = scp_dt_read_u32_index(pdev->dev.of_node,
 					"scp-mem-tbl",
-					(i * MEMORY_TBL_ELEM_NUM) + 1,
+					(i * elem_num) + 1,
 					&m_size);
 		}
 		if (ret) {
@@ -1797,14 +1826,21 @@ static int scp_reserve_memory_ioremap(struct platform_device *pdev)
 			return -1;
 		}
 
-		/* Probe memory alignment of feature that user register */
-		ret = scp_dt_read_u32_index(pdev->dev.of_node,
-				"scp-mem-tbl",
-				(i * MEMORY_TBL_ELEM_NUM) + 2,
-				&m_alignment);
-		if (ret) {
-			pr_notice("Cannot get memory alignment(%d)\n", i);
-			return -1;
+		/* Probe memory alignment of feature that user register.
+		 * Legacy (idx,size) pairs carry no alignment; 1 keeps the
+		 * layout loop below identical to 4.19 (plain append).
+		 */
+		if (elem_num == MEMORY_TBL_ELEM_NUM) {
+			ret = scp_dt_read_u32_index(pdev->dev.of_node,
+					"scp-mem-tbl",
+					(i * elem_num) + 2,
+					&m_alignment);
+			if (ret) {
+				pr_notice("Cannot get memory alignment(%d)\n", i);
+				return -1;
+			}
+		} else {
+			m_alignment = 1;
 		}
 
 		scp_reserve_mblock[m_idx].size = m_size;

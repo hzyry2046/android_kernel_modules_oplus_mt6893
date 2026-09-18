@@ -213,6 +213,8 @@ source "$(KCONFIG_EXT_PREFIX)drivers/misc/mediatek/sensor/2.0/oplus_virtual_sens
 
 source "$(KCONFIG_EXT_PREFIX)drivers/misc/mediatek/sensor/2.0/oplus_virtual_sensor/sensors/elevator_detecthub/Kconfig"
 
+source "$(KCONFIG_EXT_PREFIX)drivers/misc/mediatek/sensor/2.0/oplus_virtual_sensor/sensors/sensor_monitor/Kconfig"
+
 source "$(KCONFIG_EXT_PREFIX)drivers/misc/mediatek/sensor/1.0/oplus_sensor_devinfo/Kconfig"
 
 source "$(KCONFIG_EXT_PREFIX)drivers/misc/mediatek/sensor/1.0/oplus_virtual_sensor/Kconfig"
