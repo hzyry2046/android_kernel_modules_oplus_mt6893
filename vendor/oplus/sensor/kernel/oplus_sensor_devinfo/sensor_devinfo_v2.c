@@ -1824,13 +1824,22 @@ void  mag_soft_parameter_init(void)
 {
 	int ret = -1;
 	int index = 0;
+	bool created = false;
 
 	for (index = 0; index < 3; index++) {
 		ret = get_msensor_parameter(index);
 		if (ret == -1) {
 			para_buf[index][0] = '\0';
-		} else {
+		} else if (!created) {
+			/* op6893 6.6 bring-up: create once. The old DTB
+			 * has two msensor nodes without libname, so index
+			 * 0 and 1 both fail after logging, and a naive
+			 * per-success create would WARN on the second
+			 * proc_create of the same name. One node is enough
+			 * to serve the parameter.
+			 */
 			proc_create("mag_soft_parameter.json", 0666, NULL, &parameter_proc_fops);
+			created = true;
 		}
 	}
 }
