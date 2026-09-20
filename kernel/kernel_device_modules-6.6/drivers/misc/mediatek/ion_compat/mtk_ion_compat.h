@@ -12,6 +12,9 @@
  * Usage is publish -> send the message -> wait for the ack -> unpublish, which
  * mirrors where 4.19 closed the injected descriptor.
  *
+ * mtk_ion_publish_dmabuf_s16() is the same thing for the wire structures whose
+ * descriptor fields are __s16 (the encoder's venc_ap_ipi_msg_enc): its
+ * descriptor is negative, so it fits, and no real descriptor can be.
  * Implemented in drivers/misc/mediatek/ion_compat/mtk_ion_compat.c.
  *
  * mtk_ion_compat is built unconditionally (obj-m, no Kconfig symbol), so this
@@ -24,7 +27,8 @@
 
 struct dma_buf;
 
-int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf);
+int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf, int *fd);
+int mtk_ion_publish_dmabuf_s16(struct dma_buf *dmabuf, int *fd);
 void mtk_ion_unpublish_dmabuf(int fd);
 
 #endif /* _MTK_ION_COMPAT_H_ */

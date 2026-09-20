@@ -366,6 +366,7 @@ static int ion_map(struct ion_handle *h, int module_id)
 	if (IS_ERR(h->attach)) {
 		ret = PTR_ERR(h->attach);
 		h->attach = NULL;
+		pr_info("ion: attach port 0x%x fail %d\n", module_id, ret);
 		return ret;
 	}
 
@@ -375,6 +376,7 @@ static int ion_map(struct ion_handle *h, int module_id)
 		h->sgt = NULL;
 		dma_buf_detach(h->dmabuf, h->attach);
 		h->attach = NULL;
+		pr_info("ion: map port 0x%x fail %d\n", module_id, ret);
 		return ret;
 	}
 
@@ -542,6 +544,16 @@ static long ion_ioctl_free(struct ion_client *client, void __user *argp)
 #define MTK_ION_SYNTHETIC_FD_BASE	0x40000000
 #define MTK_ION_SYNTHETIC_FD_LIMIT	0x10000		/* live at once */
 
+/*
+ * op6893: the encoder's venc_ap_ipi_msg_enc carries its buffer descriptors in
+ * __s16 fields, so a descriptor only reaches vpud if it also fits in
+ * -32768..-1.  Negative numbers can never be a real descriptor, so this range
+ * cannot collide with one, and vpud's ldrsh.w sign-extends it back to the same
+ * 32-bit value the ioctl then carries.  Same registry, same handle space; only
+ * the number handed out differs.  See mtk_ion_publish_dmabuf_s16().
+ */
+#define MTK_ION_SYNTHETIC_SMALL_BASE	(-0x8000)
+
 struct mtk_ion_synthetic {
 	struct dma_buf *dmabuf;
 };
@@ -549,14 +561,26 @@ struct mtk_ion_synthetic {
 static DEFINE_XARRAY(mtk_ion_synthetic);
 static DEFINE_IDA(mtk_ion_synthetic_ida);
 
-/**
- * mtk_ion_publish_dmabuf - make @dmabuf importable by descriptor elsewhere
- * @dmabuf: buffer to publish; the registry takes its own reference
- *
- * Returns a synthetic descriptor number -- always positive, so a 32-bit caller
- * storing it in an int is safe -- or a negative errno.
+/*
+ * Map a descriptor back to its handle id, or -1 when it is not one of ours.
+ * The two bases are checked separately because only their difference from the
+ * right base yields an id.
  */
-int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf)
+static int mtk_ion_synthetic_id(int fd)
+{
+	if (fd >= MTK_ION_SYNTHETIC_FD_BASE)
+		return fd - MTK_ION_SYNTHETIC_FD_BASE;
+	if (fd < 0 && fd >= MTK_ION_SYNTHETIC_SMALL_BASE)
+		return fd - MTK_ION_SYNTHETIC_SMALL_BASE;
+	return -1;
+}
+
+/*
+ * Shared body.  The descriptor goes out through @fd rather than the return
+ * value: one of the two bases is negative, so a descriptor and an errno are
+ * both "a small negative int" and the caller could not tell them apart.
+ */
+static int mtk_ion_publish(struct dma_buf *dmabuf, int base, int limit, int *fd)
 {
 	struct mtk_ion_synthetic *entry;
 	void *old;
@@ -569,8 +593,7 @@ int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf)
 	if (!entry)
 		return -ENOMEM;
 
-	id = ida_alloc_max(&mtk_ion_synthetic_ida, MTK_ION_SYNTHETIC_FD_LIMIT - 1,
-			   GFP_KERNEL);
+	id = ida_alloc_max(&mtk_ion_synthetic_ida, limit - 1, GFP_KERNEL);
 	if (id < 0) {
 		kfree(entry);
 		return id;
@@ -586,9 +609,41 @@ int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf)
 		return xa_err(old);
 	}
 
-	return MTK_ION_SYNTHETIC_FD_BASE + id;
+	*fd = base + id;
+	return 0;
+}
+
+/**
+ * mtk_ion_publish_dmabuf - make @dmabuf importable by descriptor elsewhere
+ * @dmabuf: buffer to publish; the registry takes its own reference
+ * @fd:     out, the descriptor: always positive, so a 32-bit caller storing it
+ *          in an int is safe
+ *
+ * Returns 0 or a negative errno.
+ */
+int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf, int *fd)
+{
+	return mtk_ion_publish(dmabuf, MTK_ION_SYNTHETIC_FD_BASE,
+			       MTK_ION_SYNTHETIC_FD_LIMIT, fd);
 }
 EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf);
+
+/**
+ * mtk_ion_publish_dmabuf_s16 - as mtk_ion_publish_dmabuf(), but the descriptor
+ * fits in a signed 16-bit field
+ * @dmabuf: buffer to publish
+ * @fd:     out, the descriptor: in [-32768, -1], which no real one can be, and
+ *          which vpud's ldrsh.w sign-extends back to the same value
+ *
+ * For the wire structures whose descriptor fields are __s16 (the encoder's
+ * venc_ap_ipi_msg_enc).  Returns 0 or a negative errno.
+ */
+int mtk_ion_publish_dmabuf_s16(struct dma_buf *dmabuf, int *fd)
+{
+	return mtk_ion_publish(dmabuf, MTK_ION_SYNTHETIC_SMALL_BASE,
+			       -MTK_ION_SYNTHETIC_SMALL_BASE, fd);
+}
+EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf_s16);
 
 /**
  * mtk_ion_unpublish_dmabuf - drop a descriptor published above
@@ -599,10 +654,10 @@ void mtk_ion_unpublish_dmabuf(int fd)
 	struct mtk_ion_synthetic *entry;
 	int id;
 
-	if (fd < MTK_ION_SYNTHETIC_FD_BASE)
+	id = mtk_ion_synthetic_id(fd);
+	if (id < 0)
 		return;
 
-	id = fd - MTK_ION_SYNTHETIC_FD_BASE;
 	entry = xa_erase(&mtk_ion_synthetic, id);
 	if (!entry)
 		return;
@@ -620,11 +675,12 @@ EXPORT_SYMBOL_GPL(mtk_ion_unpublish_dmabuf);
 static struct dma_buf *mtk_ion_synthetic_get(int fd)
 {
 	struct mtk_ion_synthetic *entry;
+	int id = mtk_ion_synthetic_id(fd);
 
-	if (fd < MTK_ION_SYNTHETIC_FD_BASE)
+	if (id < 0)
 		return NULL;
 
-	entry = xa_load(&mtk_ion_synthetic, fd - MTK_ION_SYNTHETIC_FD_BASE);
+	entry = xa_load(&mtk_ion_synthetic, id);
 	if (!entry)
 		return NULL;
 
@@ -652,8 +708,20 @@ static long ion_ioctl_import(struct ion_client *client, void __user *argp)
 		 * way to name a buffer -- see mtk_ion_publish_dmabuf().
 		 */
 		dmabuf = mtk_ion_synthetic_get(data.fd);
-		if (!dmabuf)
+		if (!dmabuf) {
+			/*
+			 * op6893 diagnostic: a vdec fd that is neither in this
+			 * process nor in the registry is the one failure this
+			 * layer cannot recover from, so name the caller.
+			 */
+			if (mtk_ion_synthetic_id(data.fd) >= 0)
+				pr_info("ion: import FAILED pid=%d(%s) fd=0x%x err=%ld\n",
+					current->tgid, current->comm,
+					data.fd, err);
 			return err;
+		}
+		pr_info("ion: import synthetic pid=%d(%s) fd=0x%x ok\n",
+			current->tgid, current->comm, data.fd);
 	}
 
 	h = kzalloc(sizeof(*h), GFP_KERNEL);
@@ -761,6 +829,16 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 	u32 word;
 	int module_id, ret;
 	int i;
+	/* op6893: vpud is 32-bit, its struct ion_mm_data packs module_id @12,
+	 * phy_addr @16 and len @24; the 64-bit layout (libdpframework) has
+	 * them @16/@40/@48.  Using the 64-bit offsets for a 32-bit caller
+	 * reads module_id as 0 (maps to larb0 instead of larb7) and writes
+	 * the iova where the caller never looks, so it keeps a stale
+	 * 0x0f... address and VENC never starts.
+	 */
+	int off_module = compat ? 12 : ION_MM_OFF_MODULE_ID;
+	int off_phy = compat ? 16 : ION_MM_OFF_PHY_ADDR;
+	int off_len = compat ? 24 : ION_MM_OFF_LEN;
 
 	if (compat) {
 		/*
@@ -791,7 +869,7 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 	switch (mm_cmd) {
 	case ION_MM_CONFIG_BUFFER:
 	case ION_MM_CONFIG_BUFFER_EXT:
-		if (copy_from_user(&module_id, uarg + ION_MM_OFF_MODULE_ID,
+		if (copy_from_user(&module_id, uarg + off_module,
 				   sizeof(module_id)))
 			return -EFAULT;
 		h->module_id = module_id;
@@ -805,7 +883,7 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 
 	case ION_MM_GET_IOVA:
 	case ION_MM_GET_IOVA_EXT:
-		if (copy_from_user(&module_id, uarg + ION_MM_OFF_MODULE_ID,
+		if (copy_from_user(&module_id, uarg + off_module,
 				   sizeof(module_id)))
 			return -EFAULT;
 
@@ -813,10 +891,10 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 		if (ret)
 			return ret;
 
-		if (copy_to_user(uarg + ION_MM_OFF_PHY_ADDR, &h->iova,
+		if (copy_to_user(uarg + off_phy, &h->iova,
 				 sizeof(u64)))
 			return -EFAULT;
-		if (copy_to_user(uarg + ION_MM_OFF_LEN, &h->len,
+		if (copy_to_user(uarg + off_len, &h->len,
 				 sizeof(unsigned long)))
 			return -EFAULT;
 		return 0;

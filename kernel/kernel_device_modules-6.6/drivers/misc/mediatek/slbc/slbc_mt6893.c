@@ -1279,6 +1279,9 @@ static int slbc_probe(struct platform_device *pdev)
 
 	node = of_find_compatible_node(NULL, NULL,
 			"mediatek,mtk-slbc");
+	if (!node)
+		node = of_find_compatible_node(NULL, NULL,
+				"mediatek,slbc");
 	if (node) {
 		ret = of_property_read_string(node,
 				"status", (const char **)&buf);
@@ -1343,6 +1346,8 @@ static int slbc_resume(struct platform_device *pdev)
 
 static const struct of_device_id slbc_of_match[] = {
 	{ .compatible = "mediatek,mtk-slbc", },
+	/* op6893: the frozen 4.19 DTB names this node "mediatek,slbc" */
+	{ .compatible = "mediatek,slbc", },
 	{}
 };
 
