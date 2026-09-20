@@ -7889,7 +7889,14 @@ static void aw8697_haptic_brightness_set(struct led_classdev *cdev,
 
     aw8697->amplitude = level;
 
-    schedule_work(&aw8697->vib_i2c_operation_work);
+    /* Keep the LED-class path synchronous, as in the device's 4.19 driver. */
+    mutex_lock(&aw8697->lock);
+    aw8697_haptic_stop(aw8697);
+    if (aw8697->amplitude > 0) {
+        aw8697_haptic_ram_vbat_comp(aw8697, false);
+        aw8697_haptic_play_wav_seq(aw8697, aw8697->amplitude);
+    }
+    mutex_unlock(&aw8697->lock);
 
 }
 #endif
@@ -10116,6 +10123,13 @@ static int aw8697_vibrator_init(struct aw8697 *aw8697)
     aw8697->cdev.name = "vibrator";
     aw8697->cdev.brightness_get = aw8697_haptic_brightness_get;
     aw8697->cdev.brightness_set = aw8697_haptic_brightness_set;
+    /*
+     * Android init writes "transient" to every vibrator LED so that a
+     * generic vibrator can gain activate/duration/state controls.  AW8697
+     * already owns those controls.  Attaching transient here collides with
+     * the driver attributes and the failed trigger setup removes them.
+     */
+    aw8697->cdev.flags |= LED_NO_SYSFS_TRIGGER;
 
     ret = devm_led_classdev_register(&aw8697->i2c->dev, &aw8697->cdev);
     if (ret < 0){
