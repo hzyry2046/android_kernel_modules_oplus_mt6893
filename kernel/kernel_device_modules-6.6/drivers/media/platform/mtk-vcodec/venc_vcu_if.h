@@ -45,6 +45,14 @@ struct venc_vcu_inst {
 	struct mutex *ctx_ipi_lock;
 	struct list_head bufs;
 };
+
+/*
+ * op6893: the encoder state the 4.19 daemon does not have lives in
+ * struct venc_inst (see struct venc_ext in venc_drv_if.h), but the vcu_enc_*()
+ * entry points are only handed &inst->vcu_inst.
+ */
+#define VENC_EXT(vcu)	(&container_of((vcu), struct venc_inst, vcu_inst)->ext)
+
 int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv);
 int vcu_enc_init(struct venc_vcu_inst *vcu);
 int vcu_enc_query_cap(struct venc_vcu_inst *vcu, unsigned int id, void *out);

@@ -32,7 +32,12 @@ static void put_fb_to_free(struct vdec_inst *inst, struct vdec_fb *fb)
 						 fb->fb_base[0].va,
 						 (u64)fb->fb_base[1].dma_addr);
 
-		list->fb_list[list->write_idx].vdec_fb_va = (u64)(fb->index + 1);
+		/*
+		 * op6893: 4.19 puts the kernel pointer here and both peers pass it
+		 * around verbatim -- this tree's ring-index scheme never reaches the
+		 * wire.  See the note above vdec_decode().
+		 */
+		list->fb_list[list->write_idx].vdec_fb_va = (u64)(uintptr_t)fb;
 		list->write_idx = (list->write_idx == DEC_MAX_FB_NUM - 1U) ?
 						  0U : list->write_idx + 1U;
 		list->count++;
@@ -270,9 +275,8 @@ static void vdec_publish_buffers(struct vdec_inst *inst,
 
 	inst->vsi->dec.bs_fd = 0;
 	if (bs->dmabuf) {
-		fd = mtk_ion_publish_dmabuf(bs->dmabuf);
-		if (fd < 0) {
-			mtk_vcodec_err(inst, "cannot publish bs dmabuf: %d", fd);
+		if (mtk_ion_publish_dmabuf(bs->dmabuf, &fd) < 0) {
+			mtk_vcodec_err(inst, "cannot publish bs dmabuf");
 		} else {
 			inst->vsi->dec.bs_fd = (u64)fd;
 			inst->priv.published_fds[VDEC_PUB_BS] = fd;
@@ -289,10 +293,8 @@ static void vdec_publish_buffers(struct vdec_inst *inst,
 		if (!fb->fb_base[i].dmabuf)
 			continue;
 
-		fd = mtk_ion_publish_dmabuf(fb->fb_base[i].dmabuf);
-		if (fd < 0) {
-			mtk_vcodec_err(inst, "cannot publish fb plane %u dmabuf: %d",
-				i, fd);
+		if (mtk_ion_publish_dmabuf(fb->fb_base[i].dmabuf, &fd) < 0) {
+			mtk_vcodec_err(inst, "cannot publish fb plane %u dmabuf", i);
 			continue;
 		}
 		inst->vsi->dec.fb_fd[i] = (u64)fd;
@@ -309,9 +311,8 @@ static void vdec_publish_buffers(struct vdec_inst *inst,
 	 * it means.
 	 */
 	if (fb->dma_general_buf) {
-		fd = mtk_ion_publish_dmabuf(fb->dma_general_buf);
-		if (fd < 0) {
-			mtk_vcodec_err(inst, "cannot publish general dmabuf: %d", fd);
+		if (mtk_ion_publish_dmabuf(fb->dma_general_buf, &fd) < 0) {
+			mtk_vcodec_err(inst, "cannot publish general dmabuf");
 			inst->vsi->general_buf_fd = -1;
 		} else {
 			inst->vsi->general_buf_fd = fd;
@@ -376,7 +377,13 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 		(bs_fourcc >> 8) & 0xFF, (bs_fourcc >> 16) & 0xFF,
 		(bs_fourcc >> 24) & 0xFF);
 
-	inst->vsi->dec.vdec_bs_va = (u64)(bs->index + 1);
+	/*
+	 * op6893: 4.19 publishes the kernel pointers and the daemon echoes them
+	 * back into the ring lists verbatim; this tree had swapped in ring
+	 * indices, which the daemon has no way to make sense of.  Keep the
+	 * pointer form on the wire (see vdec_get_bs() / vdec_get_fb()).
+	 */
+	inst->vsi->dec.vdec_bs_va = (u64)(uintptr_t)bs;
 	inst->vsi->dec.bs_dma = (uint64_t)bs->dma_addr;
 
 	for (i = 0; i < num_planes; i++)
@@ -387,7 +394,7 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 		inst->vsi->dec.index = 0xFF;
 	}
 	if (fb != NULL) {
-		inst->vsi->dec.vdec_fb_va = (u64)(fb->index + 1);
+		inst->vsi->dec.vdec_fb_va = (u64)(uintptr_t)fb;
 		inst->vsi->dec.index = fb->index;
 		if (fb->dma_general_buf != 0) {
 			inst->vsi->general_buf_fd = fb->general_buf_fd;
@@ -438,9 +445,28 @@ static int vdec_decode(unsigned long h_vdec, struct mtk_vcodec_mem *bs,
 		(fm_fourcc >> 8) & 0xFF, (fm_fourcc >> 16) & 0xFF,
 		(fm_fourcc >> 24) & 0xFF);
 
+	/*
+	 * op6893 diagnostic: everything the daemon can read out of vsi->dec for
+	 * this AP_IPIMSG_DEC_START.  Kept to one line so the 6.6 trace can be
+	 * diffed against the same fields on 4.19.
+	 */
+	mtk_vcodec_debug(inst, "vsi->dec bs_va=%llx bs_dma=%llx fb_va=%llx fb_dma0=%llx index=%d planes=%d dpb=%d queued=%d ts=%llu",
+		inst->vsi->dec.vdec_bs_va, inst->vsi->dec.bs_dma,
+		inst->vsi->dec.vdec_fb_va, inst->vsi->dec.fb_dma[0],
+		inst->vsi->dec.index, inst->vsi->dec.fb_num_planes,
+		inst->vsi->dec.dpb_sz, inst->vsi->dec.queued_frame_buf_count,
+		inst->vsi->dec.timestamp);
+
 	data[0] = (unsigned int)bs->size;
 	data[1] = (unsigned int)bs->length;
 	data[2] = (unsigned int)bs->flags;
+	/*
+	 * op6893 diagnostic: these three words are all the daemon is told about
+	 * the bitstream it is about to parse, so log them at the same level as
+	 * the fd line above.
+	 */
+	mtk_vcodec_debug(inst, "START bs size=%u length=%u flags=0x%x",
+		data[0], data[1], data[2]);
 	data[3] =
 		inst->ctx->dec_params.fixed_max_frame_size_width;
 	data[4] =
@@ -493,7 +519,6 @@ err_free_fb_out:
 static void vdec_get_bs(struct vdec_inst *inst,
 	struct ring_bs_list *list, struct mtk_vcodec_mem **out_bs)
 {
-	u64 bs_index;
 	unsigned long vdec_bs_va;
 	struct mtk_vcodec_mem *bs;
 
@@ -504,10 +529,16 @@ get_bs:
 		return;
 	}
 
-	bs_index = list->vdec_bs_va_list[list->read_idx];
-	if (bs_index == 0 || bs_index > VB2_MAX_FRAME) {
-		mtk_vcodec_err(inst, "free bs list read_idx %d bs_index %lld invalid !",
-			list->read_idx, bs_index);
+	/*
+	 * op6893: 4.19 stores the kernel pointer the driver published in
+	 * vsi->dec.vdec_bs_va, not an index -- the 4.19 daemon echoes whatever it
+	 * was handed, so a pointer is what comes back.  Validate it as a pointer
+	 * (this tree used to range-check an index here).
+	 */
+	vdec_bs_va = (unsigned long)list->vdec_bs_va_list[list->read_idx];
+	if (vdec_bs_va < PAGE_SIZE) {
+		mtk_vcodec_err(inst, "free bs list read_idx %d bs_va %lx invalid !",
+			list->read_idx, vdec_bs_va);
 		list->read_idx = (list->read_idx == DEC_MAX_BS_NUM - 1U) ? 0U : list->read_idx + 1U;
 		list->count--;
 		if (list->count > 0)
@@ -517,11 +548,10 @@ get_bs:
 			return;
 		}
 	}
-	vdec_bs_va = (unsigned long)inst->ctx->bs_list[bs_index];
 	bs = (struct mtk_vcodec_mem *)vdec_bs_va;
 
 	*out_bs = bs;
-	mtk_vcodec_debug(inst, "[BS] get free bs %lld %lx", bs_index, vdec_bs_va);
+	mtk_vcodec_debug(inst, "[BS] get free bs %lx", vdec_bs_va);
 
 	list->read_idx = (list->read_idx == DEC_MAX_BS_NUM - 1) ? 0 : list->read_idx + 1;
 	list->count--;
@@ -530,7 +560,6 @@ get_bs:
 static void vdec_get_fb(struct vdec_inst *inst,
 	struct ring_fb_list *list, bool disp_list, struct vdec_fb **out_fb)
 {
-	u64 fb_index;
 	unsigned long vdec_fb_va;
 	struct vdec_fb *fb;
 
@@ -551,10 +580,11 @@ get_fb:
 		return;
 	}
 
-	fb_index = (u64)list->fb_list[list->read_idx].vdec_fb_va;
-	if (fb_index == 0 || fb_index > VB2_MAX_FRAME) {
-		mtk_vcodec_err(inst, "%s fb list read_idx %d fb_index %lld invalid !",
-			disp_list ? "disp" : "free", list->read_idx, fb_index);
+	/* op6893: a kernel pointer, as 4.19 carries it -- see vdec_get_bs(). */
+	vdec_fb_va = (unsigned long)list->fb_list[list->read_idx].vdec_fb_va;
+	if (vdec_fb_va < PAGE_SIZE) {
+		mtk_vcodec_err(inst, "%s fb list read_idx %d fb_va %lx invalid !",
+			disp_list ? "disp" : "free", list->read_idx, vdec_fb_va);
 		list->read_idx = (list->read_idx == DEC_MAX_FB_NUM - 1U) ? 0U : list->read_idx + 1U;
 		list->count--;
 		if (list->count > 0)
@@ -564,7 +594,6 @@ get_fb:
 			return;
 		}
 	}
-	vdec_fb_va = (unsigned long)inst->ctx->fb_list[fb_index];
 	fb = (struct vdec_fb *)vdec_fb_va;
 	if (fb == NULL)
 		return;
@@ -898,8 +927,19 @@ static int vdec_set_param(unsigned long h_vdec,
 			return -EINVAL;
 		inst->priv.dec_params.decode_mode = (__u32)(*param_ptr);
 		inst->priv.dec_params.dec_param_change |= MTK_DEC_PARAM_DECODE_MODE;
-		ret = vcu_dec_set_param(&inst->vcu,
-			SET_PARAM_419_DECODE_MODE, in, 1U);
+		/*
+		 * op6893: keep this local.  4.19 has the same forwarding code, but
+		 * its HAL never sets V4L2_CID_MPEG_MTK_DECODE_MODE, so this branch
+		 * is dead there and the daemon never sees the message -- measured
+		 * on 4.19: the only SET_PARAMs before AP_IPIMSG_DEC_START are two
+		 * FRAME_SIZE ones.  This tree does reach the branch (its control
+		 * setup runs s_ctrl for the freshly registered control), and the
+		 * daemon answers it before its codec instance exists, which is when
+		 * it is not yet able to serve it.  The decode mode reaches the
+		 * daemon at open time regardless: 4.19's daemon logs its own
+		 * "[Vdec_Drv_H264_open] eDecodeMode: 5" with nothing sent from the
+		 * kernel, so dropping this message restores the 4.19 wire.
+		 */
 		break;
 	case SET_PARAM_WAIT_KEY_FRAME:
 		if (inst->vsi == NULL)

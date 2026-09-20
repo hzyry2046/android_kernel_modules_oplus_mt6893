@@ -15,6 +15,7 @@
 #include "mtk_vcodec_enc_pm.h"
 #include "mtk_vcodec_enc.h"
 #include "mtk_heap.h"
+#include "mtk_ion_compat.h"
 
 static void handle_enc_init_msg(struct venc_vcu_inst *vcu, void *data)
 {
@@ -22,7 +23,15 @@ static void handle_enc_init_msg(struct venc_vcu_inst *vcu, void *data)
 
 	if (vcu == NULL)
 		return;
+	/*
+	 * op6893: the daemon's INIT_DONE carries the shared-memory VSI offset
+	 * in the low 32 bits of the venc_inst slot (+8), not in the
+	 * vcu_inst_addr slot (+16) that 4.19's own kernel read.  Print both so
+	 * the next run settles which field the daemon fills.
+	 */
 	vcu->inst_addr = msg->vcu_inst_addr;
+	pr_info("[VCUDBG] enc init ack: venc_inst=0x%llx status=%d vcu_inst_addr=0x%x reserved=0x%x\n",
+		msg->venc_inst, msg->status, msg->vcu_inst_addr, msg->reserved);
 	vcu->vsi = VCU_FPTR(vcu_mapping_dm_addr)(vcu->dev, msg->vcu_inst_addr);
 }
 
@@ -138,19 +147,13 @@ static int handle_enc_get_bs_buf(struct venc_vcu_inst *vcu, void *data)
 }
 int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv)
 {
-	struct mtk_vcodec_dev *dev = (struct mtk_vcodec_dev *)priv;
 	struct venc_vcu_ipi_msg_common *msg = data;
-	int msg_ctx_id;
 	struct venc_vcu_inst *vcu;
 	struct venc_vsi *vsi = NULL;
-	struct venc_inst *inst = NULL;
 	struct mtk_vcodec_ctx *ctx;
 	int ret = 0;
 	unsigned long flags;
 	struct task_struct *task = NULL;
-	struct list_head *p, *q;
-	struct mtk_vcodec_ctx *temp_ctx;
-	int msg_valid = 0;
 	int lock = -1;
 
 	BUILD_BUG_ON(sizeof(struct venc_ap_ipi_msg_init) > SHARE_BUF_SIZE);
@@ -171,35 +174,25 @@ int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv)
 	VCU_FPTR(vcu_get_task)(&task, 0);
 	if (msg == NULL || task == NULL ||
 	   task->tgid != current->tgid ||
-	   msg->ap_inst_addr == 0) {
+	   (struct venc_vcu_inst *)(unsigned long)msg->venc_inst == NULL) {
 		VCU_FPTR(vcu_put_task)();
 		ret = -EINVAL;
 		return ret;
 	}
 	VCU_FPTR(vcu_put_task)();
 
-	msg_ctx_id = (int)msg->ap_inst_addr;
-
-	/* Check IPI inst is valid */
-	mutex_lock(&dev->ctx_mutex);
-	msg_valid = 0;
-	list_for_each_safe(p, q, &dev->ctx_list) {
-		temp_ctx = list_entry(p, struct mtk_vcodec_ctx, list);
-		inst = (struct venc_inst *)temp_ctx->drv_handle;
-		if (inst != NULL && msg_ctx_id == temp_ctx->id) {
-			vcu = &inst->vcu_inst;
-			msg_valid = 1;
-			break;
-		}
+	/*
+	 * op6893: the daemon echoes back the instance pointer it was handed, so
+	 * venc_inst is the lookup key, and it is also the priv that
+	 * vcu_ipi_send recorded for this channel.  The instance-independent ids
+	 * (>= VCU_IPIMSG_ENC_POWER_ON) are broadcast on the common channel and
+	 * carry that channel's priv instead, so they skip the comparison.
+	 */
+	vcu = (struct venc_vcu_inst *)(unsigned long)msg->venc_inst;
+	if (vcu != priv && msg->msg_id < VCU_IPIMSG_ENC_POWER_ON) {
+		pr_info("%s, vcu:%p != priv:%p\n", __func__, vcu, priv);
+		return 1;
 	}
-	if (!msg_valid) {
-		mtk_v4l2_err(" msg msg_id %X vcu not exist %d\n",
-			msg->msg_id, msg_ctx_id);
-		mutex_unlock(&dev->ctx_mutex);
-		ret = -EINVAL;
-		return ret;
-	}
-	mutex_unlock(&dev->ctx_mutex);
 
 	if (vcu->daemon_pid != current->tgid) {
 		pr_info("%s, vcu->daemon_pid:%d != current %d\n",
@@ -229,7 +222,7 @@ int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv)
 		break;
 	case VCU_IPIMSG_ENC_POWER_ON:
 		/*use status to store core ID*/
-		ctx->sysram_enable = vsi->config.sysram_enable;
+		ctx->sysram_enable = VENC_EXT(vcu)->sysram_enable;
 		VCU_FPTR(vcu_get_gce_lock)(vcu->dev, VCU_VENC);
 		while (lock != 0) {
 			lock = venc_lock(ctx, 0, true);
@@ -247,7 +240,7 @@ int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv)
 	case VCU_IPIMSG_ENC_POWER_OFF:
 		/*use status to store core ID*/
 		VCU_FPTR(vcu_get_gce_lock)(vcu->dev, VCU_VENC);
-		ctx->sysram_enable = vsi->config.sysram_enable;
+		ctx->sysram_enable = VENC_EXT(vcu)->sysram_enable;
 		venc_encode_unprepare(ctx, msg->status, &flags);
 		venc_unlock(ctx, 0);
 		VCU_FPTR(vcu_put_gce_lock)(vcu->dev, VCU_VENC);
@@ -284,6 +277,8 @@ int vcu_enc_ipi_handler(void *data, unsigned int len, void *priv)
 		ret = 1;
 		break;
 	case VCU_IPIMSG_ENC_ENCODE_DONE:
+		break;
+	case VCU_IPIMSG_ENC_ENCODE_ACK:
 		break;
 	case VCU_IPIMSG_ENC_CHECK_CODEC_ID:
 		if (check_codec_id(msg, ctx->q_data[MTK_Q_DATA_DST].fmt->fourcc) == 0)
@@ -350,7 +345,8 @@ static int vcu_enc_send_msg(struct venc_vcu_inst *vcu, void *msg,
 	}
 	VCU_FPTR(vcu_put_task)();
 
-	status = VCU_FPTR(vcu_ipi_send)(vcu->dev, vcu->id, msg, len, vcu->ctx->dev);
+	/* the priv is the instance itself -- the daemon echoes it back */
+	status = VCU_FPTR(vcu_ipi_send)(vcu->dev, vcu->id, msg, len, vcu);
 	if (status) {
 		mtk_vcodec_err(vcu, "vcu_ipi_send msg_id %x len %d fail %d",
 					   *(uint32_t *)msg, len, status);
@@ -438,7 +434,7 @@ int vcu_enc_init(struct venc_vcu_inst *vcu)
 	VCU_FPTR(vcu_get_ctx_ipi_binding_lock)(vcu->dev, &vcu->ctx_ipi_lock, VCU_VENC);
 
 	status = VCU_FPTR(vcu_ipi_register)(vcu->dev,
-		vcu->id, vcu->handler, NULL, vcu->ctx->dev);
+		vcu->id, vcu->handler, NULL, vcu);
 	if (status) {
 		mtk_vcodec_err(vcu, "vcu_ipi_register fail %d", status);
 		return -EINVAL;
@@ -446,8 +442,7 @@ int vcu_enc_init(struct venc_vcu_inst *vcu)
 
 	memset(&out, 0, sizeof(out));
 	out.msg_id = AP_IPIMSG_ENC_INIT;
-	out.ap_inst_addr = (unsigned long)vcu->ctx->id;
-	out.ctx_id = vcu->ctx->id;
+	out.venc_inst = (unsigned long)vcu;
 
 	vcu_enc_set_pid(vcu);
 	status = vcu_enc_send_msg(vcu, &out, sizeof(out));
@@ -483,7 +478,7 @@ int vcu_enc_query_cap(struct venc_vcu_inst *vcu, unsigned int id, void *out)
 	vcu->handler = vcu_enc_ipi_handler;
 
 	err = VCU_FPTR(vcu_ipi_register)(vcu->dev,
-		vcu->id, vcu->handler, NULL, vcu->ctx->dev);
+		vcu->id, vcu->handler, NULL, vcu);
 	if (err != 0) {
 		mtk_vcodec_err(vcu, "vcu_ipi_register fail status=%d", err);
 		return err;
@@ -492,11 +487,8 @@ int vcu_enc_query_cap(struct venc_vcu_inst *vcu, unsigned int id, void *out)
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_ENC_QUERY_CAP;
 	msg.id = id;
-	/*
-	 * 4.19 vpud echoes ap_inst_addr back in the ack; this driver's handler
-	 * matches it against ctx->id, so send the ctx id.
-	 */
-	msg.ap_inst_addr = (unsigned long)vcu->ctx->id;
+	/* 4.19 sends the instance and the daemon echoes it back in the ack. */
+	msg.ap_inst_addr = (uintptr_t)vcu;
 	msg.ap_data_addr = (uintptr_t)out;
 
 	vcu_enc_set_pid(vcu);
@@ -522,7 +514,6 @@ int vcu_enc_set_param(struct venc_vcu_inst *vcu,
 	memset(&out, 0, sizeof(out));
 	out.msg_id = AP_IPIMSG_ENC_SET_PARAM;
 	out.vcu_inst_addr = vcu->inst_addr;
-	out.ctx_id = vcu->ctx->id;
 	out.param_id = id;
 	switch (id) {
 	case VENC_SET_PARAM_ENC:
@@ -680,6 +671,11 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 	struct venc_ap_ipi_msg_enc out;
 	struct venc_ap_ipi_msg_set_param out_slb;
 	struct venc_vsi *vsi = (struct venc_vsi *)vcu->vsi;
+	struct venc_ext *ext = VENC_EXT(vcu);
+	/* Slots for the descriptors published for this message; see below. */
+	enum { PUB_BS = MTK_VCODEC_MAX_PLANES, PUB_META, PUB_MAX };
+	/* -1 is never a descriptor mtk_ion_publish_dmabuf_s16() hands out. */
+	int pub_fd[PUB_MAX];
 	unsigned int i, ret, ret_slb;
 
 	mtk_vcodec_debug(vcu, "bs_mode %d ->", bs_mode);
@@ -690,15 +686,17 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 		return -EINVAL;
 	}
 
+	for (i = 0; i < ARRAY_SIZE(pub_fd); i++)
+		pub_fd[i] = -1;
+
 	memset(&out, 0, sizeof(out));
 	out.msg_id = AP_IPIMSG_ENC_ENCODE;
 	out.vcu_inst_addr = vcu->inst_addr;
-	out.ctx_id = vcu->ctx->id;
 	out.bs_mode = bs_mode;
 	if (frm_buf) {
 		out.fb_num_planes = frm_buf->num_planes;
 		for (i = 0; i < frm_buf->num_planes; i++) {
-			vsi->venc.input_addr[i] =
+			out.input_addr[i] =
 				frm_buf->fb_addr[i].dma_addr;
 			vsi->venc.fb_dma[i] =
 				frm_buf->fb_addr[i].dma_addr;
@@ -706,31 +704,51 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 				frm_buf->fb_addr[i].size;
 			out.data_offset[i] =
 				frm_buf->fb_addr[i].data_offset;
+
+			/*
+			 * op6893: 4.19 put a descriptor it injected straight into
+			 * vpud's file table here (get_mapped_fd(), which 6.6 has
+			 * no equivalent of).  Publish the buffer under a negative
+			 * descriptor instead -- the field is __s16, so only a
+			 * negative value survives the trip -- and vpud's
+			 * ION_IOC_IMPORT resolves it.  Without this the daemon
+			 * imports fd 0, logs "pongbuf get_ion_buffer_addr fail"
+			 * and the encode comes back status -1.
+			 */
+			if (frm_buf->fb_addr[i].dmabuf &&
+			    mtk_ion_publish_dmabuf_s16(frm_buf->fb_addr[i].dmabuf,
+						       &pub_fd[i]) == 0)
+				out.input_fd[i] = (__s16)pub_fd[i];
 		}
 		if (frm_buf->has_meta) {
 			vsi->meta_addr = frm_buf->meta_addr;
 			vsi->meta_size = sizeof(struct mtk_hdr_dynamic_info);
-			vsi->meta_offset = frm_buf->meta_offset;
+			ext->meta_offset = frm_buf->meta_offset;
+			if (frm_buf->meta_dma &&
+			    mtk_ion_publish_dmabuf_s16(frm_buf->meta_dma,
+						       &pub_fd[PUB_META]) == 0)
+				vsi->meta_fd = (__s16)pub_fd[PUB_META];
 		} else {
 			vsi->meta_size = 0;
 			vsi->meta_addr = 0;
+			vsi->meta_fd = 0;
 		}
 
 		if (frm_buf->has_qpmap) {
-			vsi->qpmap_addr = frm_buf->qpmap_dma_addr;
-			vsi->qpmap_size = frm_buf->qpmap_dma->size;
+			ext->qpmap_addr = frm_buf->qpmap_dma_addr;
+			ext->qpmap_size = frm_buf->qpmap_dma->size;
 		} else {
-			vsi->qpmap_addr = 0;
-			vsi->qpmap_size = 0;
+			ext->qpmap_addr = 0;
+			ext->qpmap_size = 0;
 		}
 
 		if (frm_buf->dyparams_dma) {
-			vsi->dynamicparams_addr = frm_buf->dyparams_dma_addr;
-			vsi->dynamicparams_size = sizeof(struct inputqueue_dynamic_info);
-			vsi->dynamicparams_offset = frm_buf->dyparams_offset;
+			ext->dynamicparams_addr = frm_buf->dyparams_dma_addr;
+			ext->dynamicparams_size = sizeof(struct inputqueue_dynamic_info);
+			ext->dynamicparams_offset = frm_buf->dyparams_offset;
 		} else {
-			vsi->dynamicparams_addr = 0;
-			vsi->dynamicparams_size = 0;
+			ext->dynamicparams_addr = 0;
+			ext->dynamicparams_size = 0;
 		}
 
 		mtk_vcodec_debug(vcu, " num_planes = %d input (dmabuf:%lx), size %d %llx",
@@ -739,21 +757,29 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 			vsi->meta_size,
 			vsi->meta_addr);
 		mtk_vcodec_debug(vcu, "vsi qpmap addr %llx size%d",
-			vsi->meta_addr, vsi->qpmap_size);
+			ext->qpmap_addr, ext->qpmap_size);
 	} else {
 		mtk_vcodec_debug(vcu, "frm_buf is null");
 	}
 
 	if (bs_buf) {
-		vsi->venc.bs_addr = bs_buf->dma_addr;
+		out.bs_addr = bs_buf->dma_addr;
 		vsi->venc.bs_dma = bs_buf->dma_addr;
 		out.bs_size = bs_buf->size;
 
-		if (vsi->config.svp_mode) {
-			out.sec_mem_handle = dmabuf_to_secure_handle(bs_buf->dmabuf);
-			pr_info("%s %d out.sec_mem_handle 0x%x", __func__,
-				 __LINE__, out.sec_mem_handle);
-		}
+		/* See the input_fd note above -- same synthetic descriptor. */
+		if (bs_buf->dmabuf &&
+		    mtk_ion_publish_dmabuf_s16(bs_buf->dmabuf,
+					       &pub_fd[PUB_BS]) == 0)
+			out.bs_fd = (__s16)pub_fd[PUB_BS];
+
+		/*
+		 * op6893: the 4.19 wire has no sec_mem_handle field here.  The
+		 * secure handle reaches the daemon through bs_buf->dma_addr --
+		 * the encoder buffer is already registered as a secure handle at
+		 * vb2 level (see dmabuf_to_secure_handle() in venc buf_prepare)
+		 * -- so there is nothing extra to send.
+		 */
 
 		mtk_vcodec_debug(vcu, " output (dma:%lx)",
 			(unsigned long)bs_buf->dmabuf);
@@ -766,7 +792,6 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 		memset(&out_slb, 0, sizeof(out_slb));
 		out_slb.msg_id = AP_IPIMSG_ENC_SET_PARAM;
 		out_slb.vcu_inst_addr = vcu->inst_addr;
-		out_slb.ctx_id = vcu->ctx->id;
 		out_slb.param_id = VENC_SET_PARAM_RELEASE_SLB;
 		out_slb.data_item = 2;
 		out_slb.data[0] = 1; //release_slb 1
@@ -822,8 +847,7 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 			memset(&out_slb, 0, sizeof(out_slb));
 			out_slb.msg_id = AP_IPIMSG_ENC_SET_PARAM;
 			out_slb.vcu_inst_addr = vcu->inst_addr;
-			out_slb.ctx_id = vcu->ctx->id;
-			out_slb.param_id = VENC_SET_PARAM_RELEASE_SLB;
+				out_slb.param_id = VENC_SET_PARAM_RELEASE_SLB;
 			out_slb.data_item = 2;
 			out_slb.data[0] = 0; //release_slb 0
 			out_slb.data[1] = vcu->ctx->slbc_addr;
@@ -847,6 +871,17 @@ int vcu_enc_encode(struct venc_vcu_inst *vcu, unsigned int bs_mode,
 	vcu_enc_set_ctx(vcu, frm_buf, bs_buf);
 	ret = vcu_enc_send_msg(vcu, &out, sizeof(out));
 	mutex_unlock(vcu->ctx_ipi_lock);
+
+	/*
+	 * op6893: same point 4.19 closed the descriptors it had injected
+	 * (close_mapped_fd() right after the send): the daemon has either
+	 * imported them and holds its own ion reference, or it never will.
+	 */
+	for (i = 0; i < ARRAY_SIZE(pub_fd); i++) {
+		if (pub_fd[i] < 0)
+			continue;
+		mtk_ion_unpublish_dmabuf(pub_fd[i]);
+	}
 
 	if (ret) {
 		mtk_vcodec_err(vcu, "AP_IPIMSG_ENC_ENCODE %d fail %d", bs_mode, ret);
@@ -876,7 +911,6 @@ int vcu_enc_deinit(struct venc_vcu_inst *vcu)
 	memset(&out, 0, sizeof(out));
 	out.msg_id = AP_IPIMSG_ENC_DEINIT;
 	out.vcu_inst_addr = vcu->inst_addr;
-	out.ctx_id = vcu->ctx->id;
 
 	mutex_lock(vcu->ctx_ipi_lock);
 	ret = vcu_enc_send_msg(vcu, &out, sizeof(out));

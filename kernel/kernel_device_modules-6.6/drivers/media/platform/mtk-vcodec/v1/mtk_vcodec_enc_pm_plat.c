@@ -480,9 +480,9 @@ void mtk_venc_dvfs_sync_vsi_data(struct mtk_vcodec_ctx *ctx)
 	if (mtk_vcodec_is_state(ctx, MTK_STATE_ABORT))
 		return;
 
-	dev->venc_dvfs_params.target_freq = inst->vsi->config.target_freq;
-	dev->venc_dvfs_params.target_bw_factor = inst->vsi->config.target_bw_factor;
-	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->vsi->config.cpu_hint);
+	dev->venc_dvfs_params.target_freq = inst->ext.target_freq;
+	dev->venc_dvfs_params.target_bw_factor = inst->ext.target_bw_factor;
+	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->ext.cpu_hint);
 }
 
 void mtk_venc_dvfs_begin_inst(struct mtk_vcodec_ctx *ctx)

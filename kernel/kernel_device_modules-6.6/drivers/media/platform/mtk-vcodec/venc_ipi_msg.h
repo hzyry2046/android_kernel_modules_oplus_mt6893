@@ -23,47 +23,59 @@
  * @AP_IPIMSG_ENC_XXX:          AP to VCU cmd message id
  * @VCU_IPIMSG_ENC_XXX_DONE:    VCU ack AP cmd message id
  */
+/*
+ * op6893: this enum is the 4.19 encoder wire, entry for entry.  The vendor
+ * vpud daemon is the 4.19 binary and it is the daemon that defines the
+ * numbering: venc_vcodec_msg_handler only accepts 0xC000-0xC004 (msg_id minus
+ * 0xC000 indexes a 5-entry tbh table), and the constants it writes back are
+ * 0xD000/0xD001/0xD003/0xD004/0xD005 and 0xE000/0xE001/0xE002/0xE003 --
+ * verified by disassembling libvpud_vcodec.so.  0xD002 is defined here because
+ * 4.19 defines it, but the daemon never emits it.
+ *
+ * Upstream's layout put the three series at 0x1000/0x2000/0x3000 and carried an
+ * extra VCU_IPIMSG_ENC_TRACE inside the 0xD block.  Both are wrong for this
+ * daemon: the bases sent every request into the "unknown id" tail, and TRACE
+ * pushed QUERY_CAP_DONE off 0xD004, so the daemon's QUERY_CAP ack came back as
+ * an unrecognised id and the encoder never got past set-format.
+ */
 enum venc_ipi_msg_id {
-	AP_IPIMSG_ENC_INIT = AP_IPIMSG_VENC_SEND_BASE,
-	AP_IPIMSG_ENC_SET_PARAM,
-	AP_IPIMSG_ENC_ENCODE,
-	AP_IPIMSG_ENC_DEINIT,
-	/** ipi with no driver inst **/
+	AP_IPIMSG_ENC_INIT = AP_IPIMSG_VENC_SEND_BASE,	/* 0xC000 */
+	AP_IPIMSG_ENC_SET_PARAM,			/* 0xC001 */
+	AP_IPIMSG_ENC_ENCODE,				/* 0xC002 */
+	AP_IPIMSG_ENC_DEINIT,				/* 0xC003 */
+	AP_IPIMSG_ENC_QUERY_CAP,			/* 0xC004 */
+
+	VCU_IPIMSG_ENC_INIT_DONE = VCU_IPIMSG_VENC_ACK_BASE,	/* 0xD000 */
+	VCU_IPIMSG_ENC_SET_PARAM_DONE,				/* 0xD001 */
+	VCU_IPIMSG_ENC_ENCODE_DONE,				/* 0xD002 */
+	VCU_IPIMSG_ENC_DEINIT_DONE,				/* 0xD003 */
+	VCU_IPIMSG_ENC_QUERY_CAP_DONE,				/* 0xD004 */
+	VCU_IPIMSG_ENC_ENCODE_ACK,				/* 0xD005 */
+
+	VCU_IPIMSG_ENC_POWER_ON = VCU_IPIMSG_VENC_SEND_BASE,	/* 0xE000 */
+	VCU_IPIMSG_ENC_POWER_OFF,				/* 0xE001 */
+	VCU_IPIMSG_ENC_WAIT_ISR,				/* 0xE002 */
+	VCU_IPIMSG_ENC_PUT_BUFFER,				/* 0xE003 */
+
 	/*
-	 * op6893 bring-up: the vendor vpud daemon is the 4.19 build, whose
-	 * encoder protocol numbers QUERY_CAP as the 5th message of the plain
-	 * AP_IPIMSG_VENC_BASE (0xC000) series -- 0xC004 -- not the
-	 * "no-inst +0x100" block (0x1100) this tree uses.  Pin the value and
-	 * the matching ack, and see the 4.19 wire layouts below: sending the
-	 * upstream 0x1100 on channel IPI_VENC_COMMON is what made vpud drop
-	 * the message and get SIGKILLed by the kernel on every codec
-	 * enumeration.
+	 * op6893: VCP-only and newer-4.19 ids below.  None of these is on this
+	 * daemon's wire (they are reachable only from venc_vcp_if.c, which is
+	 * not built -- CONFIG_MTK_TINYSYS_VCP_SUPPORT is off), so their values
+	 * cannot collide with anything the daemon sends.
 	 */
-	AP_IPIMSG_ENC_QUERY_CAP = 0xC004,
-	AP_IPIMSG_ENC_BACKUP,
+	AP_IPIMSG_ENC_BACKUP = 0xC005,
 	AP_IPIMSG_ENC_PWR_CTRL,
 	AP_IPIMSG_ENC_RESUME,
 	AP_IPIMSG_ENC_SET_CONFIG,
 
-	VCU_IPIMSG_ENC_INIT_DONE = VCU_IPIMSG_VENC_ACK_BASE,
-	VCU_IPIMSG_ENC_SET_PARAM_DONE,
-	VCU_IPIMSG_ENC_ENCODE_DONE,
-	VCU_IPIMSG_ENC_DEINIT_DONE,
-	VCU_IPIMSG_ENC_TRACE,
-	/** ack for ipi with no driver inst **/
-	/* 4.19 vpud acks QUERY_CAP with 0xD004 -- see the send-side note. */
-	VCU_IPIMSG_ENC_QUERY_CAP_DONE = 0xD004,
+	VCU_IPIMSG_ENC_TRACE = 0xD006,
 	VCU_IPIMSG_ENC_BACKUP_DONE,
 	VCU_IPIMSG_ENC_PWR_CTRL_DONE,
 	VCU_IPIMSG_ENC_RESUME_DONE,
 	VCU_IPIMSG_ENC_SET_CONFIG_DONE,
 
-	VCU_IPIMSG_ENC_POWER_ON = VCU_IPIMSG_VENC_SEND_BASE,
-	VCU_IPIMSG_ENC_POWER_OFF,
-	VCU_IPIMSG_ENC_PUT_BUFFER,
-	VCU_IPIMSG_ENC_MEM_ALLOC,
+	VCU_IPIMSG_ENC_MEM_ALLOC = 0xE004,
 	VCU_IPIMSG_ENC_MEM_FREE,
-	VCU_IPIMSG_ENC_WAIT_ISR,
 	VCU_IPIMSG_ENC_CHECK_CODEC_ID,
 	VCU_IPIMSG_ENC_GET_BS_BUFFER,
 	VCU_IPIMSG_ENC_SMI_BUS_DUMP,
@@ -159,29 +171,20 @@ enum venc_set_param_type {
 	VENC_SET_PARAM_CONFIG,
 };
 
-#define VENC_MSG_AP_SEND_PREFIX	\
-	__u32 msg_id;	\
-	__u32 ctx_id;	\
-	__u64 vcu_inst_addr
-
-#ifndef CONFIG_64BIT
-#define VENC_MSG_PREFIX	\
-	__u32 msg_id;	\
-	__u32 ctx_id;	\
-	union {	\
-		__u64 ap_inst_addr_64;		\
-		__u32 ap_inst_addr;	\
-	};	\
-	__s32 status;	\
-	__u32 reserved
-#else
-#define VENC_MSG_PREFIX	\
-	__u32 msg_id;	\
-	__u32 ctx_id;	\
-	__u64 ap_inst_addr;	\
-	__s32 status;	\
-	__u32 reserved
-#endif
+/*
+ * op6893: the 4.19 encoder wire uses a real kernel pointer as the instance
+ * identity, and the daemon echoes it verbatim:
+ *
+ *   AP  -> VCU : {msg_id, vcu_inst_addr|venc_inst, ...}
+ *   VCU -> AP  : {msg_id, status, venc_inst(u64), ...}
+ *
+ * `venc_inst` is the address of the driver's own struct venc_vcu_inst, so it
+ * doubles as the `priv` handle: vcu_ipi_send stores it in
+ * ipi_desc[id].priv and the handler looks the instance back up by comparing
+ * the echoed value against priv.  A small integer id cannot do that job, which
+ * is why this tree's ctx_id/ap_inst_addr prefix is wrong here -- the daemon
+ * writes vcu_inst_addr at +16 and the handler read status at +16 instead.
+ */
 
 /**
  * struct venc_ap_ipi_msg_init - AP to VCU init cmd structure
@@ -193,7 +196,9 @@ enum venc_set_param_type {
  *              (struct venc_vp8_inst/venc_h264_inst *)
  */
 struct venc_ap_ipi_msg_init {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__u32 reserved;
+	__u64 venc_inst;
 };
 
 /**
@@ -268,11 +273,11 @@ struct venc_vcu_ipi_query_cap_ack {
  * @data[8]:    data array to store the set parameters
  */
 struct venc_ap_ipi_msg_set_param {
-	VENC_MSG_AP_SEND_PREFIX;
+	__u32 msg_id;
+	__u32 vcu_inst_addr;
 	__u32 param_id;
 	__u32 data_item;
 	__u32 data[8];
-	__u32 reserved;
 };
 
 /**
@@ -289,15 +294,20 @@ struct venc_ap_ipi_msg_set_param {
  * @fb_num_planes:      image buffer plane number
  */
 struct venc_ap_ipi_msg_enc {
-	VENC_MSG_AP_SEND_PREFIX;
+	__u32 msg_id;
+	__u32 vcu_inst_addr;
+	__u32 input_addr[3];
 	__u32 input_size[3];
+	__u32 bs_addr;
 	__u32 bs_size;
 	__u32 data_offset[3];
+	__s16 input_fd[3];
+	__s16 bs_fd;
 	__u8 fb_num_planes;
 	__u8 bs_mode;
-	__u32 sec_mem_handle;
-	__u16 reserved1;
-	__u32 reserved2;
+	__u32 meta_size;
+	__s16 meta_fd;
+	__u32 qpmap;
 };
 
 /**
@@ -307,8 +317,8 @@ struct venc_ap_ipi_msg_enc {
  *                      (struct venc_vp8_vsi/venc_h264_vsi *)
  */
 struct venc_ap_ipi_msg_deinit {
-	VENC_MSG_AP_SEND_PREFIX;
-	__u32 reserved;
+	__u32 msg_id;
+	__u32 vcu_inst_addr;
 };
 
 /**
@@ -326,7 +336,8 @@ enum venc_ipi_msg_status {
  *                      (struct venc_vp8_vsi/venc_h264_vsi *)
  */
 struct venc_ap_ipi_msg_common {
-	VENC_MSG_AP_SEND_PREFIX;
+	__u32 msg_id;
+	__u32 vcu_inst_addr;
 };
 
 /**
@@ -335,7 +346,9 @@ struct venc_ap_ipi_msg_common {
  * @venc_inst:  AP encoder instance (struct venc_vp8_inst/venc_h264_inst *)
  */
 struct venc_ap_ipi_msg_indp {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 };
 
 /**
@@ -345,7 +358,9 @@ struct venc_ap_ipi_msg_indp {
  * @venc_inst:  AP encoder instance (struct venc_vp8_inst/venc_h264_inst *)
  */
 struct venc_vcu_ipi_msg_common {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__s32 codec_id;
 };
 
@@ -356,7 +371,9 @@ struct venc_vcu_ipi_msg_common {
  * @venc_inst:  AP encoder instance (struct venc_vp8_inst/venc_h264_inst *)
  */
 struct venc_vcu_ipi_msg_trace {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__u32 trace_id;
 	__u32 flag;
 };
@@ -373,8 +390,11 @@ struct venc_vcu_ipi_msg_trace {
  *              will be different between kernel and vcu
  */
 struct venc_vcu_ipi_msg_init {
-	VENC_MSG_PREFIX;
-	__u64 vcu_inst_addr;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
+	__u32 vcu_inst_addr;
+	__u32 reserved;
 };
 
 /**
@@ -387,7 +407,9 @@ struct venc_vcu_ipi_msg_init {
  * @data[6]:    data array to store the return result
  */
 struct venc_vcu_ipi_msg_set_param {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__u32 param_id;
 	__u32 data_item;
 	__u32 data[6];
@@ -420,10 +442,13 @@ enum venc_ipi_msg_enc_state {
  *              will be different between kernel and vcu
  */
 struct venc_vcu_ipi_msg_enc {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__u32 state;
 	__u32 is_key_frm;
 	__u32 bs_size;
+	__u32 reserved;
 };
 
 /**
@@ -433,7 +458,9 @@ struct venc_vcu_ipi_msg_enc {
  * @venc_inst:  AP encoder instance (struct venc_vp8_inst/venc_h264_inst *)
  */
 struct venc_vcu_ipi_msg_deinit {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 };
 
 /**
@@ -445,13 +472,17 @@ struct venc_vcu_ipi_msg_deinit {
  * @timeout: 1 indicate encode timeout, 0 indicate no error
  */
 struct venc_vcu_ipi_msg_waitisr {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__u32 irq_status;
 	__u32 timeout;
 };
 
 struct venc_vcu_ipi_msg_get_bs {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	__u64 bs_addr;
 	__u32 bs_size;
 	__s16 bs_fd;
@@ -465,7 +496,9 @@ struct venc_vcu_ipi_msg_get_bs {
  * @struct vcodec_mem_obj: encoder memories
  */
 struct venc_vcu_ipi_mem_op {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 	struct vcodec_mem_obj mem;
 	__u32 vcp_addr[2];
 };
@@ -478,7 +511,9 @@ struct venc_vcu_ipi_mem_op {
  * @struct vcodec_mem_obj: encoder memories
  */
 struct venc_ap_ipi_pwr_ctrl {
-	VENC_MSG_PREFIX;
+	__u32 msg_id;
+	__s32 status;
+	__u64 venc_inst;
 #ifndef CONFIG_64BIT
 	union {
 		__u64 ap_data_addr_64;
@@ -509,6 +544,13 @@ struct venc_ap_ipi_pwr_ctrl {
  * @profile: as specified in standard
  * @level: as specified in standard
  * @wfd: WFD mode 1:on, 0:off
+ *
+ * op6893: @config is embedded in @venc_vsi, which the 4.19 vpud daemon maps out
+ * of VCU DMEM and reads at hard-coded offsets.  Every member here therefore has
+ * to keep the offset 4.19 gave it, and there must be no extra member: one
+ * insertion shifts every later field and the daemon then reads whatever happens
+ * to land at the old offset.  Fields this tree added since 4.19 live in
+ * struct venc_ext (venc_drv_if.h) instead.
  */
 struct venc_vcu_config {
 	__u32 input_fourcc;
@@ -523,7 +565,6 @@ struct venc_vcu_config {
 	__u32 profile;
 	__u32 level;
 	__u32 wfd;
-	__u32 lowlatencywfd;
 	__u32 operationrate;
 	__u32 scenario;
 	__u32 prependheader;
@@ -531,6 +572,7 @@ struct venc_vcu_config {
 	__u32 roi_rc_qp;
 	__u32 roion;
 	__u32 heif_grid_size;
+	struct mtk_color_desc color_desc;
 	__u32 resolutionChange;
 	__u32 max_w;
 	__u32 max_h;
@@ -547,46 +589,9 @@ struct venc_vcu_config {
 	__u32 i_p_qp_delta;
 	__u32 qp_control_mode;
 	__u32 frame_level_qp;
-	__u32 highquality;
+	__u32 maxrefpnum;
+	__u32 maxrefbufFrameNum;
 	__u32 dummynal;
-	__u32 slbc_addr;
-	__u32 wpp_mode;
-	__u32 low_latency_mode;
-	__u32 slice_count;
-	__u32 hier_ref_layer;
-	__u32 hier_ref_type;
-	__u32 temporal_layer_pcount;
-	__u32 temporal_layer_bcount;
-	__u32 max_ltr_num;
-	__u32 slice_header_spacing;
-	__u32 sysram_enable;
-	__u32 ctx_id;
-	__s32 priority;
-	__u32 codec_fmt;
-	__s32 target_freq;
-	__u32 target_bw_factor;
-	__u8 cpu_hint;
-	__u32 mlvec_mode;
-	struct mtk_color_desc color_desc;
-	struct mtk_venc_multi_ref multi_ref;
-	struct mtk_venc_vui_info vui_info;
-	__s32 qpvbr_upper_enable;
-	__s32 qpvbr_qp_upper_threshold;
-	__s32 qpvbr_qp_max_brratio;
-	__s32 qpvbr_lower_enable;
-	__s32 qpvbr_qp_lower_threshold;
-	__s32 qpvbr_qp_min_brratio;
-	__s32 cb_qp_offset;
-	__s32 cr_qp_offset;
-	__s32 mbrc_tk_spd;
-	__s32 ifrm_q_ltr;
-	__s32 pfrm_q_ltr;
-	__s32 bfrm_q_ltr;
-	struct mtk_venc_visual_quality visual_quality;
-	struct mtk_venc_init_qp init_qp;
-	struct mtk_venc_frame_qp_range frame_qp_range;
-	struct mtk_venc_nal_length nal_length;
-	__u8 use_clean_gop;
 };
 
 /**
@@ -623,10 +628,8 @@ struct venc_info {
 	__u32 fb_num_planes;
 	__u32 index;
 	__u64 timestamp;
-	__u64 input_addr[3];
-	__u64 bs_addr;
+	__u32 roimap;
 	__u32 qpmap;
-	__u32 reserved;
 };
 
 /**
@@ -646,8 +649,6 @@ struct ring_input_list {
 	__s32 write_idx;
 	__s32 count;
 	__s32 reserved;
-	__s32 is_last_slice[VENC_MAX_FB_NUM];
-	__u32 flags[VENC_MAX_FB_NUM];
 };
 
 /*
@@ -663,6 +664,11 @@ struct ring_input_list {
  * struct mtk_vcodec_mem, then invoke mtk_vcodec_mem_alloc to allocate
  * the buffer. After that, bypass the 'dma_addr' to the 'iova' field here for
  * register setting in VCU side.
+ *
+ * op6893: this is the layout the 4.19 vpud daemon has, byte for byte (2016
+ * bytes; vpud's own private state starts right after it in the same DMEM
+ * mapping).  Nothing may be appended to it -- see struct venc_ext in
+ * venc_drv_if.h for where this tree keeps the fields the daemon does not know.
  */
 struct venc_vsi {
 	struct venc_vcu_config config;
@@ -672,16 +678,7 @@ struct venc_vsi {
 	__u32 sync_mode;
 	__u32 meta_size;
 	__u64 meta_addr;
-	__u32 meta_offset;
-	__u32 qpmap_size;
-	__u64 qpmap_addr;
-	__u64 dynamicparams_addr;
-	__u32 dynamicparams_size;
-	__u32 dynamicparams_offset;
-	__u64 general_buf_dma;
-	__s32 general_buf_fd;
-	__u32 general_buf_size;
-	__u32 reserved;
+	__s16 meta_fd;
 };
 
 struct venc_common_vsi {

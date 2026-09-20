@@ -342,7 +342,12 @@ static int mtk_vcodec_enc_probe(struct platform_device *pdev)
 	struct mtk_vcodec_dev *dev;
 	struct video_device *vfd_enc;
 	struct resource *res;
-	int i = 0, reg_index = 0, ret, slb_cpu_used_pref, slb_extra;
+	/* op6893: the 4.19 DTB has neither venc-slb-* property, so initialise
+	 * these -- they are used unconditionally further down (enc_slb_extra
+	 * gates the 8K SLBC request in mtk_vcodec_enc.c) and would otherwise
+	 * hold stack garbage.
+	 */
+	int i = 0, reg_index = 0, ret, slb_cpu_used_pref = 0, slb_extra = 0;
 	int port_num[MTK_VENC_HW_NUM] = {0};
 	const char *name = NULL;
 	int port_args_num = 0, port_data_len = 0, total_port_num = 0;
@@ -424,6 +429,41 @@ static int mtk_vcodec_enc_probe(struct platform_device *pdev)
 
 	for (i = 0; i < NUM_MAX_VENC_REG_BASE; i++)
 		dev->enc_reg_base[i] = NULL;
+
+	/*
+	 * op6893: the frozen 4.19 DTB has no reg-names on the venc node -- 4.19
+	 * mapped the resources by index and never needed the property.  Keep
+	 * that path as the fallback: without it enc_reg_base[] stays NULL, probe
+	 * still succeeds, and the first GCE-timeout dump or encoder IRQ handler
+	 * dereferences NULL and takes the phone down, with nothing in the log
+	 * pointing at the DT.
+	 */
+	if (!of_property_present(pdev->dev.of_node, "reg-names")) {
+		for (i = VENC_SYS; i < NUM_MAX_VENC_REG_BASE; i++) {
+			res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+			if (res == NULL) {
+				mtk_v4l2_debug(0, "try next resource. idx:%d", i);
+				continue;
+			}
+
+			dev->enc_reg_base[i] =
+				devm_ioremap_resource(&pdev->dev, res);
+			if (IS_ERR((__force void *)dev->enc_reg_base[i])) {
+				ret = PTR_ERR(
+					(__force void *)dev->enc_reg_base[i]);
+				goto err_res;
+			}
+			mtk_v4l2_debug(2, "reg[%d] base=0x%lx",
+				i, (unsigned long)dev->enc_reg_base[i]);
+		}
+
+		if (dev->enc_reg_base[VENC_SYS] == NULL) {
+			dev_info(&pdev->dev,
+				"get memory resource failed. idx:%d", VENC_SYS);
+			ret = -ENXIO;
+			goto err_res;
+		}
+	} else {
 	for (i = 0; !of_property_read_string_index(pdev->dev.of_node, "reg-names", i, &name); i++) {
 		if (!strcmp(MTK_VDEC_REG_NAME_VENC_SYS, name)) {
 			reg_index = VENC_SYS;
@@ -458,6 +498,7 @@ static int mtk_vcodec_enc_probe(struct platform_device *pdev)
 		}
 		mtk_v4l2_debug(2, "reg[%d] base=0x%lx",
 			reg_index, (unsigned long)dev->enc_reg_base[reg_index]);
+	}
 	}
 
 	ret = of_property_read_u32(pdev->dev.of_node, "support-wfd-region", &support_wfd_region);

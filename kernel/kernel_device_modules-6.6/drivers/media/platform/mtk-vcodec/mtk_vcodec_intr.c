@@ -537,13 +537,15 @@ void mtk_vcodec_enc_timeout_dump(void *ctx)
 	struct mtk_vcodec_ctx *curr_ctx = ctx;
 	struct mtk_vcodec_dev *dev = NULL;
 
-	#define REG1_COUNT 13
+	#define REG1_COUNT 15
 	#define REG2_COUNT 46
 
 	unsigned int Reg_1[REG1_COUNT] = {
 		0x14, 0xEC, 0x1C0, 0x1168, 0x11C0,
 		0x11C4, 0xF4, 0x5C, 0x60, 0x130,
-		0x24, 0x114C, 0x1164};
+		0x24, 0x114C, 0x1164,
+		/* op6893: HW-active and break-mode, same two hw_break() reads */
+		0x1398, 0x1448};
 	unsigned int Reg_2[REG2_COUNT] = {
 		0xEC, 0x200, 0x204, 0x208, 0x20C,
 		0x210, 0x214, 0x218, 0x21C,
@@ -567,6 +569,36 @@ void mtk_vcodec_enc_timeout_dump(void *ctx)
 
 	mtk_v4l2_debug(0, "ctx: %p, is_codec_suspending: %d",
 	    ctx, dev->is_codec_suspending);
+
+	/*
+	 * op6893: this runs from the GCE timeout worker, i.e. exactly when an
+	 * encode has already gone wrong.  A NULL base here used to mean a
+	 * readl(0x14) from the worker and a full phone reboot, which turns
+	 * "encoding failed" into "device restarted" and hides the real fault.
+	 * The base is NULL when the DTB gave no reg-names -- see the fallback in
+	 * mtk_vcodec_enc_drv.c, which is what makes this dump readable.
+	 */
+	if (dev->enc_reg_base[0] == NULL) {
+		mtk_v4l2_debug(0, "venc reg base not mapped, skip dump");
+		return;
+	}
+
+	/* op6893: VEN MTCMOS (bit17 of SPM PWR_STATUS @0x1000616C) -- the VENC
+	 * device has no power-domains property, so genpd never powers it and
+	 * it lives on bootloader residue.  If bit17 is 0 here, the encoder
+	 * is unpowered and nothing else matters.
+	 */
+	{
+		void __iomem *spm = ioremap(0x10006000, 0x200);
+
+		if (spm) {
+			mtk_v4l2_debug(0, "SPM PWR_STATUS=0x%x VEN=%d VEN_CORE1=%d",
+				readl(spm + 0x16C),
+				(readl(spm + 0x16C) >> 17) & 1,
+				(readl(spm + 0x16C) >> 18) & 1);
+			iounmap(spm);
+		}
+	}
 
 	for (j = 0; j < MTK_VENC_CORE_1; j++) {
 		for (i = 0; i < REG1_COUNT; i++) {

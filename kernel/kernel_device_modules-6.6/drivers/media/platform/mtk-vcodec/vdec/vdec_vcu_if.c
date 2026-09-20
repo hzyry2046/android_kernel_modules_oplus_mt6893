@@ -180,7 +180,7 @@ static int check_codec_id(struct vdec_vcu_ipi_ack *msg, unsigned int fmt, unsign
 int vcu_dec_ipi_handler(void *data, unsigned int len, void *priv)
 {
 	struct vdec_vcu_ipi_ack *msg = data;
-	int msg_ctx_id;
+	uintptr_t msg_inst_addr;
 	struct vdec_vcu_inst *vcu = NULL;
 	struct vdec_fb *pfb;
 	struct timespec64 t_s, t_e;
@@ -217,20 +217,29 @@ int vcu_dec_ipi_handler(void *data, unsigned int len, void *priv)
 	}
 	VCU_FPTR(vcu_put_task)();
 
-	msg_ctx_id = (int)msg->ap_inst_addr;
+	/*
+	 * op6893: 4.19 puts the address of its vdec_vcu_inst here and the daemon
+	 * echoes it back verbatim, which is how 4.19 finds the instance again.
+	 * This tree used to send ctx->id instead, which the daemon also echoes,
+	 * but nothing in the 4.19 daemon asks for a small integer there and 4.19
+	 * never sends one -- so send the address, exactly as 4.19 does, and match
+	 * on the same value here.
+	 */
+	msg_inst_addr = (uintptr_t)msg->ap_inst_addr;
 	/* Check IPI inst is valid */
 	mutex_lock(&dev->ctx_mutex);
 	list_for_each_safe(p, q, &dev->ctx_list) {
 		temp_ctx = list_entry(p, struct mtk_vcodec_ctx, list);
 		inst = (struct vdec_inst *)temp_ctx->drv_handle;
-		if (inst != NULL && msg_ctx_id == temp_ctx->id) {
+		if (inst != NULL && msg_inst_addr == (uintptr_t)&inst->vcu) {
 			vcu = &inst->vcu;
 			msg_valid = 1;
 			break;
 		}
 	}
 	if (!msg_valid) {
-		mtk_v4l2_err(" msg vcu not exist %d\n", msg_ctx_id);
+		mtk_v4l2_err(" msg vcu not exist 0x%lx\n",
+			(unsigned long)msg_inst_addr);
 		mutex_unlock(&dev->ctx_mutex);
 		return -EINVAL;
 	}
@@ -601,11 +610,11 @@ int vcu_dec_init(struct vdec_vcu_inst *vcu)
 	if (vcu->ctx->dec_params.svp_mode)
 		msg.reserved = vcu->ctx->dec_params.svp_mode;
 	/*
-	 * op6893: the daemon cannot dereference a kernel pointer, and this
-	 * driver's handler keys instances off ctx->id, so the context id is what
-	 * goes out here -- and comes back echoed in every ack.
+	 * op6893: the address of this instance's vdec_vcu_inst, exactly what 4.19
+	 * sends.  The daemon never dereferences it -- it echoes it back and this
+	 * driver's handler matches on it (see vcu_dec_ipi_handler).
 	 */
-	msg.ap_inst_addr = (unsigned long)vcu->ctx->id;
+	msg.ap_inst_addr = (uintptr_t)vcu;
 
 	mtk_vcodec_debug(vcu, "vdec_inst=%p svp_mode=%d", vcu, msg.reserved);
 
@@ -705,11 +714,8 @@ int vcu_dec_query_cap(struct vdec_vcu_inst *vcu, unsigned int id, void *out)
 	memset(&msg, 0, sizeof(msg));
 	msg.msg_id = AP_IPIMSG_DEC_QUERY_CAP;
 	msg.id = id;
-	/*
-	 * 4.19 vpud echoes ap_inst_addr back in the ack; this driver's
-	 * handler matches it against ctx->id, so send the ctx id.
-	 */
-	msg.ap_inst_addr = (unsigned long)vcu->ctx->id;
+	/* Same value as vcu_dec_init() -- see the comment there. */
+	msg.ap_inst_addr = (uintptr_t)vcu;
 	msg.ap_data_addr = (uintptr_t)out;
 
 	vcu_dec_set_pid(vcu);

@@ -487,11 +487,11 @@ void mtk_venc_dvfs_sync_vsi_data(struct mtk_vcodec_ctx *ctx)
 	if (mtk_vcodec_is_state(ctx, MTK_STATE_ABORT))
 		return;
 
-	dev->venc_dvfs_params.target_freq = inst->vsi->config.target_freq;
-	dev->venc_dvfs_params.target_bw_factor = inst->vsi->config.target_bw_factor;
-	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->vsi->config.cpu_hint);
+	dev->venc_dvfs_params.target_freq = inst->ext.target_freq;
+	dev->venc_dvfs_params.target_bw_factor = inst->ext.target_bw_factor;
+	mtk_vcodec_cpu_adaptive_ctrl(ctx, inst->ext.cpu_hint);
 #if IS_ENABLED(CONFIG_MTK_TASK_TURBO)
-	if (inst->vsi->config.cpu_hint) {
+	if (inst->ext.cpu_hint) {
 		if (enforce_ct_to_vip(1, VIDEO) != 0)
 			mtk_v4l2_debug(0, "[VENC] enable ct to TA Fail");
 		else
