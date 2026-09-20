@@ -953,6 +953,10 @@ static void vcu_set_gce_cmd(struct cmdq_pkt *pkt,
 		pr_debug("[VCU] %s CMD_READ addr: 0x%llx\n", __func__, addr);
 	break;
 	case CMD_WRITE:
+		/* op6893: diagnostic -- log what goes to VENC+0x00/0x04/0x08 */
+		if ((addr & 0xfff00000) == 0x17000000 && (addr & 0xfff) < 0x10)
+			pr_info("[VCUDBG] VENC+%03llx = 0x%llx (mask 0x%x)\n",
+				addr & 0xfff, data, mask);
 		if (vcu_check_reg_base(vcu, addr, 4) == 0) {
 			cmdq_pkt_write(pkt, vcu->clt_base, addr, data, mask);
 		} else {
@@ -1208,6 +1212,42 @@ static void vcu_set_gce_readstatus_cmd(struct cmdq_pkt *pkt,
 	}
 }
 
+static void vcu_dump_pkt(struct cmdq_pkt *pkt)
+{
+	struct cmdq_pkt_buffer *cbuf;
+	u32 tmp[256];
+	u32 *w;
+	size_t sz;
+	int n, k;
+
+	if (!pkt) {
+		pr_info("[VCUDBG]   pkt is NULL\n");
+		return;
+	}
+	cbuf = list_first_entry_or_null(&pkt->buf,
+		struct cmdq_pkt_buffer, list_entry);
+	if (!cbuf || !cbuf->va_base) {
+		pr_info("[VCUDBG]   pkt=%p buf null\n", pkt);
+		return;
+	}
+	w = (u32 *)cbuf->va_base;
+	sz = min_t(size_t, pkt->cmd_buf_size, sizeof(tmp));
+	n = (int)(sz - (sz % 4)) / 4;
+	if (n <= 0)
+		return;
+	if (copy_from_kernel_nofault(tmp, w, n * 4)) {
+		pr_info("[VCUDBG]   pkt=%p va=%px unreadable\n", pkt, w);
+		return;
+	}
+	pr_info("[VCUDBG]   buf va=%px iova=%pad pa=%pad size=%zu\n",
+		w, &cbuf->iova_base, &cbuf->pa_base, pkt->cmd_buf_size);
+	for (k = 0; k < n; k += 4)
+		pr_info("[VCUDBG]   %04d: %08x %08x %08x %08x\n", k,
+			tmp[k], tmp[k + 1], tmp[k + 2], tmp[k + 3]);
+}
+
+static int vcu_pkt_ok_cnt;
+
 static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 {
 	int i, j;
@@ -1215,10 +1255,34 @@ static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 	struct mtk_vcu *vcu;
 	unsigned int core_id;
 	unsigned int gce_order;
+	struct cmdq_pkt *pkt;
 
 	buff = (struct gce_callback_data *)data.data;
 	i = (buff->cmdq_buff.codec_type == VCU_VDEC) ? VCU_VDEC : VCU_VENC;
 	core_id = buff->cmdq_buff.core_id;
+	gce_order = buff->cmdq_buff.flush_order % GCE_PENDING_CNT;
+
+	pkt = buff->pkt_ptr;
+	if (data.err < 0) {
+		/* op6893: the 4.19 vpud builds the VENC GCE packet that waits on
+		 * CMDQ_EVENT_VENC_CMDQ_FRAME_DONE, and when that event never fires
+		 * the whole encode stalls with no kernel-side symptom.  Dump the
+		 * packet verbatim so the register setup it programmed can be
+		 * checked against the hardware it expects.
+		 */
+		pr_info("[VCUDBG] VENC gce_flush err=%d codec=%u core=%u order=%u gce_idx=%d\n",
+			data.err, buff->cmdq_buff.codec_type, core_id,
+			buff->cmdq_buff.flush_order, vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle));
+		vcu_dump_pkt(pkt);
+	} else if (buff->cmdq_buff.codec_type == VCU_VENC && vcu_pkt_ok_cnt++ < 2) {
+		/* a completed VENC flush: the SEQ_HDR packet must complete like
+		 * this, so print it as the "known good" reference.
+		 */
+		pr_info("[VCUDBG] VENC gce_flush ok codec=%u core=%u order=%u gce_idx=%d\n",
+			buff->cmdq_buff.codec_type, core_id,
+			buff->cmdq_buff.flush_order, vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle));
+		vcu_dump_pkt(pkt);
+	}
 
 	vcu = buff->vcu_ptr;
 	j = vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle);
@@ -3321,12 +3385,27 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 		}
 	}
 
+	/*
+	 * op6893: the 4.19 DTB names these with underscores
+	 * (mediatek,dec_gce_th_num / mediatek,enc_gce_th_num); upstream renamed
+	 * them to hyphens without a fallback.  This device ships a 4.19 DTB that
+	 * cannot be regenerated, so accept both.  Without it the encoder path is
+	 * silently misconfigured: the DTB asks for 2 VENC cmdq threads and the
+	 * fallback below creates only 1, which also shifts clt_venc_sec[0]'s
+	 * thread index (4.19: dec+enc = 3, here: 2).
+	 */
 	ret = of_property_read_u32(dev->of_node, "mediatek,dec-gce-th-num",
+					  &vcu->gce_th_num[VCU_VDEC]);
+	if (ret != 0)
+		ret = of_property_read_u32(dev->of_node, "mediatek,dec_gce_th_num",
 					  &vcu->gce_th_num[VCU_VDEC]);
 	if (ret != 0 || vcu->gce_th_num[VCU_VDEC] > GCE_THNUM_MAX)
 		vcu->gce_th_num[VCU_VDEC] = 1;
 
 	ret = of_property_read_u32(dev->of_node, "mediatek,enc-gce-th-num",
+					  &vcu->gce_th_num[VCU_VENC]);
+	if (ret != 0)
+		ret = of_property_read_u32(dev->of_node, "mediatek,enc_gce_th_num",
 					  &vcu->gce_th_num[VCU_VENC]);
 	if (ret != 0 || vcu->gce_th_num[VCU_VENC] > GCE_THNUM_MAX)
 		vcu->gce_th_num[VCU_VENC] = 1;
@@ -3348,6 +3427,14 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 	if (vcu->gce_th_num[VCU_VENC] > 0)
 		vcu->clt_venc_sec[0] =
 			cmdq_mbox_create(dev, vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC]);
+
+	/* op6893: acceptance evidence for the underscore fallback above --
+	 * the DTB asks for dec=1 enc=2, so venc must own mboxes 1 and 2. */
+	dev_info(dev, "[VCU] gce_th_num dec=%d enc=%d (venc mbox %d..%d, sec %d)",
+		vcu->gce_th_num[VCU_VDEC], vcu->gce_th_num[VCU_VENC],
+		vcu->gce_th_num[VCU_VDEC],
+		vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC] - 1,
+		vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC]);
 
 	ret = of_property_read_u16(pdev->dev.of_node, "gce-norm-token",
 		&vcu->cmdq_venc_norm_token);
