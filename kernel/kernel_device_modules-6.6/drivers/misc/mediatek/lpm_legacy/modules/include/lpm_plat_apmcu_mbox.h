@@ -94,13 +94,18 @@ enum MCDI_IPI_ID_TLB {
 #define MCUPM_TASK_RUN                  4
 #define MCUPM_TASK_PAUSE                5
 
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
+/*
+ * op6893 6.6 bring-up: these used to be declared (and the whole .c built)
+ * only under CONFIG_MTK_LPM_MT6781.  They are the APMCU->MCUPM handshake,
+ * and on mt6893 MCUPM is what actually powers MCUSYS down, so leaving them
+ * out is the reason our MCUSYS-off never happened.  See the header comment
+ * in modules/platform/v1/lpm_plat_apmcu_mbox.c.
+ */
 void mtk_set_lp_apmcu_pll_mode(unsigned int mode);
 void mtk_set_lp_apmcu_buck_mode(unsigned int mode);
 bool mtk_lp_apmcu_is_ready(void);
 void mtk_wait_mbox_init_done(void);
 void mtk_notify_subsys_ap_ready(void);
 int mtk_apmcu_mbox_init(void);
-#endif
 
 #endif

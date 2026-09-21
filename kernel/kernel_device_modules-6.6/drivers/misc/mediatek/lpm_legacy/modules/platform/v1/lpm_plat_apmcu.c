@@ -16,9 +16,7 @@
 #include <lpm.h>
 
 #include <lpm_plat_apmcu.h>
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 #include <lpm_plat_apmcu_mbox.h>
-#endif
 #include <lpm_module.h>
 
 
@@ -27,10 +25,10 @@ void __iomem *cpu_pm_syssram_base;
 
 #define plat_node_ready()       (cpu_pm_mcusys_base && cpu_pm_syssram_base)
 
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 #define BOOT_TIME_LIMIT         60
+/* op6893: see the give-up path in __lpm_plat_wait_depd_condition(). */
+#define MCUPM_RDY_TIME_LIMIT    240
 static struct task_struct *lpm_plat_task;
-#endif
 
 /* qos */
 static struct pm_qos_request lpm_plat_qos_req;
@@ -256,7 +254,6 @@ static inline void get_monotonic_boottime(struct timespec64 *ts)
 	*ts = ktime_to_timespec64(ktime_get_boottime());
 }
 
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 #define DEPD_COND_TYPE_BOOTIME  (1<<0u)
 #define DEPD_COND_TYPE_MCU      (1<<1u)
 
@@ -278,12 +275,27 @@ static int __lpm_plat_wait_depd_condition(int type, void *arg)
 		if (!mcupm_rdy && mtk_lp_apmcu_is_ready())
 			mcupm_rdy = true;
 
+		get_monotonic_boottime(&uptime);
+
 		if ((type & DEPD_COND_TYPE_BOOTIME) &&
 		    !boot_time_pass) {
-			get_monotonic_boottime(&uptime);
-
 			if ((unsigned int)uptime.tv_sec > BOOT_TIME_LIMIT)
 				boot_time_pass = true;
+		}
+
+		/*
+		 * op6893 6.6 bring-up: 4.19 spins here until MCUPM answers,
+		 * with no way out.  cpu-off is blocked by the pm_qos request
+		 * for as long as we stay in this loop, so on a tree where
+		 * MCUPM might not come up that costs cpu-off and cluster-off,
+		 * which do work.  Give up loudly instead -- the state we land
+		 * in is the one we had before, not a worse one.
+		 */
+		if (!mcupm_rdy &&
+		    (unsigned int)uptime.tv_sec > MCUPM_RDY_TIME_LIMIT) {
+			pr_notice("[name:lpm][p] mcupm not ready %us after boot; continuing without it\n",
+				  (unsigned int)uptime.tv_sec);
+			mcupm_rdy = true;
 		}
 	} while (!(mcupm_rdy && boot_time_pass));
 
@@ -302,7 +314,6 @@ static int lpm_plat_wait_depd_condition(void *arg)
 	return __lpm_plat_wait_depd_condition((DEPD_COND_TYPE_BOOTIME
 					       | DEPD_COND_TYPE_MCU), arg);
 }
-#endif
 
 static void __init lpm_plat_pwr_dev_init(void)
 {
@@ -357,10 +368,17 @@ static int __init lpm_plat_mcusys_ctrl_init(void)
 
 int __init lpm_plat_apmcu_init(void)
 {
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 	struct device_node *node = NULL;
-	unsigned int is_mcu_mode = 0;
-#endif
+	/*
+	 * op6893 6.6 bring-up: "cpupm-method" is an MT6781-era property and is
+	 * absent from this board's (4.19 stock) mtk_lpm node, so the old
+	 * default of 0 would have skipped the MCUPM handshake on exactly the
+	 * SoC that needs it.  mt6893's own 4.19 driver has no such switch: it
+	 * always waits for MCUPM.  So MCU mode is the default here and the
+	 * property can only be used to turn it off.
+	 */
+	unsigned int is_mcu_mode = IS_ENABLED(CONFIG_MTK_LPM_MT6781) ? 0 : 1;
+
 	if (!plat_node_ready()) {
 		lpm_plat_qos_uninit();
 		return 0;
@@ -368,15 +386,14 @@ int __init lpm_plat_apmcu_init(void)
 
 	lpm_plat_pwr_dev_init();
 
-#if IS_ENABLED(CONFIG_MTK_LPM_MT6781)
 	mtk_apmcu_mbox_init();
 	node = of_find_compatible_node(NULL, NULL, MTK_LPM_DTS_COMPATIBLE);
 	if (node) {
 		const char *method = NULL;
 
 		of_property_read_string(node, "cpupm-method", &method);
-		if (method && !strcmp(method, "mcu"))
-			is_mcu_mode = 1;
+		if (method)
+			is_mcu_mode = !strcmp(method, "mcu");
 		of_node_put(node);
 	}
 
@@ -392,10 +409,7 @@ int __init lpm_plat_apmcu_init(void)
 		wake_up_process(lpm_plat_task);
 	else
 		pr_notice("Create thread fail @ %s()\n", __func__);
-#else
-	lpm_cpu_off_allow();
-	lpm_plat_cpuhp_init();
-#endif
+
 	return 0;
 }
 

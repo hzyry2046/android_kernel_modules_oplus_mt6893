@@ -734,6 +734,12 @@ int mcupm_mbox_read(unsigned int mbox, unsigned int slot, void *buf,
 	return mtk_mbox_read(&mcupm_mboxdev, mbox, slot,
 				buf, len * MBOX_SLOT_SIZE);
 }
+/*
+ * op6893 6.6 bring-up: v1 never exported this -- it had no out-of-module
+ * reader -- while v2 exports both halves.  lpm_legacy's APMCU->MCUPM mailbox
+ * polls APMCU_MCUPM_MBOX_TASK_STA through it, so the pair has to match.
+ */
+EXPORT_SYMBOL_GPL(mcupm_mbox_read);
 
 int mcupm_mbox_write(unsigned int mbox, unsigned int slot, void *buf,
 			unsigned int len)
