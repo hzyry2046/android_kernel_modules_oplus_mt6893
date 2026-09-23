@@ -51,7 +51,11 @@ struct mtk_battery_manager *get_mtk_battery_manager(void)
 #ifndef OPLUS_FEATURE_CHG_BASIC
 		psy = power_supply_get_by_name("battery");
 #else
-		psy = power_supply_get_by_name("mtk-battery");
+		/* op6893: oplus userspace (health HAL, BatteryService, oplus_chg
+		 * v1/v2, fuelgauged) addresses the battery psy as "battery",
+		 * same as the 4.19 baseline.  "mtk-battery" leaves Android
+		 * with no battery device (dumpsys level 0 / present false). */
+		psy = power_supply_get_by_name("battery");
 #endif
 		if (psy == NULL) {
 			pr_err("[%s]psy is not rdy\n", __func__);
@@ -1491,12 +1495,14 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 void bm_battery_service_init(struct mtk_battery_manager *bm)
 {
 	struct battery_data *bs_data;
+	struct device *psy_parent;
 
 	bs_data = &bm->bs_data;
 #ifndef OPLUS_FEATURE_CHG_BASIC
 	bs_data->psd.name = "battery";
 #else
-	bs_data->psd.name = "mtk-battery";
+	/* op6893: keep the 4.19 "battery" name, see get_mtk_battery_manager. */
+	bs_data->psd.name = "battery";
 #endif
 	bs_data->psd.type = POWER_SUPPLY_TYPE_BATTERY;
 	bs_data->psd.properties = battery_props;
@@ -1506,6 +1512,26 @@ void bm_battery_service_init(struct mtk_battery_manager *bm)
 	bs_data->psd.external_power_changed =
 		mtk_battery_external_power_changed;
 	bs_data->psy_cfg.drv_data = bm;
+
+	/*
+	 * op6893: attach the "battery" psy under the existing "charger"
+	 * platform device (probed by oplus_chg_v2/mtk_charger long before us --
+	 * must NOT create our own "charger" device, EEXIST, fgproto12).  That
+	 * puts the psy at /devices/platform/charger/power_supply/battery --
+	 * the single path labeled vendor_sysfs_battery_supply, readable by the
+	 * enforcing health HAL.  Fall back to our own device when the charger
+	 * device is absent (charger stack not staged): boot works, only the
+	 * enforcing label is lost.
+	 */
+	psy_parent = bus_find_device_by_name(&platform_bus_type, NULL, "charger");
+	if (psy_parent) {
+		pr_err("[%s] op6893: battery psy parented to charger device\n",
+			__func__);
+	} else {
+		pr_err("[%s] op6893: no charger device, psy under own device\n",
+			__func__);
+		psy_parent = bm->dev;
+	}
 
 	bs_data->bat_status = POWER_SUPPLY_STATUS_DISCHARGING,
 	bs_data->bat_health = POWER_SUPPLY_HEALTH_GOOD,
@@ -1517,9 +1543,11 @@ void bm_battery_service_init(struct mtk_battery_manager *bm)
 
 	bm->bs_data.psy =
 	power_supply_register(
-		bm->dev, &bm->bs_data.psd, &bm->bs_data.psy_cfg);
+		psy_parent, &bm->bs_data.psd, &bm->bs_data.psy_cfg);
 	if (IS_ERR(bm->bs_data.psy))
 		pr_err("[BAT_probe] power_supply_register Battery Fail !!\n");
+	if (psy_parent != bm->dev)
+		put_device(psy_parent);
 
 	bm->gm1->fixed_uisoc = 0xffff;
 	if (bm->gm_no == 2)
@@ -1533,13 +1561,26 @@ void mtk_bm_send_to_user(struct mtk_battery_manager *bm, u32 pid,
 {
 	struct sk_buff *skb;
 	struct nlmsghdr *nlh;
-	int size = reply_msg->data_len + AFW_MSG_HEADER_LEN;
-	int len = NLMSG_SPACE(size);
+	int size;
+	int len;
 	void *data;
 	int ret = -1;
+	/*
+	 * op6893: the 4.19 daemon reads replies with its 28-byte header
+	 * (identity at +24), so for a legacy peer drop the afw_header's
+	 * leading instance_id/datatype word before it goes on the wire --
+	 * the exact inverse of the receive-side translation in
+	 * mtk_bm_netlink_handler.  We copy from reply_msg + shift rather than
+	 * repack, so reply_msg itself is untouched.  See bm->fgd_legacy.
+	 */
+	int shift;
 
 	if (bm == NULL)
 		return;
+
+	shift = bm->fgd_legacy ? 4 : 0;
+	size = reply_msg->data_len + AFW_MSG_HEADER_LEN - shift;
+	len = NLMSG_SPACE(size);
 
 	//pr_err("[%s]id:%d cmd:%d datalen:%d\n", __func__,
 	//	reply_msg->instance_id, reply_msg->cmd, reply_msg->data_len);
@@ -1563,7 +1604,7 @@ void mtk_bm_send_to_user(struct mtk_battery_manager *bm, u32 pid,
 
 	nlh = nlmsg_put(skb, pid, seq, 0, size, 0);
 	data = NLMSG_DATA(nlh);
-	memcpy(data, reply_msg, size);
+	memcpy(data, (char *)reply_msg + shift, size);
 	NETLINK_CB(skb).portid = 0;	/* from kernel */
 	NETLINK_CB(skb).dst_group = 0;	/* unicast */
 
@@ -1664,7 +1705,16 @@ static void mtk_battery_manager_handler(struct mtk_battery_manager *bm, void *nl
 	}
 	break;
 	case AFW_CMD_SET_PID:
-	//case FG_DAEMON_CMD_SET_DAEMON_PID:
+	/*
+	 * op6893: the 4.19 daemon announces its pid with the old
+	 * FG_DAEMON_CMD_SET_DAEMON_PID (== 1), not AFW_CMD_SET_PID
+	 * (0x10000000).  Without this label its packet fell through to the
+	 * default gauge handler, fgd_pid stayed 0, and every reply was
+	 * dropped by mtk_bm_send_to_user's "pid is 0" guard -- so the daemon
+	 * blocked forever in recvmsg.  The two constants differ, so both
+	 * labels coexist.
+	 */
+	case FG_DAEMON_CMD_SET_DAEMON_PID:
 	{
 		unsigned int ino = bm->gm_no;
 
@@ -1730,11 +1780,14 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 	void *data;
 	struct nlmsghdr *nlh;
 	struct afw_header *fgd_msg, *fgd_ret_msg;
+	struct afw_header *xlat = NULL;
 	int size = 0;
 	static struct mtk_battery_manager *bm;
 
 	if (bm == NULL)
 		bm = get_mtk_battery_manager();
+	if (bm == NULL)
+		return;
 
 	nlh = (struct nlmsghdr *)skb->data;
 	seq = nlh->nlmsg_seq;
@@ -1743,13 +1796,69 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 
 	fgd_msg = (struct afw_header *)data;
 
+	/*
+	 * op6893: the shipped vendor fuelgauged/libfgauge_gm30.so is Oplus's
+	 * 4.19 binary.  Its on-wire message is the old 7-word (28-byte)
+	 * fgd_nl_msg_t header -- cmd, hash, subcmd, subcmd_para1, data_len,
+	 * ret_data_len, identity -- with no leading instance_id/datatype
+	 * word, so identity sits at payload +24, one u32 before where this
+	 * kernel's 32-byte afw_header keeps it (+28).  Reading it raw makes
+	 * afw_header.identity fall on the daemon's pid, which is exactly the
+	 * "not correct MTKFG netlink packet!<pid>" reject we saw.
+	 *
+	 * When the packet is that layout (magic at +24), copy it into a real
+	 * afw_header by prepending a zeroed instance_id/datatype/pad word;
+	 * everything downstream then lines up field-for-field.  The matching
+	 * -4 shift on the reply lives in mtk_bm_send_to_user, gated by the
+	 * same bm->fgd_legacy flag set here.  (kprobe-confirmed 2026-09-21.)
+	 */
 	if (fgd_msg->identity != AFW_MAGIC) {
-		pr_err("[%s]not correct MTKFG netlink packet!%d\n",
-			__func__, fgd_msg->identity);
-		return;
+		u32 *w = data;
+		int plen = nlmsg_len(nlh);
+		const int legacy_hdr = AFW_MSG_HEADER_LEN - 4; /* 28 */
+
+		if (plen >= legacy_hdr &&
+		    w[legacy_hdr / 4 - 1] == AFW_MAGIC) {
+			xlat = kzalloc(plen + 4, GFP_KERNEL);
+			if (!xlat)
+				return;
+			/* instance_id/datatype/pad stay 0 from kzalloc */
+			memcpy((char *)xlat + 4, data, plen);
+			fgd_msg = xlat;
+			data = xlat;
+			if (!bm->fgd_legacy) {
+				bm->fgd_legacy = true;
+				pr_err("[%s]op6893: legacy 28-byte FG daemon layout, translating\n",
+					__func__);
+			}
+		} else {
+			pr_err("[%s]not correct MTKFG netlink packet!%d\n",
+				__func__, fgd_msg->identity);
+			return;
+		}
 	}
 
+	/* op6893 handshake trace -- drop once the daemon sequence is known. */
+	pr_err("[%s]op6893 rx cmd=%u id=%u subcmd=%u dlen=%u rlen=%u legacy=%d\n",
+		__func__, fgd_msg->cmd, fgd_msg->instance_id, fgd_msg->subcmd,
+		fgd_msg->data_len, fgd_msg->ret_data_len, bm->fgd_legacy);
+
 	size = fgd_msg->ret_data_len + AFW_MSG_HEADER_LEN;
+
+	/*
+	 * op6893: the stock daemon pre-sizes ret_data_len to cover whatever the
+	 * kernel handler will write, so the reply buffer is otherwise only
+	 * AFW_MSG_HEADER_LEN + ret_data_len.  The legacy 4.19 daemon sends
+	 * ret_data_len=0 even for commands whose handler writes into
+	 * ret_msg->data (e.g. SET_DAEMON_PID stores a 4-byte ino at data[0]),
+	 * so a 32-byte reply buffer overflows and trips FORTIFY_SOURCE
+	 * (mtk_bm_netlink_handler fortify_panic).  For a legacy peer, floor the
+	 * allocation at a full afw_header (data[AFW_MSG_MAX_LEN]) so any
+	 * handler's write fits; the wire reply is still trimmed to data_len in
+	 * mtk_bm_send_to_user, so this does not enlarge what goes out.
+	 */
+	if (bm->fgd_legacy && size < sizeof(struct afw_header))
+		size = sizeof(struct afw_header);
 
 	if (size > (PAGE_SIZE << 1))
 		fgd_ret_msg = vmalloc(size);
@@ -1764,8 +1873,10 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 		if (size > PAGE_SIZE)
 			fgd_ret_msg = vmalloc(size);
 
-		if (fgd_ret_msg == NULL)
+		if (fgd_ret_msg == NULL) {
+			kfree(xlat);
 			return;
+		}
 	}
 
 	memset(fgd_ret_msg, 0, size);
@@ -1773,6 +1884,7 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 	mtk_battery_manager_handler(bm, data, fgd_ret_msg, seq);
 
 	kvfree(fgd_ret_msg);
+	kfree(xlat);
 
 #ifdef WY_FIX
 	if (fgd_msg->instance_id == 0) {
@@ -1842,10 +1954,35 @@ void bm_custom_init_from_dts(struct platform_device *pdev, struct mtk_battery_ma
 		bm->disable_quick_shutdown, bm->vsys_det_voltage1, bm->vsys_det_voltage2);
 }
 
+/*
+ * op6893 6.6 bring-up: no `mediatek,battery manager` node exists in the
+ * LK-owned base tree (same reason as the gauge shim in mt6359p-gauge.c), so
+ * take the gauge psy by name instead of the gauge1/gauge2 phandles.  The
+ * gauge registers "mtk-gauge" at the end of its own probe; defer until then.
+ * bs_data.chg_psy stays best-effort (no charger stack on this port yet).
+ */
+static struct mtk_gauge *bm_find_gauge(struct device *dev)
+{
+	struct power_supply *psy;
+	struct mtk_gauge *gauge;
+
+	psy = power_supply_get_by_name("mtk-gauge");
+	if (!psy) {
+		dev_dbg(dev, "manager: gauge psy not ready, deferring\n");
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+	gauge = (struct mtk_gauge *)power_supply_get_drvdata(psy);
+	power_supply_put(psy);
+	if (!gauge || !gauge->gm) {
+		dev_dbg(dev, "manager: gauge core not ready, deferring\n");
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+	return gauge;
+}
+
 static int mtk_bm_probe(struct platform_device *pdev)
 {
 	struct mtk_battery_manager *bm;
-	struct power_supply *psy;
 	struct mtk_gauge *gauge;
 	int ret = 0;
 
@@ -1860,52 +1997,15 @@ static int mtk_bm_probe(struct platform_device *pdev)
 	bm_custom_init_from_header(bm);
 	bm_custom_init_from_dts(pdev, bm);
 
-	psy = devm_power_supply_get_by_phandle(&pdev->dev,
-								 "gauge1");
-
-	if (psy == NULL || IS_ERR(psy)) {
-		pr_err("[%s]can not get gauge1 psy\n", __func__);
-	} else {
-		gauge = (struct mtk_gauge *)power_supply_get_drvdata(psy);
-		if (gauge != NULL) {
-			bm->gm1 = gauge->gm;
-			bm->gm1->id = 0;
-			bm->gm1->bm = bm;
-			bm->gm1->netlink_send = mtk_bm_handler;
-		} else
-			pr_err("[%s]gauge1 is not rdy\n", __func__);
-	}
-	psy = devm_power_supply_get_by_phandle(&pdev->dev,
-								 "gauge2");
-
-	if (psy == NULL || IS_ERR(psy)) {
-		pr_err("[%s]can not get gauge2 psy\n", __func__);
-	} else {
-		gauge = (struct mtk_gauge *)power_supply_get_drvdata(psy);
-		if (gauge != NULL) {
-			bm->gm2 = gauge->gm;
-			bm->gm2->id = 1;
-			bm->gm2->bm = bm;
-			bm->gm2->netlink_send = mtk_bm_handler;
-		} else
-			pr_err("[%s]gauge2 is not rdy\n", __func__);
-	}
-
-	if (bm->gm1 != NULL) {
-		if (bm->gm2 != NULL) {
-			pr_err("[%s]dual gauges is enabled\n", __func__);
-			bm->gm_no = 2;
-		} else {
-			pr_err("[%s]single gauge is enabled\n", __func__);
-			bm->gm_no = 1;
-		}
-	} else
-		pr_err("[%s]gauge configuration is incorrect\n", __func__);
-
-	if (bm->gm1 == NULL && bm->gm2 == NULL) {
-		pr_err("[%s]disable gauge because can not find gm!\n", __func__);
-		return 0;
-	}
+	gauge = bm_find_gauge(&pdev->dev);
+	if (IS_ERR(gauge))
+		return PTR_ERR(gauge);
+	bm->gm1 = gauge->gm;
+	bm->gm1->id = 0;
+	bm->gm1->bm = bm;
+	bm->gm1->netlink_send = mtk_bm_handler;
+	bm->gm_no = 1;
+	pr_err("[%s]single gauge is enabled\n", __func__);
 
 
 	bm->chan_vsys = devm_iio_channel_get(
@@ -1994,17 +2094,91 @@ static const struct of_device_id __maybe_unused mtk_bm_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, mtk_bm_of_match);
 
+static const struct platform_device_id mtk_bm_id_table[] = {
+	{ .name = "mtk_battery_manager", },
+	{ }
+};
+MODULE_DEVICE_TABLE(platform, mtk_bm_id_table);
+
 static struct platform_driver mtk_battery_manager_driver = {
 	.probe = mtk_bm_probe,
 	.remove = mtk_bm_remove,
 	.shutdown = mtk_bm_shutdown,
+	.id_table = mtk_bm_id_table,
 	.driver = {
 		.name = "mtk_battery_manager",
 		.pm = &mtk_bm_pm_ops,
 		.of_match_table = mtk_bm_of_match,
 	},
 };
-module_platform_driver(mtk_battery_manager_driver);
+
+/*
+ * op6893: no `mediatek,battery manager` node in the LK-owned base tree, and
+ * the manager needs no hardware resources at all (it only consumes the
+ * gauge's "mtk-gauge" psy by name).  Instantiate our own platform device the
+ * way the 4.19 battery driver did (battery_device), so probe runs and
+ * registers the "battery" psy without any DT node.
+ *
+ * The device must NOT be named "charger": the oplus_chg_v2 stack already owns
+ * /devices/platform/charger (oplus_mms_wired/mtk_charger probe), so a second
+ * "charger" device trips EEXIST in sysfs (fgproto12, caught from pstore in
+ * rec, both after a 4.19 charge cycle and on a plain reflash -- deterministic).
+ *
+ * The "battery" psy is instead attached under the existing "charger" platform
+ * device (see bm_battery_service_init): a psy created with parent=that
+ * charger device lands exactly at
+ * /devices/platform/charger/power_supply/battery, which is the single battery
+ * path vendor sepolicy labels as vendor_sysfs_battery_supply (what the
+ * enforcing health HAL may read) -- the same path where the 4.19 "battery"
+ * psy lives.  Any other parent leaves the psy with the generic sysfs label,
+ * which enforcing SELinux denies to the health HAL (BatteryService stuck at
+ * level 0 / no present; fgproto9-11).  The fallback, when the charger device
+ * is not present (charger stack not staged), is our own device -- boot keeps
+ * working, only the enforcing label is lost.
+ */
+static struct platform_device *mtk_bm_pdev;
+
+static int __init mtk_bm_create_device(void)
+{
+	int ret;
+
+	mtk_bm_pdev = platform_device_alloc("mtk_battery_manager", -1);
+	if (!mtk_bm_pdev)
+		return -ENOMEM;
+	ret = platform_device_add(mtk_bm_pdev);
+	if (ret) {
+		platform_device_put(mtk_bm_pdev);
+		mtk_bm_pdev = NULL;
+		return ret;
+	}
+	return 0;
+}
+
+static int __init mtk_bm_mod_init(void)
+{
+	int ret;
+
+	ret = platform_driver_register(&mtk_battery_manager_driver);
+	if (ret)
+		return ret;
+	ret = mtk_bm_create_device();
+	if (ret) {
+		platform_driver_unregister(&mtk_battery_manager_driver);
+		return ret;
+	}
+	return 0;
+}
+
+static void __exit mtk_bm_mod_exit(void)
+{
+	if (mtk_bm_pdev) {
+		platform_device_unregister(mtk_bm_pdev);
+		mtk_bm_pdev = NULL;
+	}
+	platform_driver_unregister(&mtk_battery_manager_driver);
+}
+module_init(mtk_bm_mod_init);
+module_exit(mtk_bm_mod_exit);
 
 MODULE_AUTHOR("Wy Chuang<Wy.Chuang@mediatek.com>");
 MODULE_DESCRIPTION("MTK Battery Manager");

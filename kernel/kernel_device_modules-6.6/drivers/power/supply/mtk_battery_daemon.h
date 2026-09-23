@@ -37,6 +37,20 @@ void fg_sw_bat_cycle_accu(struct mtk_battery *gm);
 
 #define DATA_SIZE 2048
 struct afw_data_param {
+	/*
+	 * op6893: the vendor 4.19 fuelgauged packs a leading `type` word
+	 * ahead of total_size -- its get_data_from_kernel / send_data_to_kernel
+	 * put input at struct+0x10 (16) and total_size at +4, confirmed by
+	 * disasm.  This kernel had dropped the field (see the commented
+	 * `//unsigned int type;` in the 4.19 header), leaving a 12-byte header
+	 * that read the daemon's total_size as our size -- a 39020-byte
+	 * chunked-table request became a 39020-byte memcpy into input[2048]
+	 * (FORTIFY field-spanning write -> paging fault in fg_daemon_get_data).
+	 * Restore it so the wire layout matches; this struct is only cast over
+	 * the netlink data buffer in mtk_battery_daemon.c, so the change is
+	 * confined to that interpretation and is symmetric for get and send.
+	 */
+	unsigned int type;
 	unsigned int total_size;
 	unsigned int size;
 	unsigned int idx;

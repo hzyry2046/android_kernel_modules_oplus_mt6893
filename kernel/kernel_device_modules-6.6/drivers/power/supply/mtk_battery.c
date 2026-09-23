@@ -552,7 +552,8 @@ struct mtk_battery *get_mtk_battery(void)
 #ifndef OPLUS_FEATURE_CHG_BASIC
 		psy = power_supply_get_by_name("battery");
 #else
-		psy = power_supply_get_by_name("mtk-battery");
+		/* op6893: matches bm_battery_service_init's "battery" name. */
+		psy = power_supply_get_by_name("battery");
 #endif
 		if (psy == NULL) {
 			pr_debug("[%s] psy is not rdy\n", __func__);
@@ -2312,7 +2313,17 @@ void fg_check_bat_type(struct platform_device *dev,
 void fg_custom_init_from_dts(struct platform_device *dev,
 	struct mtk_battery *gm)
 {
-	struct device_node *np = dev->dev.of_node;
+	/*
+	 * op6893 6.6 bring-up: the 6.6 battery core expects every table on
+	 * the gauge's own of_node, but this board's tables live on the
+	 * top-level /battery (bat_gm30) node while the gauge device itself
+	 * has no of_node (MFD cell without a DT child -- LK owns the base
+	 * tree, see mt6359p-gauge.c).  Prefer /battery by path; fall back to
+	 * our own node for trees that follow the upstream layout.
+	 */
+	struct device_node *np = of_find_node_by_path("/battery");
+	if (!np)
+		np = dev->dev.of_node;
 	unsigned int val = 0;
 	int bat_id, multi_battery = 0, active_table = 0;
 	int i, j, ret, column = 0;
@@ -3072,6 +3083,9 @@ void fg_custom_init_from_dts(struct platform_device *dev,
 				fg_table_cust_data->fg_profile[i].fg_charging_r_profile, 2,
 				fg_table_cust_data->fg_profile[i].charging_r_ratio_active_table);
 	}
+	/* Paired with the of_find_node_by_path() above; dev.of_node needs no put. */
+	if (np && np != dev->dev.of_node)
+		of_node_put(np);
 }
 
 #endif	/* end of CONFIG_OF */
@@ -4595,33 +4609,41 @@ int battery_init(struct platform_device *pdev)
 	gm->in_sleep = false;
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "BAT_TEMP_01C_PRECISION", &(bat_temp_01c_precision), 1);
+	{
+	/*
+	 * op6893: same /battery fallback as fg_custom_init_from_dts --
+	 * the gauge device has no of_node (MFD cell without DT child).
+	 */
+	struct device_node *opl_dtnode = of_find_node_by_path("/battery");
+	if (!opl_dtnode)
+		opl_dtnode = pdev->dev.of_node;
+	fg_read_dts_val(gauge->gm, opl_dtnode, "BAT_TEMP_01C_PRECISION", &(bat_temp_01c_precision), 1);
 	printk("%s, bat_temp_01c_precision:%d\n", __func__, bat_temp_01c_precision);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "FUELGAGUE_APPLY", &(fuelgauge_apply), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "FUELGAGUE_APPLY", &(fuelgauge_apply), 1);
 	printk("%s, fuelgauge_apply:%d\n", __func__, fuelgauge_apply);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "IS_GET_TBAT_SUPPORT", &(is_get_tbat_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "IS_GET_TBAT_SUPPORT", &(is_get_tbat_support), 1);
 	printk("%s, is_get_tbat_support:%d\n", __func__, is_get_tbat_support);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "FOR_MTK_60W_SUPPORT", &(for_mtk_60w_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "FOR_MTK_60W_SUPPORT", &(for_mtk_60w_support), 1);
 	printk("%s, for_mtk_60w_support:%d\n", __func__, for_mtk_60w_support);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "USE_MT6768", &(use_mt6768), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "USE_MT6768", &(use_mt6768), 1);
 	printk("%s, use_mt6768:%d\n", __func__, use_mt6768);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "IS_4450MV_BATTERY_SUPPORT", &(is_4450mv_battery_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "IS_4450MV_BATTERY_SUPPORT", &(is_4450mv_battery_support), 1);
 	printk("%s, is_4450mv_battery_support:%d\n", __func__, is_4450mv_battery_support);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "ENABLE_IS_FORCE_FULL", &(enable_is_force_full), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "ENABLE_IS_FORCE_FULL", &(enable_is_force_full), 1);
 	printk("%s, enable_is_force_full:%d\n", __func__, enable_is_force_full);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "IS_SUBBOARD_TEMP_SUPPORT", &(is_subboard_temp_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "IS_SUBBOARD_TEMP_SUPPORT", &(is_subboard_temp_support), 1);
 	printk("%s, is_subboard_temp_support:%d\n", __func__, is_subboard_temp_support);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "USE_MT6360", &(use_mt6360), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "USE_MT6360", &(use_mt6360), 1);
 	printk("%s, use_mt6360:%d\n", __func__, use_mt6360);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "USE_MT6370", &(use_mt6370), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "USE_MT6370", &(use_mt6370), 1);
 	printk("%s, use_mt6370:%d\n", __func__, use_mt6370);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "ODM_SELECT_BAT_NTC_SUPPORT", &(odm_select_bat_ntc_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "ODM_SELECT_BAT_NTC_SUPPORT", &(odm_select_bat_ntc_support), 1);
 	printk("%s, odm_select_bat_ntc_support:%d\n", __func__, odm_select_bat_ntc_support);
 
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "AUTHENTICATE_IC_READ_BATT_BARCODE_SUPPORT",
+	fg_read_dts_val(gauge->gm, opl_dtnode, "AUTHENTICATE_IC_READ_BATT_BARCODE_SUPPORT",
 	                &(batt_barcode_read_support), 1);
 	printk("%s, batt_barcode_read_support:%d\n", __func__, batt_barcode_read_support);
-	fg_read_dts_val(gauge->gm, pdev->dev.of_node, "EXTERNAL_AUTHENTICATE", &(external_authenticate_support), 1);
+	fg_read_dts_val(gauge->gm, opl_dtnode, "EXTERNAL_AUTHENTICATE", &(external_authenticate_support), 1);
 	printk("%s, external_authenticate_support:%d\n", __func__, external_authenticate_support);
 
 	node = of_find_node_by_name(NULL, "charger");
@@ -4639,6 +4661,9 @@ int battery_init(struct platform_device *pdev)
 #if (defined(CONFIG_OPLUS_CHARGER_MTK6877) || defined(CONFIG_OPLUS_CHARGER_MTK6769R) || defined(CONFIG_OPLUS_CHARGER_MTK6833))
 	register_mtk_oplus_batt_interfaces(&mtk_oplus_batt_intf);
 #endif
+	if (opl_dtnode && opl_dtnode != pdev->dev.of_node)
+		of_node_put(opl_dtnode);
+	} /* opl_dtnode scope */
 #endif /* OPLUS_FEATURE_CHG_BASIC */
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	if(is_fuelgauge_apply() == true) {

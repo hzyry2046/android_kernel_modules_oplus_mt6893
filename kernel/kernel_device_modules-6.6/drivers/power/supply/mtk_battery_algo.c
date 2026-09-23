@@ -1203,6 +1203,34 @@ void fgr_dod_init(struct mtk_battery *gm)
 	init_swocv = gauge_get_int_property(gm, GAUGE_PROP_PTIM_BATTERY_VOLTAGE)
 		* 10;
 
+	/*
+	 * op6893 kernel-mode Gauge: the PTIM IMP/IMIX_R auxadc channels do not
+	 * exist on this board (neither the LK-owned base DTB nor the 4.19
+	 * live tree describes them -- the 4.19 driver simply logged
+	 * "chan_ptim_bat_voltage auxadc get fail" and carried on, because in
+	 * daemon mode DOD init runs in libfgauge off LK/NVRAM state and never
+	 * needs PTIM).  gauge_get_int_property() returns 0 on failure, so
+	 * without a fallback init_swocv stays 0 and OCV_to_SOC_c(0) yields a
+	 * bogus -216.  Fall back in order:
+	 *   1. LK's shutdown-time OCV (atag,fg_swocv_v -> gm->ptim_lk_v),
+	 *      the same source the 4.19 daemon preferred;
+	 *   2. live BATADC voltage (GAUGE_PROP_BATTERY_VOLTAGE, mV) -- same
+	 *      cell OCV minus IR drop, good enough for a cold-start seed
+	 *      (verified: 40420 -> OCV_to_SOC_c ~= 6100, i.e. ~61%).
+	 */
+	if (init_swocv <= 0) {
+		if (gm->ptim_lk_v > 0) {
+			init_swocv = gm->ptim_lk_v;
+			bm_err(gm, "[%s] op6893: PTIM unavailable, using LK swocv %d\n",
+				__func__, init_swocv);
+		} else {
+			init_swocv = gauge_get_int_property(gm,
+				GAUGE_PROP_BATTERY_VOLTAGE) * 10;
+			bm_err(gm, "[%s] op6893: PTIM/LK unavailable, using BATADC swocv %d\n",
+				__func__, init_swocv);
+		}
+	}
+
 	if (algo->rtc_ui_soc == 0 || con0_soc == 0) {
 		algo->rtc_ui_soc = OCV_to_SOC_c(gm, init_swocv);
 		algo->fg_c_d0_soc = algo->rtc_ui_soc;

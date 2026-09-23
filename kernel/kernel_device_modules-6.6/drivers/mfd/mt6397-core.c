@@ -663,6 +663,11 @@ static const struct mfd_cell mt6359p_legacy_devs[] = {
 		.resources = mt6359p_rtc_resources,
 		.of_compatible = "mediatek,mt6359-rtc",
 	}, {
+		.name = "mt6359p-gauge",
+		.num_resources = ARRAY_SIZE(mt6359p_gauge_resources),
+		.resources = mt6359p_gauge_resources,
+		.of_compatible = "mediatek,mt6359p-gauge",
+	}, {
 		.name = "mt6359p-misc",
 		.of_compatible = "mediatek,mt6359p-misc",
 	},

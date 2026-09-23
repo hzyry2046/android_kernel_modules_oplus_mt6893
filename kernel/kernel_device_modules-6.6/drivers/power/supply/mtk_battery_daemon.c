@@ -385,6 +385,26 @@ void fg_daemon_get_data(struct mtk_battery *gm, int cmd,
 		pret->total_size = prcv->total_size;
 		pret->size = prcv->size;
 		pret->idx = prcv->idx;
+		/*
+		 * op6893 kernel-mode Gauge: the vendor daemon's
+		 * fgauge_version_check rejected this kernel (custom_table_len
+		 * 55124 vs its baked 39020), so it never sends SET_INIT_FLAG
+		 * and fuelgauged stays a harmless 10s heartbeat.  Take the same
+		 * path MTK designed for exactly this case -- SEND_VERSION_CONTROL
+		 * mismatch arms gm->algo.active, and battery_algo_init() sets
+		 * BAT_PROP_INIT_DONE -> gm->init_flag = 1.  The kernel table it
+		 * replies with here is the one the kernel algo itself consumes,
+		 * so self-consistency holds and single-cell battery_update
+		 * publishes bm->uisoc into bat_capacity.
+		 */
+		if (gm->bm && gm->bm->fgd_legacy &&
+		    cmd == FG_DAEMON_CMD_GET_CUSTOM_TABLE &&
+		    !gm->algo.active) {
+			gm->algo.active = true;
+			battery_algo_init(gm);
+			bm_err(gm, "[%s] op6893: no daemon SET_INIT_FLAG, kernel mode armed, init_flag=%d\n",
+				__func__, gm->init_flag);
+		}
 
 	switch (cmd) {
 	case FG_DAEMON_CMD_GET_CUSTOM_SETTING:
@@ -5226,7 +5246,7 @@ static void bat_plugin_irq_handler(struct mtk_battery *gm)
 		enable_gauge_irq(gm->gauge, BAT_PLUGIN_IRQ);
 }
 
-static irqreturn_t bat_plugin_irq(int irq, void *data)
+static irqreturn_t __maybe_unused bat_plugin_irq(int irq, void *data)
 {
 	struct mtk_battery *gm = data;
 
@@ -5530,7 +5550,21 @@ int wakeup_fg_daemon(struct mtk_battery *gm, unsigned int flow_state, int cmd, i
 	fgd_msg->subcmd_para1 = para1;
 	memcpy(fgd_msg->data, &flow_state, sizeof(flow_state));
 	fgd_msg->data_len += sizeof(flow_state);
-	if (gm->netlink_send != NULL)
+	/*
+	 * op6893: gm->netlink_send is mtk_bm_handler, which belongs to
+	 * mtk_battery_manager.ko and lives only when that module loaded (it
+	 * may also be merely the raw handler without the pid/CCI state the
+	 * manager init sets up).  Calling it unconditionally dereferences the
+	 * manager's tables; when the manager's platform device failed to
+	 * register (EEXIST, fgproto12) or the module was never staged, that
+	 * call chain ends in a wild indirect branch (CFI Oops in
+	 * wakeup_fg_daemon, target mcupm_mbox_table, pstore t+13.45s -- the
+	 * actual device-kicking panic).  Guard on the manager being present:
+	 * gm->bm is set by mtk_bm_probe and never otherwise.  Daemon-mode
+	 * notifications get dropped in kernel mode, which is fine -- the algo
+	 * thread consumes the same state.
+	 */
+	if (gm->netlink_send != NULL && gm->bm != NULL)
 		gm->netlink_send(gm, 0, fgd_msg);
 	kvfree(fgd_msg);
 
@@ -5926,12 +5960,19 @@ int mtk_battery_daemon_init(struct platform_device *pdev)
 		"mtk_gauge_bat_plugout",
 		gm);
 
-		ret |= devm_request_threaded_irq(&gm->gauge->pdev->dev,
-		gm->gauge->irq_no[BAT_PLUGIN_IRQ],
-		NULL, bat_plugin_irq,
-		IRQF_ONESHOT | IRQF_TRIGGER_HIGH,
-		"mtk_gauge_bat_plugin",
-		gm);
+		/*
+		 * op6893: this board's PMIC exposes a single "BAT_OUT" interrupt,
+		 * so mt6359p-gauge.c maps both BAT_PLUGIN_IRQ and BAT_PLUGOUT_IRQ
+		 * onto the same hwirq (the 4.19 gauge does too, and its daemon
+		 * requests only BAT_PLUGOUT).  6.6 added a second request on
+		 * BAT_PLUGIN with a different handler/name -- on a shared line
+		 * that is a genirq flags mismatch ("mtk_gauge_bat_plugin vs
+		 * mtk_gauge_bat_plugout"), the request fails, and request irq
+		 * failed aborts the rest of the FG IRQ setup.  Match 4.19: drop
+		 * the BAT_PLUGIN request.  bat_plugin_irq only matters for the
+		 * dual-gauge (gm_no==2) hot-swap path, which this single-gauge
+		 * board never takes.
+		 */
 
 		ret |= devm_request_threaded_irq(&gm->gauge->pdev->dev,
 		gm->gauge->irq_no[FG_N_CHARGE_L_IRQ],

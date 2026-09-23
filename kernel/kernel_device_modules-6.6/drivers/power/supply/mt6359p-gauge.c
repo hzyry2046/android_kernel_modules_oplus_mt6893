@@ -7,12 +7,17 @@
 #include <linux/cdev.h>
 #include <linux/device.h>
 #include <linux/iio/consumer.h>
+#include <linux/iio/driver.h>
+#include <linux/iio/iio.h>
+#include <linux/iio/machine.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/irqdesc.h>
 #include <linux/mfd/mt6397/core.h>
 #include <linux/mfd/mt6359p/registers.h>
+#include <linux/mutex.h>
 #include <linux/netlink.h>
+#include <linux/of_platform.h>
 #include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/module.h>
@@ -3869,27 +3874,223 @@ static int adc_cali_cdev_init(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * op6893 6.6 bring-up: this board boots the LK-bundled base DTB, not the
+ * kernel_dtb chain's blob00, so no `mediatek,mt6359p-gauge` child node can be
+ * added from the kernel side (see prepare_gauge_dtb.py, kept for reference).
+ * The MFD legacy cell still creates the `mt6359p-gauge` platform device with
+ * its 12 IRQ resources -- it just has no of_node.  Take the three things a
+ * nested node would have been handed the way the 4.19 driver and the accdet
+ * shim (mt6359p-accdet.c, commit f9c34770) do:
+ *
+ *   regmap  the mt6397 chip found by compatible + of_find_device_by_node(),
+ *           not dev_get_drvdata(pdev->dev.parent) -- the MFD pdev IS the
+ *           parent here but carries no drvdata for an of_node-less child, so
+ *           the old line oopsed on NULL.
+ *   iio     board-consumer map (below) instead of the gauge node's
+ *           io-channels, which does not exist in this DTB.
+ *   tables  read from the top-level /battery (bat_gm30) node by path, not
+ *           from our own of_node (see fg_custom_init_from_dts shim in
+ *           mtk_battery.c).
+ *
+ * Each helper defers while its provider is late (first stage loads
+ * modules.load in parallel) and fails closed with -ENODEV when this DT does
+ * not describe it at all.
+ */
+#define MT6359_PMIC_COMPATIBLE		"mediatek,mt6359-pmic"
+#define MT6359_AUXADC_COMPATIBLE	"mediatek,mt6359-auxadc"
+
+/* The parent drvdata a nested node would have been given. */
+static struct mt6397_chip *gauge_pmic_chip(struct device *dev)
+{
+	struct platform_device *pmic_pdev;
+	struct mt6397_chip *chip;
+	struct device_node *np;
+
+	np = of_find_compatible_node(NULL, NULL, MT6359_PMIC_COMPATIBLE);
+	if (!np)
+		return ERR_PTR(-ENODEV);
+
+	pmic_pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pmic_pdev)
+		return ERR_PTR(-EPROBE_DEFER);
+
+	chip = platform_get_drvdata(pmic_pdev);
+	put_device(&pmic_pdev->dev);
+
+	if (!chip || !chip->regmap) {
+		dev_dbg(dev, "gauge: PMIC chip not ready, deferring\n");
+		return ERR_PTR(-EPROBE_DEFER);
+	}
+
+	return chip;
+}
+
+/*
+ * Board IIO map: the 4.19 DTB's gauge node carries no io-channels (that came
+ * from the mt6359.dtsi mtk_gauge template this board never included), and the
+ * 6.6 auxadc driver registers no global map of its own.  The channel numbers
+ * are the dt-bindings/iio/mt635x-auxadc.h values, double-checked against the
+ * pmic_auxadc child nodes in the live DTB (bat_temp ch3, batadc ch0,
+ * vbif ch0x0e; DT has no IMP/IMIX_R child but the auxadc driver always
+ * registers those two computed channels, so the labels resolve).
+ * The map is registered on the auxadc device itself with the gauge's
+ * consumer names, so the stock devm_iio_channel_get() calls below resolve
+ * without touching this driver's (absent) of_node.
+ *
+ * NOTE: the label must be the auxadc's own datasheet_name ("BATADC",
+ * "BAT_TEMP", "VBIF", "IMP", "IMIX_R" -- see mt635x-auxadc.c), because
+ * iio_channel_get_sys() matches adc_channel_label against
+ * channels[].datasheet_name.  The consumer_channel side stays the legacy
+ * pmic_* names the gauge driver asks for.
+ */
+static const char * const gauge_consumer_channels[] = {
+	"pmic_battery_temp",
+	"pmic_battery_voltage",
+	"pmic_bif_voltage",
+	"pmic_ptim_voltage",
+	"pmic_ptim_r",
+	"pmic_ptim_current",
+};
+
+static const char * const gauge_provider_labels[] = {
+	"BAT_TEMP",
+	"BATADC",
+	"VBIF",
+	"IMP",
+	"IMIX_R",
+	"IMP",
+};
+
+static bool gauge_iio_map_done;
+static DEFINE_MUTEX(gauge_iio_map_lock);
+
+/*
+ * rmmod safety: map entries point at devm memory on the gauge device and at
+ * the auxadc iio device without holding a reference, so they must be gone
+ * before either side is freed.  Hooking removal to the gauge device's devres
+ * list (instead of remove()) also covers probe paths that defer after
+ * registering, and clears gauge_iio_map_done so a later probe re-registers
+ * instead of trusting a stale flag.
+ */
+static void gauge_iio_map_devm_release(void *data)
+{
+	struct iio_dev *indio_dev = data;
+
+	mutex_lock(&gauge_iio_map_lock);
+	iio_map_array_unregister(indio_dev);
+	gauge_iio_map_done = false;
+	mutex_unlock(&gauge_iio_map_lock);
+}
+
+#ifdef OPLUS_FEATURE_CHG_BASIC
+static int gauge_iio_match_parent(struct device *dev, const void *data)
+{
+	struct iio_dev *indio_dev = dev_to_iio_dev(dev);
+
+	return indio_dev->dev.parent == data;
+}
+
+static int gauge_iio_map_register(struct device *consumer)
+{
+	struct device_node *np;
+	struct platform_device *auxadc_pdev;
+	struct device *iio_dev;
+	struct iio_dev *indio_dev;
+	struct iio_map *map;
+	int i, ret = 0;
+
+	mutex_lock(&gauge_iio_map_lock);
+	if (gauge_iio_map_done)
+		goto out;
+
+	np = of_find_compatible_node(NULL, NULL, MT6359_AUXADC_COMPATIBLE);
+	if (!np) {
+		ret = -ENODEV;
+		goto out;
+	}
+	auxadc_pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!auxadc_pdev) {
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+
+	/* The auxadc registers its channels from its DT children at probe;
+	 * its iio device is the child of the auxadc platform device. */
+	iio_dev = bus_find_device(&iio_bus_type, NULL, &auxadc_pdev->dev,
+				  gauge_iio_match_parent);
+	put_device(&auxadc_pdev->dev);
+	if (!iio_dev) {
+		dev_dbg(consumer, "gauge: auxadc iio device not ready, deferring\n");
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+	indio_dev = dev_to_iio_dev(iio_dev);
+
+	map = devm_kzalloc(consumer,
+			   sizeof(*map) * (ARRAY_SIZE(gauge_consumer_channels) + 1),
+			   GFP_KERNEL);
+	if (!map) {
+		put_device(iio_dev);
+		ret = -ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(gauge_consumer_channels); i++) {
+		map[i].adc_channel_label = gauge_provider_labels[i];
+		map[i].consumer_dev_name = dev_name(consumer);
+		map[i].consumer_channel = gauge_consumer_channels[i];
+	}
+
+	ret = iio_map_array_register(indio_dev, map);
+	if (ret) {
+		dev_err(consumer, "gauge: cannot register iio map (%d)\n", ret);
+		put_device(iio_dev);
+		devm_kfree(consumer, map);
+		goto out;
+	}
+	ret = devm_add_action_or_reset(consumer,
+					 gauge_iio_map_devm_release,
+					 indio_dev);
+	put_device(iio_dev);
+	if (ret)
+		goto out;
+	gauge_iio_map_done = true;
+
+out:
+	mutex_unlock(&gauge_iio_map_lock);
+	return ret;
+}
+#endif /* OPLUS_FEATURE_CHG_BASIC */
+
 static int mt6359_gauge_probe(struct platform_device *pdev)
 {
 	struct mtk_gauge *gauge;
+	struct mt6397_chip *chip;
 	int ret;
-#ifndef OPLUS_FEATURE_CHG_BASIC
+#ifdef OPLUS_FEATURE_CHG_BASIC
 	struct iio_channel *chan_bat_temp;
 
-	chan_bat_temp = devm_iio_channel_get(
-		&pdev->dev, "pmic_battery_temp");
+	ret = gauge_iio_map_register(&pdev->dev);
+	if (ret)
+		return ret;
+	chan_bat_temp = iio_channel_get(&pdev->dev, "pmic_battery_temp");
 	if (IS_ERR(chan_bat_temp)) {
 		dev_err(&pdev->dev, "mt6359 requests probe deferral\n");
 		return -EPROBE_DEFER;
 	}
+	iio_channel_release(chan_bat_temp);
 #endif
 
 	gauge = devm_kzalloc(&pdev->dev, sizeof(*gauge), GFP_KERNEL);
 	if (!gauge)
 		return -ENOMEM;
 
-	gauge->chip = (struct mt6397_chip *)dev_get_drvdata(
-		pdev->dev.parent);
+	chip = gauge_pmic_chip(&pdev->dev);
+	if (IS_ERR(chip))
+		return PTR_ERR(chip);
+	gauge->chip = chip;
 	gauge->regmap = gauge->chip->regmap;
 	gauge->regmap_type = REGMAP_TYPE_SPI;
 	dev_set_drvdata(&pdev->dev, gauge);
@@ -3903,6 +4104,8 @@ static int mt6359_gauge_probe(struct platform_device *pdev)
 	gauge->irq_no[VBAT_H_IRQ] = platform_get_irq_byname(pdev, "VBAT_H");
 	gauge->irq_no[VBAT_L_IRQ] = platform_get_irq_byname(pdev, "VBAT_L");
 	gauge->irq_no[NAFG_IRQ] = platform_get_irq_byname(pdev, "NAFG");
+	gauge->irq_no[BAT_PLUGIN_IRQ] =
+		platform_get_irq_byname(pdev, "BAT_OUT");
 	gauge->irq_no[BAT_PLUGOUT_IRQ] =
 		platform_get_irq_byname(pdev, "BAT_OUT");
 	gauge->irq_no[ZCV_IRQ] = platform_get_irq_byname(pdev, "ZCV");
@@ -3951,6 +4154,25 @@ static int mt6359_gauge_probe(struct platform_device *pdev)
 	if (IS_ERR(gauge->chan_ptim_r)) {
 		ret = PTR_ERR(gauge->chan_ptim_r);
 		dev_err(&pdev->dev, "chan_ptim_r auxadc get fail, ret=%d\n",
+			ret);
+	}
+
+	/*
+	 * op6893: PTIM current.  The 4.19 gauge template binds
+	 * "pmic_ptim_current" to <&auxadc 3> (SPMI ADC), a provider this
+	 * board's DT does not describe.  The 4.19 driver treated a missing
+	 * binding as fatal for probe or left the channel broken, but the
+	 * value is only an input to get_ptim_i() (vboot compensation) --
+	 * and get_ptim_current() right above derives the same discharge
+	 * current straight from the FG_R_CURR register, which is working
+	 * here (ptim current:4540 in dmesg).  So keep the channel optional:
+	 * use it when present, otherwise fall back to the register value.
+	 */
+	gauge->chan_ptim_current = devm_iio_channel_get(
+		&pdev->dev, "pmic_ptim_current");
+	if (IS_ERR(gauge->chan_ptim_current)) {
+		ret = PTR_ERR(gauge->chan_ptim_current);
+		dev_dbg(&pdev->dev, "pmic_ptim_current not bound (%d), using FG register current\n",
 			ret);
 	}
 
@@ -4014,12 +4236,25 @@ static int mt6359_gauge_remove(struct platform_device *pdev)
 
 MODULE_DEVICE_TABLE(of, mt6359_gauge_of_match);
 
+/*
+ * op6893: the MFD-created `mt6359p-gauge` device has no of_node (see above),
+ * so of_match never fires.  Bind by platform name instead -- the MFD core
+ * names the device after the cell, and platform bus matching falls back to
+ * driver.name comparison when no OF or ID table matches.
+ */
+static const struct platform_device_id mt6359_gauge_id_table[] = {
+	{ .name = "mt6359p-gauge", },
+	{ }
+};
+MODULE_DEVICE_TABLE(platform, mt6359_gauge_id_table);
+
 static struct platform_driver mt6359_gauge_driver = {
 	.probe = mt6359_gauge_probe,
 	.remove = mt6359_gauge_remove,
 	.shutdown = mt6359_gauge_shutdown,
 	.suspend = mt6359_gauge_suspend,
 	.resume = mt6359_gauge_resume,
+	.id_table = mt6359_gauge_id_table,
 	.driver = {
 		.name = "mt6359p_gauge",
 		.of_match_table = mt6359_gauge_of_match,

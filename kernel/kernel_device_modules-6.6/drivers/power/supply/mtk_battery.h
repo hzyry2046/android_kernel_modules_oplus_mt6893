@@ -1424,6 +1424,17 @@ struct mtk_battery_manager {
 	//netlink
 	struct sock *mtk_bm_sk;
 	u_int fgd_pid;
+	/*
+	 * op6893: the vendor fuelgauged/libfgauge_gm30.so is the Oplus 4.19
+	 * binary, whose on-wire header is the 7-word (28-byte) fgd_nl_msg_t
+	 * without the afw_header's leading instance_id/datatype word, so its
+	 * identity lands at payload +24 instead of the +28 this kernel's
+	 * afw_header expects.  Set once the first packet is recognised as that
+	 * layout; gates the header translation in mtk_bm_netlink_handler and
+	 * mtk_bm_send_to_user.  (kprobe-confirmed 2026-09-21: SET_DAEMON_PID
+	 * packet dumped as cmd=1 hash=0 subcmd=28 ... identity@+24.)
+	 */
+	bool fgd_legacy;
 
 	struct battery_data bs_data;
 

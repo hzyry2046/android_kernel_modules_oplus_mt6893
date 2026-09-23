@@ -267,6 +267,8 @@ struct mtk_gauge {
 	struct iio_channel *chan_bif;
 	struct iio_channel *chan_ptim_bat_voltage;
 	struct iio_channel *chan_ptim_r;
+	/* op6893: optional PTIM current channel, see mt6359p-gauge.c probe. */
+	struct iio_channel *chan_ptim_current;
 
 	struct mtk_gauge_sysfs_field_info *attr;
 	struct zcv_data zcv_info;
