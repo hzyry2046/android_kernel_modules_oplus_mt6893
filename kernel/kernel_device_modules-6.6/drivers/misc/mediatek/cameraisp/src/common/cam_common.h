@@ -225,5 +225,17 @@
 				platform_id = 0x6580;				\
 		}								\
 	}									\
+	/*								\
+	 * op6893 6.6 bring-up: the 4.19 DTB we boot has no		\
+	 * "*_legacy" camera nodes and no "mediatek,platform"		\
+	 * property (the camsys/cam nodes use the old un-suffixed	\
+	 * compatibles), so GET_PLATFORM_ID would return 0 and every	\
+	 * camera driver bails with -ENODEV.  Fall back to the SoC	\
+	 * id off the machine compatible, mirroring the seninf/	\
+	 * imgsensor "mediatek,platform" shims.				\
+	 */								\
+	if (platform_id == 0 &&						\
+		of_machine_is_compatible("mediatek,MT6893"))		\
+		platform_id = 0x6893;					\
 	platform_id;								\
 })
