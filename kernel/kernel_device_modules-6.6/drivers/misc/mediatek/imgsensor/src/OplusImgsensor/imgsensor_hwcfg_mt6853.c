@@ -7401,9 +7401,170 @@ struct CAMERA_DEVICE_INFO gImgEepromInfo_210A0 = {
 };
 
 #endif
+/* op6893 6.6 bring-up: 20615 sensor tables ported from 4.19 imgsensor_hwcfg_mt6885.c */
+struct IMGSENSOR_SENSOR_LIST
+    gimgsensor_sensor_list_20615[MAX_NUM_OF_SUPPORT_SENSOR] = {
+#if defined(IMX682_MIPI_RAW_20615)
+{IMX682_SENSOR_ID_20615, SENSOR_DRVNAME_IMX682_MIPI_RAW_20615, IMX682_MIPI_RAW_20615_SensorInit},
+#endif
+#if defined(IMX471_MIPI_RAW_20615)
+{IMX471_SENSOR_ID_20615, SENSOR_DRVNAME_IMX471_MIPI_RAW_20615, IMX471_MIPI_RAW_20615_SensorInit},
+#endif
+#if defined(HI846_MIPI_RAW_20615)
+{HI846_SENSOR_ID_20615, SENSOR_DRVNAME_HI846_MIPI_RAW_20615, HI846_MIPI_RAW_20615_SensorInit},
+#endif
+#if defined(OV02B10_MIPI_RAW_20615)
+{OV02B10_SENSOR_ID_20615, SENSOR_DRVNAME_OV02B10_MIPI_RAW_20615, OV02B10_MIPI_RAW_20615_SensorInit},
+#endif
+
+    /*  ADD sensor driver before this line */
+    {0, {0}, NULL}, /* end of list */
+};
+
+struct IMGSENSOR_HW_CFG imgsensor_custom_config_20615[] = {
+    {
+        IMGSENSOR_SENSOR_IDX_MAIN,
+        IMGSENSOR_I2C_DEV_0,
+        {
+            {IMGSENSOR_HW_PIN_MCLK,  IMGSENSOR_HW_ID_MCLK},
+            {IMGSENSOR_HW_PIN_AVDD,  IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_AVDD_1,IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DOVDD, IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DVDD,  IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_RST,   IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_NONE,  IMGSENSOR_HW_ID_NONE},
+        },
+    },
+    {
+        IMGSENSOR_SENSOR_IDX_SUB,
+        IMGSENSOR_I2C_DEV_1,
+        {
+            {IMGSENSOR_HW_PIN_MCLK,  IMGSENSOR_HW_ID_MCLK},
+            {IMGSENSOR_HW_PIN_AVDD,  IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_DOVDD, IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DVDD,  IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_RST,   IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_NONE, IMGSENSOR_HW_ID_NONE},
+        },
+    },
+    {
+        IMGSENSOR_SENSOR_IDX_MAIN2,
+        IMGSENSOR_I2C_DEV_2,
+        {
+            {IMGSENSOR_HW_PIN_MCLK,  IMGSENSOR_HW_ID_MCLK},
+            {IMGSENSOR_HW_PIN_AVDD,  IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DOVDD, IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DVDD,  IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_RST,   IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_NONE,  IMGSENSOR_HW_ID_NONE},
+        },
+    },
+    {
+        IMGSENSOR_SENSOR_IDX_SUB2,
+        IMGSENSOR_I2C_DEV_3,
+        {
+            {IMGSENSOR_HW_PIN_MCLK,  IMGSENSOR_HW_ID_MCLK},
+            {IMGSENSOR_HW_PIN_AVDD,  IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_DOVDD, IMGSENSOR_HW_ID_REGULATOR},
+            {IMGSENSOR_HW_PIN_RST,   IMGSENSOR_HW_ID_GPIO},
+            {IMGSENSOR_HW_PIN_NONE,  IMGSENSOR_HW_ID_NONE},
+        },
+    },
+
+    {IMGSENSOR_SENSOR_IDX_NONE}
+};
+
+struct IMGSENSOR_HW_POWER_SEQ sensor_power_sequence_20615[] = {
+#if defined(IMX682_MIPI_RAW_20615)
+    {
+        SENSOR_DRVNAME_IMX682_MIPI_RAW_20615,
+        {
+            {RST, Vol_Low, 1},
+            {AVDD_1, Vol_1800, 0},
+            {AVDD, Vol_2900, 0},
+            {DVDD, Vol_1100, 0},
+            {DOVDD, Vol_1800, 2},
+            //{AFVDD, Vol_1800, 1},
+            {SensorMCLK, Vol_High, 1},
+            {RST, Vol_High, 3}
+        },
+    },
+#endif
+#if defined(IMX471_MIPI_RAW_20615)
+    {
+        SENSOR_DRVNAME_IMX471_MIPI_RAW_20615,
+        {
+            {RST, Vol_Low, 1},
+            {AVDD, Vol_2800, 0},
+            {DVDD, Vol_1100, 0},
+            {DOVDD, Vol_1800, 1},
+            {SensorMCLK, Vol_High, 1},
+            {RST, Vol_High, 2}
+        },
+    },
+#endif
+#if defined(HI846_MIPI_RAW_20615)
+      {
+          SENSOR_DRVNAME_HI846_MIPI_RAW_20615,
+          {
+              {RST, Vol_Low, 1},
+              {AVDD, Vol_2800, 0},
+              {DVDD, Vol_1200, 0},
+              {DOVDD, Vol_1800, 1},
+              {SensorMCLK, Vol_High, 1},
+              {RST, Vol_High, 2}
+          },
+     },
+#endif
+#if defined(OV02B10_MIPI_RAW_20615)
+    {
+        SENSOR_DRVNAME_OV02B10_MIPI_RAW_20615,
+        {
+            {RST, Vol_Low, 1},
+            {DOVDD, Vol_1800, 1},
+            {AVDD, Vol_2800, 0, Vol_Low, 8},
+            {SensorMCLK, Vol_High, 5},
+            {RST, Vol_High, 10}
+        },
+    },
+#endif
+    /* add new sensor before this line */
+    {NULL,},
+};
+
+struct CAMERA_DEVICE_INFO gImgEepromInfo_20615= {
+    .i4SensorNum = 4,
+    .pCamModuleInfo = {
+        {IMX682_SENSOR_ID_20615, 0xA0, {0x00, 0x06}, 0xB0, 1, {0x92,0xFF,0xFF,0x94}, "Cam_r0", "imx682"},
+        {IMX471_SENSOR_ID_20615, 0xA8, {0x00, 0x06}, 0xB0, 0, {0xFF,0xFF,0xFF,0xFF}, "Cam_f",  "imx471"},
+        {HI846_SENSOR_ID_20615,  0xA2, {0x00, 0x06}, 0xB0, 0, {0xFF,0xFF,0xFF,0xFF}, "Cam_r1", "hi846"},
+        {OV02B10_SENSOR_ID_20615,0xA4, {0x00, 0x06}, 0xB0, 0, {0xFF,0xFF,0xFF,0xFF}, "Cam_r2", "ov02b10"},
+    },
+    .i4MWDataIdx = IMGSENSOR_SENSOR_IDX_MAIN2,
+    .i4MTDataIdx = 0xFF,
+    .i4FrontDataIdx = 0xFF,
+    .i4NormDataLen = 40,
+    .i4MWDataLen = 3102,
+    .i4MWStereoAddr = {IMX682_STEREO_START_ADDR_20615, HI846_STEREO_START_ADDR_20615},
+    .i4MTStereoAddr = {0xFFFF, 0xFFFF},
+    .i4FrontStereoAddr = {0xFFFF, 0xFFFF},
+};
+
+
 void oplus_imgsensor_hwcfg(void)
 {
-    if (is_project(22083) || is_project(22291) || is_project(22292)) {
+    /*
+     * op6893 6.6 bring-up: the 4.19 DTB we boot has no "oplus_project"
+     * node, so get_project() returns 0 and is_project(20615) is false;
+     * force the 20615 tables on any MT6893 board that reports no project.
+     */
+    if (is_project(20615) || is_project(21609) || is_project(20662) ||
+        (get_project() == 0 && of_machine_is_compatible("mediatek,MT6893"))) {
+         oplus_gimgsensor_sensor_list = gimgsensor_sensor_list_20615;
+         oplus_imgsensor_custom_config = imgsensor_custom_config_20615;
+         oplus_sensor_power_sequence = sensor_power_sequence_20615;
+         gImgEepromInfo = gImgEepromInfo_20615;
+    } else     if (is_project(22083) || is_project(22291) || is_project(22292)) {
          oplus_gimgsensor_sensor_list = gimgsensor_sensor_list_lijing;
          oplus_imgsensor_custom_config = imgsensor_custom_config_lijing;
          oplus_sensor_power_sequence = sensor_power_sequence_lijing;

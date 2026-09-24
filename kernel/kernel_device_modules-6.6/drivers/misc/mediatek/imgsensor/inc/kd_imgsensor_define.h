@@ -1257,6 +1257,9 @@ struct IMAGESENSOR_GET_SUPPORTED_ISP_CLK {
 #define OV48B_STEREO_START_ADDR               (0x2840)
 #define S5KGM1ST_STEREO_START_ADDR            (0x2840)
 #define HI846_STEREO_START_ADDR_20645         (0x1A20)
+/* op6893 6.6 bring-up: 20615 stereo addrs ported from 4.19 */
+#define IMX682_STEREO_START_ADDR_20615        (0x2840)
+#define HI846_STEREO_START_ADDR_20615         (0x1A20)
 #define HI846Q2R_STEREO_START_ADDR            (0x1EA8)
 #define IMX686Q2R_STEREO_START_ADDR           (0x26D0)
 #define S5KGW3_STEREO_START_ADDR_20630        (0x2D98)

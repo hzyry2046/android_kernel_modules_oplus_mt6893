@@ -10,6 +10,16 @@
 #define OPLUS_FEATURE_CAMERA_COMMON
 #endif /* OPLUS_FEATURE_CAMERA_COMMON */
 
+/* op6893 6.6 bring-up: 20615 sensor IDs/DRVNAMEs ported from 4.19 */
+#define IMX682_SENSOR_ID_20615                        0x0683 /*0x0682+1*/
+#define SENSOR_DRVNAME_IMX682_MIPI_RAW_20615          "imx682_mipi_raw_20615"
+#define IMX471_SENSOR_ID_20615                        0x20001 /*0x20000+1*/
+#define SENSOR_DRVNAME_IMX471_MIPI_RAW_20615          "imx471_mipi_raw_20615"
+#define HI846_SENSOR_ID_20615                         0x0848 /*0x0846+2*/
+#define SENSOR_DRVNAME_HI846_MIPI_RAW_20615           "hi846_mipi_raw_20615"
+#define OV02B10_SENSOR_ID_20615                       0x0032 /*0x002B+7*/
+#define SENSOR_DRVNAME_OV02B10_MIPI_RAW_20615         "ov02b10_mipi_raw_20615"
+
 #include <linux/ioctl.h>
 #include <linux/i3c/device.h>
 
