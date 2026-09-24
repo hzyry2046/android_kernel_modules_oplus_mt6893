@@ -2498,7 +2498,18 @@ static int boot_zcv_get(struct mtk_gauge *gauge_dev,
 				_hw_ocv_src = FROM_PMIC_PON_ON;
 			}
 
-			if (abs(_hw_ocv - _sw_ocv) > now_thr) {
+			/*
+			 * op6893 kernel-mode: with no fuel-gauge daemon,
+			 * gauge_dev->hw_status.sw_ocv stays 0.  The original
+			 * "reliability" override then rejects a perfectly good
+			 * PMIC power-on latch (|hw_ocv - 0| > now_thr is always
+			 * true) and forces _hw_ocv = sw_ocv = 0, which seeds a
+			 * bogus SoC.  Only trust the sw_ocv override when sw_ocv
+			 * is itself a plausible battery voltage (>= 2.8 V);
+			 * otherwise keep the hardware zero-current OCV.
+			 */
+			if (_sw_ocv >= 28000 &&
+				abs(_hw_ocv - _sw_ocv) > now_thr) {
 				_prev_hw_ocv = _hw_ocv;
 				_prev_hw_ocv_src = _hw_ocv_src;
 				_hw_ocv = _sw_ocv;
@@ -2532,7 +2543,8 @@ static int boot_zcv_get(struct mtk_gauge *gauge_dev,
 
 	/* final chance to check hwocv */
 	if (gm != NULL)
-		if (_hw_ocv < 28000 && (gm->disableGM30 == 0)) {
+		if (_hw_ocv < 28000 && _sw_ocv >= 28000 &&
+			(gm->disableGM30 == 0)) {
 			bm_err(gm, "[%s] ERROR, _hw_ocv=%d  src:%d, force use swocv\n",
 			__func__, _hw_ocv, _hw_ocv_src);
 			_hw_ocv = _sw_ocv;
