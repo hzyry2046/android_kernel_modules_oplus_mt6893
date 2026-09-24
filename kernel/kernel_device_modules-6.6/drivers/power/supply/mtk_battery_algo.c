@@ -8,6 +8,20 @@
 
 #define CAR_MIN_GAP 15
 
+/*
+ * op6893 kernel-mode cold-start OCV seed guards.
+ * FGR_BOOT_ZCV_MIN : unit 0.1 mV.  boot_zcv_get() forces the value to
+ *   sw_ocv (0 in kernel mode) whenever the PMIC power-on latch is not
+ *   ready or reads < 2.8 V, so anything below ~3.0 V means "no valid
+ *   zero-current OCV" and we must fall through to the BATADC path.
+ * FGR_BOOT_RBAT_MOHM : pack internal resistance estimate used only by
+ *   the IR-compensation safety net.  Derived from this 2S pack's boot
+ *   delta measured 2026-09-24 (3938 mV zero-current vs 3652 mV loaded
+ *   BATADC at ~3.8 A => ~75 mOhm).
+ */
+#define FGR_BOOT_ZCV_MIN	30000
+#define FGR_BOOT_RBAT_MOHM	75
+
 int set_kernel_soc(struct mtk_battery *gm, int _soc)
 {
 	gm->soc = (_soc + 50) / 100;
@@ -1204,30 +1218,59 @@ void fgr_dod_init(struct mtk_battery *gm)
 		* 10;
 
 	/*
-	 * op6893 kernel-mode Gauge: the PTIM IMP/IMIX_R auxadc channels do not
-	 * exist on this board (neither the LK-owned base DTB nor the 4.19
-	 * live tree describes them -- the 4.19 driver simply logged
-	 * "chan_ptim_bat_voltage auxadc get fail" and carried on, because in
-	 * daemon mode DOD init runs in libfgauge off LK/NVRAM state and never
-	 * needs PTIM).  gauge_get_int_property() returns 0 on failure, so
-	 * without a fallback init_swocv stays 0 and OCV_to_SOC_c(0) yields a
-	 * bogus -216.  Fall back in order:
-	 *   1. LK's shutdown-time OCV (atag,fg_swocv_v -> gm->ptim_lk_v),
-	 *      the same source the 4.19 daemon preferred;
-	 *   2. live BATADC voltage (GAUGE_PROP_BATTERY_VOLTAGE, mV) -- same
-	 *      cell OCV minus IR drop, good enough for a cold-start seed
-	 *      (verified: 40420 -> OCV_to_SOC_c ~= 6100, i.e. ~61%).
+	 * op6893 kernel-mode Gauge cold-start OCV seed.  The PTIM IMP/IMIX_R
+	 * auxadc channels do not exist on this board, so PTIM vbat above and
+	 * LK's atag swocv both come back 0 here (verified on-device).  Without
+	 * a real zero-current OCV the code used to fall straight to the live
+	 * BATADC voltage -- but on this 2S pack that is the *loaded* terminal
+	 * voltage: at boot the platform draws 1.9-3.8 A, dropping BATADC to
+	 * ~3652 mV even at a true ~60% SoC, so OCV_to_SOC_c() seeded ~4-7%.
+	 *
+	 * Fix (2026-09-24): consult the PMIC power-on zero-current OCV latch
+	 * (PWRON_PCHR, GAUGE_PROP_BOOT_ZCV) before touching the loaded BATADC.
+	 * Verified on-device: the latch reads 3938 mV (rdy=1, stable) -> ~58%
+	 * on the 25C profile, matching the real ~60%.  Fall back in order:
+	 *   1. PTIM vbat                        (0 on this board);
+	 *   2. LK atag swocv gm->ptim_lk_v      (0 on this board);
+	 *   3. GAUGE_PROP_BOOT_ZCV -- PMIC zero-current power-on latch, the
+	 *      correct load-independent seed (unit 0.1 mV, same as the table);
+	 *   4. IR-compensated BATADC (Vbat - I*R_batt) as a best-effort net if
+	 *      the latch is unreliable (rdy=0 / forced to sw_ocv=0 in kernel
+	 *      mode).  When there is no load this degenerates to the old raw
+	 *      BATADC seed, so it also serves as the final fallback.
 	 */
+	if (init_swocv <= 0 && gm->ptim_lk_v > 0) {
+		init_swocv = gm->ptim_lk_v;
+		bm_err(gm, "[%s] op6893: PTIM unavailable, using LK swocv %d\n",
+			__func__, init_swocv);
+	}
+
 	if (init_swocv <= 0) {
-		if (gm->ptim_lk_v > 0) {
-			init_swocv = gm->ptim_lk_v;
-			bm_err(gm, "[%s] op6893: PTIM unavailable, using LK swocv %d\n",
+		int boot_zcv = gauge_get_int_property(gm, GAUGE_PROP_BOOT_ZCV);
+
+		if (boot_zcv > FGR_BOOT_ZCV_MIN) {
+			init_swocv = boot_zcv;
+			bm_err(gm, "[%s] op6893: PTIM/LK unavailable, using boot ZCV %d\n",
 				__func__, init_swocv);
-		} else {
-			init_swocv = gauge_get_int_property(gm,
-				GAUGE_PROP_BATTERY_VOLTAGE) * 10;
-			bm_err(gm, "[%s] op6893: PTIM/LK unavailable, using BATADC swocv %d\n",
-				__func__, init_swocv);
+		}
+	}
+
+	if (init_swocv <= 0) {
+		int vbat = gauge_get_int_property(gm,
+			GAUGE_PROP_BATTERY_VOLTAGE) * 10;
+		int ibat = gauge_get_int_property(gm,
+			GAUGE_PROP_BATTERY_CURRENT);
+		/*
+		 * ibat: 0.1 mA, discharge negative.  comp(0.1mV) =
+		 * -ibat(0.1mA) * R(mOhm) / 1000 -- pushes the loaded voltage
+		 * back up towards OCV during discharge.
+		 */
+		int comp = -ibat * FGR_BOOT_RBAT_MOHM / 1000;
+
+		if (vbat > 0) {
+			init_swocv = vbat + comp;
+			bm_err(gm, "[%s] op6893: boot ZCV bad, IR-comp BATADC vbat=%d ibat=%d comp=%d swocv=%d\n",
+				__func__, vbat, ibat, comp, init_swocv);
 		}
 	}
 
