@@ -71,7 +71,7 @@
 /******************************************************************************
  * Proifling
  ******************************************************************************/
-#define PROFILE 1
+#define PROFILE 0
 #if PROFILE
 static struct timeval tv1, tv2;
 static DEFINE_SPINLOCK(kdsensor_drv_lock);

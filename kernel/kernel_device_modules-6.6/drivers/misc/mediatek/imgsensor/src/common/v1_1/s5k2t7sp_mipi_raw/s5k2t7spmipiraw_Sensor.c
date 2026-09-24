@@ -48,9 +48,9 @@
 #define MULTI_WRITE 1
 
 #if MULTI_WRITE
-static const int I2C_BUFFER_LEN = 1020; /*trans# max is 255, each 4 bytes*/
+#define I2C_BUFFER_LEN 1020 /*trans# max is 255, each 4 bytes*/
 #else
-static const int I2C_BUFFER_LEN = 4;
+#define I2C_BUFFER_LEN 4
 #endif
 
 /*
