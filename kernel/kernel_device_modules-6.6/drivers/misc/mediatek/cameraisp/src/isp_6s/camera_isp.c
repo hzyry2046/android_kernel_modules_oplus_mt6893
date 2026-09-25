@@ -316,6 +316,31 @@ static const struct of_device_id isp_of_ids[] = {
 	{
 		.compatible = "mediatek,camsv7_legacy",
 	},
+	/*
+	 * op6893 6.6 bring-up: the byte-frozen 4.19 DTB names these camera
+	 * nodes without the "_legacy" suffix, so bind those old compatibles
+	 * too.  The clocks camera_isp would need are already wired onto
+	 * camsys@1a000000, and EP_NO_CLKMGR is defined here so this driver
+	 * fetches none itself -- recognizing the names is enough to probe.
+	 */
+	{ .compatible = "mediatek,camsys", },
+	{ .compatible = "mediatek,camsys_a", },
+	{ .compatible = "mediatek,camsys_b", },
+	{ .compatible = "mediatek,camsys_c", },
+	{ .compatible = "mediatek,cam1", },
+	{ .compatible = "mediatek,cam2", },
+	{ .compatible = "mediatek,cam3", },
+	{ .compatible = "mediatek,cam1_inner", },
+	{ .compatible = "mediatek,cam2_inner", },
+	{ .compatible = "mediatek,cam3_inner", },
+	{ .compatible = "mediatek,camsv1", },
+	{ .compatible = "mediatek,camsv2", },
+	{ .compatible = "mediatek,camsv3", },
+	{ .compatible = "mediatek,camsv4", },
+	{ .compatible = "mediatek,camsv5", },
+	{ .compatible = "mediatek,camsv6", },
+	{ .compatible = "mediatek,camsv7", },
+	{ .compatible = "mediatek,camsv8", },
 	{} };
 
 #endif
@@ -6476,6 +6501,48 @@ static unsigned int NodeName_to_DevIdx(const char *name)
 	else if (strncmp(name, "camsv6_legacy", strlen("camsv6_legacy")) == 0)
 		return ISP_CAMSV6_IDX;
 	else if (strncmp(name, "camsv7_legacy", strlen("camsv7_legacy")) == 0)
+		return ISP_CAMSV7_IDX;
+	/*
+	 * op6893 6.6 bring-up: same nodes under the old 4.19 names (no
+	 * "_legacy" suffix).  Match the more specific names before their
+	 * prefixes (camsys_a before camsys, cam1_inner before cam1).  The
+	 * live camsv1..8 map to camsv0..7 (off by one vs the 6.6 dtsi).
+	 */
+	else if (strncmp(name, "camsys_a", strlen("camsys_a")) == 0)
+		return ISP_CAMSYS_RAWA_CONFIG_IDX;
+	else if (strncmp(name, "camsys_b", strlen("camsys_b")) == 0)
+		return ISP_CAMSYS_RAWB_CONFIG_IDX;
+	else if (strncmp(name, "camsys_c", strlen("camsys_c")) == 0)
+		return ISP_CAMSYS_RAWC_CONFIG_IDX;
+	else if (strncmp(name, "camsys", strlen("camsys")) == 0)
+		return ISP_CAMSYS_CONFIG_IDX;
+	else if (strncmp(name, "cam1_inner", strlen("cam1_inner")) == 0)
+		return ISP_CAM_A_INNER_IDX;
+	else if (strncmp(name, "cam2_inner", strlen("cam2_inner")) == 0)
+		return ISP_CAM_B_INNER_IDX;
+	else if (strncmp(name, "cam3_inner", strlen("cam3_inner")) == 0)
+		return ISP_CAM_C_INNER_IDX;
+	else if (strncmp(name, "cam1", strlen("cam1")) == 0)
+		return ISP_CAM_A_IDX;
+	else if (strncmp(name, "cam2", strlen("cam2")) == 0)
+		return ISP_CAM_B_IDX;
+	else if (strncmp(name, "cam3", strlen("cam3")) == 0)
+		return ISP_CAM_C_IDX;
+	else if (strncmp(name, "camsv1", strlen("camsv1")) == 0)
+		return ISP_CAMSV0_IDX;
+	else if (strncmp(name, "camsv2", strlen("camsv2")) == 0)
+		return ISP_CAMSV1_IDX;
+	else if (strncmp(name, "camsv3", strlen("camsv3")) == 0)
+		return ISP_CAMSV2_IDX;
+	else if (strncmp(name, "camsv4", strlen("camsv4")) == 0)
+		return ISP_CAMSV3_IDX;
+	else if (strncmp(name, "camsv5", strlen("camsv5")) == 0)
+		return ISP_CAMSV4_IDX;
+	else if (strncmp(name, "camsv6", strlen("camsv6")) == 0)
+		return ISP_CAMSV5_IDX;
+	else if (strncmp(name, "camsv7", strlen("camsv7")) == 0)
+		return ISP_CAMSV6_IDX;
+	else if (strncmp(name, "camsv8", strlen("camsv8")) == 0)
 		return ISP_CAMSV7_IDX;
 	else
 		return ISP_DEV_NODE_NUM;
