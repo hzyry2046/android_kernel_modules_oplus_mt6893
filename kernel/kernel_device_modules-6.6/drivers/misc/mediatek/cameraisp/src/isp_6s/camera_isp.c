@@ -234,17 +234,24 @@ const struct ISR_TABLE IRQ_CB_TBL[ISP_IRQ_TYPE_AMOUNT] = {
 	/* device_name definded in IRQ_CB_TBL must be match with the node name
 	 * defined in dts.
 	 */
-	{ISP_Irq_CAM_A, 0, "cam1_legacy"},
-	{ISP_Irq_CAM_B, 0, "cam2_legacy"},
-	{ISP_Irq_CAM_C, 0, "cam3_legacy"},
-	{ISP_Irq_CAMSV_0, 0, "camsv0_legacy"},
-	{ISP_Irq_CAMSV_1, 0, "camsv1_legacy"},
-	{ISP_Irq_CAMSV_2, 0, "camsv2_legacy"},
-	{ISP_Irq_CAMSV_3, 0, "camsv3_legacy"},
-	{ISP_Irq_CAMSV_4, 0, "camsv4_legacy"},
-	{ISP_Irq_CAMSV_5, 0, "camsv5_legacy"},
-	{ISP_Irq_CAMSV_6, 0, "camsv6_legacy"},
-	{ISP_Irq_CAMSV_7, 0, "camsv7_legacy"}
+	/*
+	 * op6893 6.6 bring-up: the byte-frozen 4.19 DTB names these nodes
+	 * without the "_legacy" suffix, and its camsvN is off-by-one vs the
+	 * 6.6 dtsi (live camsv1@1a090000 == hw CAMSV0, IRQ 323).  This strcmp
+	 * is exact, so the table must carry the live names or no ISR is hooked
+	 * and frame-done interrupts never reach the driver.
+	 */
+	{ISP_Irq_CAM_A, 0, "cam1"},
+	{ISP_Irq_CAM_B, 0, "cam2"},
+	{ISP_Irq_CAM_C, 0, "cam3"},
+	{ISP_Irq_CAMSV_0, 0, "camsv1"},
+	{ISP_Irq_CAMSV_1, 0, "camsv2"},
+	{ISP_Irq_CAMSV_2, 0, "camsv3"},
+	{ISP_Irq_CAMSV_3, 0, "camsv4"},
+	{ISP_Irq_CAMSV_4, 0, "camsv5"},
+	{ISP_Irq_CAMSV_5, 0, "camsv6"},
+	{ISP_Irq_CAMSV_6, 0, "camsv7"},
+	{ISP_Irq_CAMSV_7, 0, "camsv8"}
 #endif
 };
 
