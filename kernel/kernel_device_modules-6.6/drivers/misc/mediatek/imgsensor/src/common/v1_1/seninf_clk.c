@@ -25,14 +25,27 @@ int seninf_dfs_init(struct seninf_dfs_ctx *ctx, struct device *dev)
 
 	ret = dev_pm_opp_of_add_table(dev);
 	if (ret < 0) {
-		dev_info(dev, "fail to init opp table: %d\n", ret);
-		return ret;
+		/*
+		 * op6893 6.6 bring-up: the 4.19 seninf_top node has no
+		 * operating-points-v2 / dvfsrc-vcore-supply, so there is no
+		 * seninf DVFS.  Don't fail probe over it -- run seninf at its
+		 * default clock and mark DFS disabled (ctx->reg == NULL), which
+		 * seninf_dfs_ctrl() below treats as a no-op.
+		 */
+		dev_info(dev, "no opp table (%d), running seninf without DVFS\n",
+			ret);
+		ctx->reg = NULL;
+		ctx->cnt = 0;
+		return 0;
 	}
 
 	ctx->reg = devm_regulator_get_optional(dev, "dvfsrc-vcore");
 	if (IS_ERR(ctx->reg)) {
-		dev_info(dev, "can't get dvfsrc-vcore\n");
-		return PTR_ERR(ctx->reg);
+		dev_info(dev, "can't get dvfsrc-vcore, running seninf without DVFS\n");
+		dev_pm_opp_of_remove_table(dev);
+		ctx->reg = NULL;
+		ctx->cnt = 0;
+		return 0;
 	}
 
 	ctx->cnt = dev_pm_opp_get_opp_count(dev);
@@ -60,6 +73,9 @@ int seninf_dfs_init(struct seninf_dfs_ctx *ctx, struct device *dev)
 
 void seninf_dfs_exit(struct seninf_dfs_ctx *ctx)
 {
+	/* op6893 6.6 bring-up: nothing added when DVFS is disabled */
+	if (!ctx->reg)
+		return;
 	dev_pm_opp_of_remove_table(ctx->dev);
 }
 
@@ -69,6 +85,14 @@ int seninf_dfs_ctrl(struct seninf_dfs_ctx *ctx,
 	int i4RetValue = 0;
 
 	/*pr_info("%s\n", __func__);*/
+
+	/*
+	 * op6893 6.6 bring-up: DVFS is disabled when the DTB carries no
+	 * seninf opp table / dvfsrc-vcore (ctx->reg == NULL); skip all
+	 * voltage scaling and let seninf run at its default clock.
+	 */
+	if (!ctx->reg)
+		return 0;
 
 	switch (option) {
 	case DFS_CTRL_ENABLE:

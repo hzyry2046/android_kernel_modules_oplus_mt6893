@@ -69,6 +69,15 @@
 				platform_id = 0x6739;				\
 		}								\
 	}									\
+	/*								\
+	 * op6893 6.6 bring-up: seninf_top in the 4.19 DTB has no	\
+	 * "mediatek,platform", so seninf would run with platform id 0	\
+	 * and mis-program the CSI receiver.  Fall back to mt6893 off	\
+	 * the machine compatible (same shim as cam_common.h).		\
+	 */								\
+	if (platform_id == 0 &&						\
+		of_machine_is_compatible("mediatek,MT6893"))		\
+		platform_id = 0x6893;					\
 	platform_id;								\
 })
 
@@ -94,6 +103,16 @@
 				seninf_max_num_id = 6;				\
 		}								\
 	}									\
+	/*								\
+	 * op6893 6.6 bring-up: the 4.19 seninf_top node has no		\
+	 * "mediatek,seninf_max_num", so this returns 0 and the seninf	\
+	 * driver skips all 8 seninf instances.  Default to the mt6893	\
+	 * count when the property is absent, mirroring the		\
+	 * GET_PLATFORM_ID shim in cam_common.h.			\
+	 */								\
+	if (seninf_max_num_id == 0 &&					\
+		of_machine_is_compatible("mediatek,MT6893"))		\
+		seninf_max_num_id = 8;					\
 	seninf_max_num_id;							\
 })
 
