@@ -26,13 +26,22 @@ enum IMGSENSOR_HW_PIN {
 	IMGSENSOR_HW_PIN_AVDD1,
 	#endif
 	#endif
-	IMGSENSOR_HW_PIN_AFVDD,
+	/*
+	 * op6893 6.6 bring-up: keep AVDD/DVDD/DOVDD contiguous so the
+	 * regulator_control[] (VCAMA+pin-AVDD) and gpio_pinctrl_list_cam[]
+	 * ((pin-PDN)<<1) index maps still line up with their name tables.
+	 * 6.6 had inserted AFVDD here (right after AVDD), shifting DVDD/DOVDD
+	 * by one so DOVDD resolved to vcamaf and DVDD to vcamio -> sensors
+	 * lost their IO/core rails and never ACKed on i2c.  AFVDD is used
+	 * only via `pin == IMGSENSOR_HW_PIN_AFVDD`, so its slot can move.
+	 */
 	IMGSENSOR_HW_PIN_DVDD,
 	IMGSENSOR_HW_PIN_DOVDD,
 //#ifdef CONFIG_REGULATOR_RT5133
 //	IMGSENSOR_HW_PIN_AVDD1,
 //#endif
 	IMGSENSOR_HW_PIN_AVDD1_GPIO,
+	IMGSENSOR_HW_PIN_AFVDD,
 	#ifdef OPLUS_FEATURE_CAMERA_COMMON
 	IMGSENSOR_HW_PIN_AVDD_1,
 	IMGSENSOR_HW_PIN_DVDD_1,
