@@ -196,6 +196,16 @@ static void imgsensor_mutex_unlock(struct IMGSENSOR_SENSOR_INST *psensor_inst)
 		imgsensor_i2c_set_device(NULL);
 		mutex_unlock(&psensor_inst->sensor_mutex);
 #else
+		/*
+		 * op6893 6.6 bring-up: the lock path above stored this thread's
+		 * i2c cfg via imgsensor_i2c_set_device(&i2c_cfg); clear it here
+		 * too.  Without this, the per-tid pgi2c_cfg_legacy[] slot from
+		 * the first sensor (socket 0, i2c2) is never released, so during
+		 * the sequential SET_DRIVER search every later socket's read
+		 * gets that stale i2c2 cfg back from imgsensor_i2c_get_device()
+		 * -- the i2c4 sensors (imx471/hi846) probed on i2c2 and missed.
+		 */
+		imgsensor_i2c_set_device(NULL);
 		mutex_unlock(&gimgsensor_mutex);
 #endif
 		}
