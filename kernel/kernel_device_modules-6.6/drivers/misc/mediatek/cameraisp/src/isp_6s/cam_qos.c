@@ -933,7 +933,18 @@ int ISP_SetPMQOS(
 		LOG_DBG("1:DFS Clk_0:%d\n", pvalue[0]);
 		return 1;
 #else
-		unsigned int num_available, i = 0;
+		unsigned int i = 0;
+		/*
+		 * op6893 6.6 bring-up: dev_pm_opp_get_opp_count() returns a
+		 * negative errno when mmdvfsDev has no OPP table (the 4.19 DTB
+		 * carries no camera MM-DVFS opp).  This used to be stored in an
+		 * unsigned int, so the negative count wrapped to ~4e9, passed the
+		 * "> 0" guard and drove kcalloc()/the fill loop to a huge size ->
+		 * __alloc_pages fault + OOB write -> panic the moment the HAL set
+		 * PM QoS at stream start.  Keep it signed and clamp; no MM-DVFS
+		 * table just means run at the default clock (like seninf DFS).
+		 */
+		int num_available;
 		u32 *speeds = NULL;
 		struct dev_pm_opp *opp;
 		unsigned long freq;
@@ -944,6 +955,8 @@ int ISP_SetPMQOS(
 
 		/* number of available opp */
 		num_available = dev_pm_opp_get_opp_count(mmdvfsDev);
+		if (num_available < 0)
+			num_available = 0;
 		if (num_available > 0) {
 			speeds = kcalloc(num_available, sizeof(u32),
 				GFP_KERNEL);
@@ -1150,13 +1163,20 @@ int SV_SetPMQOS(
 		LOG_DBG("1:DFS Clk_0:%d\n", pvalue[0]);
 		return 1;
 #else
-		unsigned int num_available, i = 0;
+		unsigned int i = 0;
+		/* op6893 6.6 bring-up: keep the opp count signed -- see the
+		 * matching note in ISP_SetPMQOS.  A negative count (no MM-DVFS
+		 * opp table) must not wrap to a huge kcalloc.
+		 */
+		int num_available;
 		u32 *speeds = NULL;
 		struct dev_pm_opp *opp;
 		unsigned long freq;
 
 		/* number of available opp */
 		num_available = dev_pm_opp_get_opp_count(mmdvfsDev);
+		if (num_available < 0)
+			num_available = 0;
 		if (num_available > 0) {
 			speeds = kcalloc(num_available, sizeof(u32), GFP_KERNEL);
 
