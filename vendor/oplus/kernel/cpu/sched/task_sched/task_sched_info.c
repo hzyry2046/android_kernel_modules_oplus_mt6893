@@ -1316,6 +1316,7 @@ void cpufreq_limit_notifier_init(void)
 
 #define SCHED_INFO_DIR "task_info"
 #define SCHED_INFO_PROC_NODE "task_sched_info"
+extern struct proc_dir_entry *oplus_task_info_dir;
 #define SCHED_INFO_PROC_EXIST_NODE "task_info/task_sched_info"
 static struct proc_dir_entry *task_info;
 static struct proc_dir_entry *sched_info;
@@ -1341,12 +1342,12 @@ int sched_info_init(void)
 
 	sched_action_init();
 
-	task_info = proc_mkdir(SCHED_INFO_DIR, NULL);
-
-	if (!task_info)
-		sched_info = proc_mkdir(SCHED_INFO_PROC_EXIST_NODE, NULL);
-	else
-		sched_info = proc_mkdir(SCHED_INFO_PROC_NODE, task_info);
+	/*
+	 * op6893 6.6 bring-up: /proc/task_info belongs to sched_assist (see
+	 * oplus_task_info_dir there); borrow it rather than create it.
+	 */
+	if (oplus_task_info_dir)
+		sched_info = proc_mkdir(SCHED_INFO_PROC_NODE, oplus_task_info_dir);
 
 	if (!sched_info) {
 		sched_err("create task_sched_info fail\n");

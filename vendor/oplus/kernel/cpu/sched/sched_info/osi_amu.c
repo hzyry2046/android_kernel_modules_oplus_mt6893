@@ -334,14 +334,19 @@ static void dup_or_update_uid_struct(const struct task_struct *task, bool is_com
 	struct uid_struct *new_uid_struct;
 	struct oplus_task_struct *ots;
 	struct amu_uid_entry *amu_uid_entry;
-	struct user_namespace *user_ns = current_user_ns();
 
 	ots = get_oplus_task_struct((struct task_struct *)task);
 	if (!ots)
 		return;
 
 	rcu_read_lock();
-	uid = from_kuid_munged(user_ns, task_uid(task));
+	/*
+	 * op6893 6.6 bring-up: from_kuid_munged() is not in the GKI KMI list, so
+	 * an unsigned module that calls it is refused at insmod ("Protected
+	 * symbol").  Android runs everything in init_user_ns, where the munged
+	 * value is the raw kuid anyway.
+	 */
+	uid = __kuid_val(task_uid(task));
 	rcu_read_unlock();
 
 	spin_lock(&amu_uid_lock);

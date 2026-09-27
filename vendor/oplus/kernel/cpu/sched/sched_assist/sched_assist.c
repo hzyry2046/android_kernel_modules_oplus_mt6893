@@ -1,3 +1,4 @@
+#include <linux/proc_fs.h>
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2020 Oplus. All rights reserved.
@@ -175,9 +176,22 @@ int __nocfi detect_symbol(void)
 }
 
 
+/*
+ * op6893 6.6 bring-up: /proc/task_info is shared by task_sched and
+ * task_cpustats.  Each used to proc_mkdir() it itself, so whichever loaded
+ * second WARNed in proc_register() ("already registered"), and asking for the
+ * nested path first instead WARNs in __xlate_proc_name() when the parent is
+ * missing -- there is no quiet way to probe for a proc dir.  Both depend on
+ * sched_assist, so the directory is created here, once, and borrowed by them.
+ */
+struct proc_dir_entry *oplus_task_info_dir;
+EXPORT_SYMBOL_GPL(oplus_task_info_dir);
+
 static int __init oplus_sched_assist_init(void)
 {
 	int ret;
+
+	oplus_task_info_dir = proc_mkdir("task_info", NULL);
 
 	/* compile time checks for vendor data size */
 	OPLUS_OEM_DATA_SIZE_TEST(struct oplus_rq, struct rq);

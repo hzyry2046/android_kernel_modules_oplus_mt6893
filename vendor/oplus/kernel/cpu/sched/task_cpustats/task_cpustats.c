@@ -266,6 +266,7 @@ static const struct proc_ops sgefreq_proc_fops = {
 
 #define TASK_CPUSTATS_FILE "task_info"
 #define TASK_CPUSTATS_PROC_NODE "task_cpustats"
+extern struct proc_dir_entry *oplus_task_info_dir;
 #define TASK_CPUSTATS_PROC_EXIST_NODE "task_info/task_cpustats"
 static struct proc_dir_entry *task_info;
 static struct proc_dir_entry *task_cpustats;
@@ -277,12 +278,12 @@ static int proc_task_cpustats_init(void)
 	task_info = NULL;
 	task_cpustats = NULL;
 
-	task_info = proc_mkdir(TASK_CPUSTATS_FILE, NULL);
-
-	if (!task_info)
-		task_cpustats = proc_mkdir(TASK_CPUSTATS_PROC_EXIST_NODE, NULL);
-	else
-		task_cpustats = proc_mkdir(TASK_CPUSTATS_PROC_NODE, task_info);
+	/*
+	 * op6893 6.6 bring-up: /proc/task_info belongs to sched_assist (see
+	 * oplus_task_info_dir there); borrow it rather than create it.
+	 */
+	if (oplus_task_info_dir)
+		task_cpustats = proc_mkdir(TASK_CPUSTATS_PROC_NODE, oplus_task_info_dir);
 
 	if (!task_cpustats) {
 		task_err("create proc/task_info/task_cpustats failed\n");
