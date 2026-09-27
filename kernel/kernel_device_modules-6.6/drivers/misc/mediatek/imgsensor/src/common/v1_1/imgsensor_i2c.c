@@ -430,6 +430,8 @@ enum IMGSENSOR_RETURN imgsensor_i2c_read(
 	return ret;
 }
 
+#define IMGSENSOR_I2C_WRITE_RETRY 3
+
 enum IMGSENSOR_RETURN imgsensor_i2c_write(
 		struct IMGSENSOR_I2C_CFG *pi2c_cfg,
 		u8 *pwrite_data,
@@ -445,6 +447,7 @@ enum IMGSENSOR_RETURN imgsensor_i2c_write(
 	u8                 *pend  = pwrite_data + write_length;
 	int i   = 0;
 	int i2c_ret = 0;
+	int retry;
 
 	if (pinst->pi2c_client == NULL) {
 		pr_info("NOTICE: slave_id %d pi2c_client is NULL!\n", id);
@@ -464,20 +467,35 @@ enum IMGSENSOR_RETURN imgsensor_i2c_write(
 		pdata += write_per_cycle;
 	}
 
+	/*
+	 * op6893 6.6 bring-up: on 6.6 i2c-mt65xx a long multi-message DMA
+	 * burst (e.g. the 72-register first chunk of IMX471 sensor_init) now
+	 * and then times out with nothing on the bus.  The chunk was silently
+	 * dropped, leaving EXCK/PLL unprogrammed: preview still came up but the
+	 * video mode streamed garbage and P1 stalled.  Register writes are
+	 * idempotent, so resend the whole transaction on -ETIMEDOUT (only; a
+	 * NACK means no device and must stay fast for sensor probing).
+	 */
+	for (retry = 0; retry < IMGSENSOR_I2C_WRITE_RETRY; retry++) {
 #ifdef OPLUS_FEATURE_CAMERA_COMMON
-	dynamic_adjust_i2c_speed(
-			pi2c_cfg->msg,
-			((speed > 0) && (speed <= 1000))
-				? speed * 1000 : IMGSENSOR_I2C_SPEED * 1000);
+		dynamic_adjust_i2c_speed(
+				pi2c_cfg->msg,
+				((speed > 0) && (speed <= 1000))
+					? speed * 1000 : IMGSENSOR_I2C_SPEED * 1000);
 #endif
-	i2c_ret = mtk_i2c_transfer(
-			pinst->pi2c_client->adapter,
-			pi2c_cfg->msg,
-			i,
-			(pi2c_cfg->pinst->status.filter_msg)
-				? I2C_A_FILTER_MSG : 0,
-			((speed > 0) && (speed <= 1000))
-				? speed * 1000 : IMGSENSOR_I2C_SPEED * 1000);
+		i2c_ret = mtk_i2c_transfer(
+				pinst->pi2c_client->adapter,
+				pi2c_cfg->msg,
+				i,
+				(pi2c_cfg->pinst->status.filter_msg)
+					? I2C_A_FILTER_MSG : 0,
+				((speed > 0) && (speed <= 1000))
+					? speed * 1000 : IMGSENSOR_I2C_SPEED * 1000);
+		if (i2c_ret != -ETIMEDOUT)
+			break;
+		pr_info("NOTICE: I2C id %d write timeout, retry %d (0x%x)\n",
+			id, retry + 1, *pwrite_data);
+	}
 	if (i2c_ret != i) {
 		static DEFINE_RATELIMIT_STATE(ratelimit, 1 * HZ, 30);
 
