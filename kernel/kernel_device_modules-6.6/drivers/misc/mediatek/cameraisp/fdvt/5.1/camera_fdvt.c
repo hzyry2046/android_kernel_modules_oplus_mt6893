@@ -152,6 +152,23 @@ static unsigned long __read_mostly tracing_mark_write_addr;
 /* CCF */
 #if !IS_ENABLED(CONFIG_MTK_LEGACY) && IS_ENABLED(CONFIG_COMMON_CLK) /*CCF*/
 #include <linux/clk.h>
+#include <linux/iommu.h>
+
+/*
+ * op6893 6.6 bring-up: the secure CMDQ (cmdq-sec) and secure heap need the
+ * TEE, which is not up on this port.  Stub them locally so the module loads;
+ * only secure-FD requests reach these, and they fail cleanly instead.
+ */
+#ifdef FDVT_NO_SEC_CMDQ
+#define cmdq_sec_pkt_set_data(pkt, ...)		((void)(pkt), -ENODEV)
+#define cmdq_sec_pkt_set_payload(pkt, ...)	((void)(pkt), -ENODEV)
+#define cmdq_sec_pkt_write_reg(pkt, ...)	((void)(pkt), -ENODEV)
+#define cmdq_sec_pkt_set_mtee(pkt, en)		do { (void)(pkt); } while (0)
+#define cmdq_sec_pkt_set_secid(pkt, id)		do { (void)(pkt); } while (0)
+#define cmdq_sec_mbox_enable(chan)		do { (void)(chan); } while (0)
+#define cmdq_sec_mbox_disable(chan)		do { (void)(chan); } while (0)
+#define dmabuf_to_secure_handle(buf)		((void)(buf), 0ULL)
+#endif
 struct FDVT_CLK_STRUCT {
 #define SMI_CLK
 #ifndef SMI_CLK
@@ -1033,6 +1050,35 @@ struct dma_buf *aie_imem_sec_alloc(u32 size, bool IsSecure)
 	return my_dma_buf;
 }
 
+/*
+ * op6893 6.6 bring-up: the frozen 4.19 DTB gives the fdvt node no `iommus`,
+ * so dma_buf_attach(fdvt_devs->dev) would yield a *physical* address.  The MM
+ * M4U page table is global on this SoC, so borrow a `mediatek,mt-pseudo_m4u-port`
+ * device that mtk_ion_compat has bound to an IOMMU domain (same as camera_dip).
+ */
+static struct device *fdvt_ion_dev(void)
+{
+	static struct device *cached;
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	if (cached)
+		return cached;
+	if (iommu_get_domain_for_dev(fdvt_devs->dev))
+		return fdvt_devs->dev;
+
+	for_each_compatible_node(np, NULL, "mediatek,mt-pseudo_m4u-port") {
+		pdev = of_find_device_by_node(np);
+		if (pdev && iommu_get_domain_for_dev(&pdev->dev)) {
+			cached = &pdev->dev;
+			of_node_put(np);
+			return cached;
+		}
+	}
+	log_err("no mt-pseudo_m4u-port dev with iommu domain\n");
+	return fdvt_devs->dev;
+}
+
 unsigned long long fdvt_get_sec_iova(struct dma_buf *my_dma_buf,
 				struct imem_buf_info *bufinfo, int type)
 {
@@ -1040,10 +1086,10 @@ unsigned long long fdvt_get_sec_iova(struct dma_buf *my_dma_buf,
 	unsigned long long iova = 0;
 	struct sg_table *sgt;
 
-	if (type == special_memory)
+	if (type == special_memory && nr_fdvt_devs > 1)
 		attach = dma_buf_attach(my_dma_buf, fdvt_devs[1].dev);
 	else
-		attach = dma_buf_attach(my_dma_buf, fdvt_devs->dev);
+		attach = dma_buf_attach(my_dma_buf, fdvt_ion_dev());
 
 	if (IS_ERR(attach)) {
 		log_err("attach fail, return\n");
@@ -1651,7 +1697,7 @@ static bool mmu_get_dma_buffer(struct tee_mmu *mmu, int va)
 	}
 
 	mmu->dma_buf = buf;
-	mmu->attach = dma_buf_attach(mmu->dma_buf, fdvt_devs->dev);
+	mmu->attach = dma_buf_attach(mmu->dma_buf, fdvt_ion_dev());
 
 	if (IS_ERR(mmu->attach))
 		goto err_attach;
@@ -4401,6 +4447,9 @@ static int fdvt_add_device_link(struct platform_device *pDev)
 	struct platform_device *larb_pdev;
 
 	larb_node = of_parse_phandle(pDev->dev.of_node, "mediatek,larb", 0);
+	if (!larb_node)
+		larb_node = of_find_compatible_node(NULL, NULL,
+						    "mediatek,smi_larb20");
 	if (!larb_node) {
 		log_err("%s: failed to get larb from\n",
 			pDev->dev.of_node->name);
@@ -4483,6 +4532,9 @@ static signed int FDVT_probe(struct platform_device *pDev)
 
 	/*temperate: power for larb20*/
 	node = of_parse_phandle(FDVT_dev->dev->of_node, "mediatek,larb", 0);
+	/* op6893: 4.19 DTB has no mediatek,larb; FD sits behind IPE larb20 */
+	if (!node)
+		node = of_find_compatible_node(NULL, NULL, "mediatek,smi_larb20");
 	if (!node && nr_fdvt_devs == 1)
 		return -EINVAL;
 	pdev = of_find_device_by_node(node);
@@ -4518,8 +4570,10 @@ static signed int FDVT_probe(struct platform_device *pDev)
 		}
 
 		for (i = 0; i < FDVT_IRQ_TYPE_AMOUNT; i++) {
+			/* op6893: the 4.19 DTB names the node "fdvt", not "aie" */
 			if (strcmp(pDev->dev.of_node->name,
-				   FDVT_IRQ_CB_TBL[i].device_name) == 0) {
+				   FDVT_IRQ_CB_TBL[i].device_name) == 0 ||
+			    strcmp(pDev->dev.of_node->name, "fdvt") == 0) {
 				ret = request_irq(FDVT_dev->irq,
 						  (irq_handler_t)
 						  FDVT_IRQ_CB_TBL[i].isr_fp,
@@ -4623,12 +4677,16 @@ static signed int FDVT_probe(struct platform_device *pDev)
 		fdvt_clk.CG_IPESYS_LARB20 =
 			devm_clk_get(&pDev->dev, "FDVT_CLK_IPE_LARB20");
 
+		/* op6893: larb20 is powered via the device link; clock optional */
 		if (IS_ERR(fdvt_clk.CG_IPESYS_LARB20)) {
-			log_err("cannot get CG_IPESYS_LARB20 clock\n");
-			return PTR_ERR(fdvt_clk.CG_IPESYS_LARB20);
+			log_inf("no CG_IPESYS_LARB20 clock, relying on larb link\n");
+			fdvt_clk.CG_IPESYS_LARB20 = NULL;
 		}
 
 		fdvt_clk.CG_IPESYS_FD = devm_clk_get(&pDev->dev, "aie");
+		if (IS_ERR(fdvt_clk.CG_IPESYS_FD))	/* 4.19 DTB name */
+			fdvt_clk.CG_IPESYS_FD =
+				devm_clk_get(&pDev->dev, "FD_CLK_IPE_FD");
 		if (IS_ERR(fdvt_clk.CG_IPESYS_FD)) {
 			log_err("cannot get CG_IPESYS_FD clock\n");
 			return PTR_ERR(fdvt_clk.CG_IPESYS_FD);
@@ -4932,6 +4990,7 @@ static const struct of_device_id FDVT_of_ids[] = {
 /*	{.compatible = "mediatek,ipesyscq",},*/
 	{.compatible = "mediatek,aie-hw2.0",},
 	{.compatible = "mediatek,mtk_iommu_fake_aie",},
+	{.compatible = "mediatek,fdvt",},	/* op6893: 4.19 DTB */
 	{}
 };
 #endif
