@@ -24,8 +24,7 @@ mtk-vcodec-enc-$(CONFIG_DEVICE_MODULES_VIDEO_MEDIATEK_VCODEC) += mtk_vcodec_enc_
 
 mtk-vcodec-common-$(CONFIG_DEVICE_MODULES_VIDEO_MEDIATEK_VCODEC) += mtk_vcodec_intr.o \
 		mtk_vcodec_util.o \
-		mtk_vcodec_fence.o \
-		mtk_vcodec_svp_stub.o
+		mtk_vcodec_fence.o
 
 ifeq ($(CONFIG_VIDEO_MEDIATEK_VCODEC_V1),y)
 	obj-$(CONFIG_DEVICE_MODULES_VIDEO_MEDIATEK_VCODEC) += mtk-vcodec-dec-v1.o \
@@ -73,7 +72,6 @@ ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/mtk-interconnect
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/vcp/rv
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/vcp/include
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/dma-buf/heaps
-ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/ion_compat
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/iommu/arm/arm-smmu-v3
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/sched/eas
 ccflags-y += -I$(DEVICE_MODULES_PATH)/include/soc/mediatek

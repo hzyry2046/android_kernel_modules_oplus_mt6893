@@ -7,7 +7,6 @@
 #ifndef _VCODEC_IPI_MSG_H_
 #define _VCODEC_IPI_MSG_H_
 
-#include <linux/build_bug.h>
 #include <linux/videodev2.h>
 #include <linux/v4l2-controls.h>
 
@@ -27,9 +26,9 @@
 #define AP_IPIMSG_VDEC_ACK_BASE 0xD000
 #define VCU_IPIMSG_VDEC_SEND_ASYNC_BASE 0xE000
 
-#define AP_IPIMSG_VENC_SEND_BASE 0xC000
-#define VCU_IPIMSG_VENC_ACK_BASE 0xD000
-#define VCU_IPIMSG_VENC_SEND_BASE 0xE000
+#define AP_IPIMSG_VENC_SEND_BASE 0x1000
+#define VCU_IPIMSG_VENC_ACK_BASE 0x2000
+#define VCU_IPIMSG_VENC_SEND_BASE 0x3000
 #define AP_IPIMSG_VENC_ACK_BASE 0x4000
 
 enum mtk_venc_hw_id {
@@ -142,9 +141,7 @@ struct mtk_video_fmt {
 	__u32	fourcc;
 	__u32	type;   /* enum mtk_fmt_type */
 	__u32	num_planes;
-	/* op6893: no "reserved" here -- the 4.19 vpud fills these tables with a
-	 * 12-byte stride, so a 16-byte struct here read every entry after [0]
-	 * from the wrong offset. */
+	__u32	reserved;
 };
 
 /**
@@ -155,7 +152,7 @@ struct mtk_codec_framesizes {
 	__u32	fourcc;
 	__u32	profile;
 	__u32	level;
-	/* op6893: no "reserved" here -- the 4.19 vpud fills this struct. */
+	__u32	reserved;
 	struct	v4l2_frmsize_stepwise	stepwise;
 };
 
@@ -197,13 +194,6 @@ struct mtk_video_frame_frameintervals {
 	struct v4l2_frmival_stepwise stepwise;
 };
 
-/*
- * op6893 bring-up: the trailing `reserved' word this tree added is gone -- the
- * 4.19 daemon writes this structure into the shared vsi and its copy is 68
- * bytes (the last word is `full_range').  Everything is sized with
- * sizeof(struct mtk_color_desc) on both sides, so dropping the word keeps the
- * v4l2 control and the wire format consistent.
- */
 struct mtk_color_desc {
 	__u32	color_primaries;
 	__u32	transform_character;
@@ -218,6 +208,7 @@ struct mtk_color_desc {
 	__u32	max_pic_light_level;
 	__u32	hdr_type;
 	__u32	full_range;
+	__u32	reserved;
 };
 
 struct v4l2_vdec_hdr10_info {
@@ -416,12 +407,9 @@ struct mtk_dec_params {
  * @bitdepth: Sequence bitdepth
  * @layout_mode: mediatek frame layout mode
  * @fourcc: frame buffer color format
+ * @field: enum v4l2_field, field type of this sequence
  * E.g. suppose picture size is 176x144,
  *      buffer size will be aligned to 176x160.
- *
- * op6893 bring-up: the trailing `field' is this tree's addition and it is never
- * read -- drop it so the structure is the 4.19 60-byte one that vpud writes
- * into the vsi at offset 6904.
  */
 struct vdec_pic_info {
 	__u32 pic_w;
@@ -432,6 +420,7 @@ struct vdec_pic_info {
 	__u32 bitdepth;
 	__u32 layout_mode;
 	__u32 fourcc;
+	__u32 field;
 };
 
 /**
@@ -445,41 +434,24 @@ struct vdec_pic_info {
  * @vdec_bs_va		: VDEC bitstream buffer struct virtual address
  * @vdec_fb_va		: VDEC frame buffer struct virtual address
  * @fb_num_planes	: frame buffer plane count
- * @index		: frame buffer index
- * @wait_key_frame	: wait for key frame
- * @error_map		: error map
- * @timestamp		: timestamp
- * @queued_frame_buf_count: queued frame buffer count
- *
- * op6893 bring-up: exactly the 4.19 200-byte layout.  This tree had inserted
- * `bs_non_acp_dma' after @bs_fd (pushing fb_dma[8] from 24 to 32 and fb_fd[8]
- * from 88 to 96), dropped @wait_key_frame, put @error_code[] where @wait_key_frame
- * belongs, and moved @timestamp from 184 to 208.  The daemon reads @bs_fd at
- * +16 and @vdec_bs_va at +152, so every one of those shifts is fatal.
- * `error_code' and `bs_non_acp_dma' now live in struct vdec_vsi_priv.
+ * @reserved		: reserved variable for 64bit align
  */
 struct vdec_dec_info {
 	__u32 dpb_sz;
 	__u32 vdec_changed_info;
 	__u64 bs_dma;
 	__u64 bs_fd;
+	__u64 bs_non_acp_dma; // for acp debug
 	__u64 fb_dma[VIDEO_MAX_PLANES];
 	__u64 fb_fd[VIDEO_MAX_PLANES];
 	__u64 vdec_bs_va;
 	__u64 vdec_fb_va;
 	__u32 fb_num_planes;
 	__u32 index;
-	__u32 wait_key_frame;
 	__u32 error_map;
+	__u32 error_code[MTK_VDEC_HW_NUM];
 	__u64 timestamp;
-	__u32 queued_frame_buf_count;
 };
-
-#define VDEC_DEC_INFO_4_19_SIZE	200
-static_assert(sizeof(struct vdec_dec_info) == VDEC_DEC_INFO_4_19_SIZE,
-	      "vdec_dec_info must stay the size the 4.19 vpud writes");
-static_assert(VIDEO_MAX_PLANES == 8,
-	      "the sizes above assume VIDEO_MAX_PLANES == 8");
 
 #define HDR10_PLUS_MAX_SIZE              (128)
 

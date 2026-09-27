@@ -117,10 +117,9 @@ static char *vcodec_param_string = "";
 
 inline unsigned int ipi_id_to_inst_id(int id)
 {
-	/* 4.19 numbering: every channel below IPI_VENC_COMMON is a decoder
-	 * channel (IPI_VDEC_COMMON, then one per codec), the rest are encoder
-	 * channels.  That is exactly how the vendor vpud splits its receivers.
-	 */
+	if (id == IPI_VDEC_RESOURCE)
+		return VCU_RESOURCE;
+
 	if (id < IPI_VENC_COMMON && id >= IPI_VCU_INIT)
 		return VCU_VDEC;
 	else
@@ -145,10 +144,6 @@ inline unsigned int ipi_id_to_inst_id(int id)
 
 /* Default vcu_mtkdev[0] handle vdec, vcu_mtkdev[1] handle mdp */
 static struct mtk_vcu *vcu_mtkdev[MTK_VCU_NR_MAX];
-
-/* op6893 bring-up diagnostic: bounded trace of the AP<->vpud ipi sequence */
-#define VCU_DBG_MAX 400
-static atomic_t vcu_dbg_cnt = ATOMIC_INIT(0);
 
 static struct task_struct *vcud_task;
 
@@ -611,11 +606,6 @@ int vcu_ipi_send(struct platform_device *pdev,
 		return -EPERM;
 	}
 
-	/* op6893 bring-up diagnostic: trace the AP->vpud ipi sequence. */
-	if (atomic_inc_return(&vcu_dbg_cnt) <= VCU_DBG_MAX)
-		pr_info("[VCUDBG] send id=%d msg=0x%X len=%u tgid=%d comm=%s\n",
-			id, *(u32 *)buf, len, current->tgid, current->comm);
-
 	i = ipi_id_to_inst_id(id);
 	timeout = msecs_to_jiffies(IPI_TIMEOUT_MS);
 
@@ -653,9 +643,6 @@ int vcu_ipi_send(struct platform_device *pdev,
 
 	if (vcu_ptr->abort || ret == 0) {
 		dev_info(&pdev->dev, "vcu ipi %d ack time out !%d", id, ret);
-		pr_info("[VCUDBG] TIMEOUT id=%d msg=0x%X abort=%d comm=%s\n",
-			id, *(u32 *)buf, (int)vcu_ptr->abort, current->comm);
-		dump_stack();
 		mutex_lock(&vpud_task_mutex);
 		if (!vcu_ptr->abort && vcud_task) {
 			send_sig(SIGTERM, vcud_task, 0);
@@ -953,10 +940,6 @@ static void vcu_set_gce_cmd(struct cmdq_pkt *pkt,
 		pr_debug("[VCU] %s CMD_READ addr: 0x%llx\n", __func__, addr);
 	break;
 	case CMD_WRITE:
-		/* op6893: diagnostic -- log what goes to VENC+0x00/0x04/0x08 */
-		if ((addr & 0xfff00000) == 0x17000000 && (addr & 0xfff) < 0x10)
-			pr_info("[VCUDBG] VENC+%03llx = 0x%llx (mask 0x%x)\n",
-				addr & 0xfff, data, mask);
 		if (vcu_check_reg_base(vcu, addr, 4) == 0) {
 			cmdq_pkt_write(pkt, vcu->clt_base, addr, data, mask);
 		} else {
@@ -967,21 +950,6 @@ static void vcu_set_gce_cmd(struct cmdq_pkt *pkt,
 			__func__, addr, data, mask);
 	break;
 	case CMD_SEC_WRITE:
-		/*
-		 * op6893 6.6 bring-up: every cmdq_sec_* symbol this file uses is
-		 * exported by cmdq-sec-drv.ko, and the cmdq mailbox Makefile only
-		 * builds that module inside its "ifneq (,$(filter y m,
-		 * $(CONFIG_MTK_GZ_TZ_SYSTEM)))" block -- GenieZone is =y on 4.19
-		 * but off in this 6.6 config, so the module does not exist and
-		 * mtk-vcu.ko could not load at all: nine "Unknown symbol (err
-		 * -2)" lines, no /dev/vcu, and vpud exiting on open() every five
-		 * seconds for the whole session.  MediaTek's own gate for these
-		 * calls is exactly that config, so use it here too; the secure
-		 * (WFD/DRM) encode path is unavailable either way until the
-		 * trusted-memory and GZ stacks are brought up, while ordinary
-		 * decode and encode need none of it.
-		 */
-#if IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
 		if (vcu_check_reg_base(vcu, addr, 4) == 0) {
 			cmdq_sec_pkt_write_reg(pkt,
 				addr,
@@ -996,10 +964,6 @@ static void vcu_set_gce_cmd(struct cmdq_pkt *pkt,
 		}
 		pr_debug("[VCU] %s CMD_SEC_WRITE addr: 0x%llx 0x%llx 0x%x 0x%x\n",
 				__func__, addr, data, dma_offset, dma_size);
-#else
-		pr_info_once("[VCU] %s CMD_SEC_WRITE dropped: no GZ secure CMDQ in this build\n",
-				__func__);
-#endif
 	break;
 	case CMD_POLL_REG:
 		if (vcu_check_reg_base(vcu, addr, 4) == 0) {
@@ -1093,9 +1057,7 @@ static void vcu_set_gce_secure_cmd(struct cmdq_pkt *pkt,
 
 	break;
 	case CMD_SEC_WRITE:
-	/* op6893: see the CMD_SEC_WRITE note in vcu_set_gce_cmd(). */
-#if (!(IS_ENABLED(CONFIG_DEVICE_MODULES_ARM_SMMU_V3))) && \
-	IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
+#if (!(IS_ENABLED(CONFIG_DEVICE_MODULES_ARM_SMMU_V3)))
 		if (vcu_check_reg_base(vcu, addr, 4) == 0) {
 			if (is_disable_map_sec()) {
 				//for secure handle
@@ -1110,9 +1072,6 @@ static void vcu_set_gce_secure_cmd(struct cmdq_pkt *pkt,
 			pr_info("[VCU] %s CMD_SEC_WRITE wrong addr: 0x%llx 0x%llx 0x%x 0x%x\n",
 				__func__, addr, data, dma_offset, dma_size);
 		}
-#elif !IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
-		pr_info_once("[VCU] %s CMD_SEC_WRITE dropped: no GZ secure CMDQ in this build\n",
-			__func__);
 #endif
 		pr_debug("[VCU] %s CMD_SEC_WRITE addr: 0x%llx 0x%llx 0x%x 0x%x\n",
 			__func__, addr, data, dma_offset, dma_size);
@@ -1212,42 +1171,6 @@ static void vcu_set_gce_readstatus_cmd(struct cmdq_pkt *pkt,
 	}
 }
 
-static void vcu_dump_pkt(struct cmdq_pkt *pkt)
-{
-	struct cmdq_pkt_buffer *cbuf;
-	u32 tmp[256];
-	u32 *w;
-	size_t sz;
-	int n, k;
-
-	if (!pkt) {
-		pr_info("[VCUDBG]   pkt is NULL\n");
-		return;
-	}
-	cbuf = list_first_entry_or_null(&pkt->buf,
-		struct cmdq_pkt_buffer, list_entry);
-	if (!cbuf || !cbuf->va_base) {
-		pr_info("[VCUDBG]   pkt=%p buf null\n", pkt);
-		return;
-	}
-	w = (u32 *)cbuf->va_base;
-	sz = min_t(size_t, pkt->cmd_buf_size, sizeof(tmp));
-	n = (int)(sz - (sz % 4)) / 4;
-	if (n <= 0)
-		return;
-	if (copy_from_kernel_nofault(tmp, w, n * 4)) {
-		pr_info("[VCUDBG]   pkt=%p va=%px unreadable\n", pkt, w);
-		return;
-	}
-	pr_info("[VCUDBG]   buf va=%px iova=%pad pa=%pad size=%zu\n",
-		w, &cbuf->iova_base, &cbuf->pa_base, pkt->cmd_buf_size);
-	for (k = 0; k < n; k += 4)
-		pr_info("[VCUDBG]   %04d: %08x %08x %08x %08x\n", k,
-			tmp[k], tmp[k + 1], tmp[k + 2], tmp[k + 3]);
-}
-
-static int vcu_pkt_ok_cnt;
-
 static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 {
 	int i, j;
@@ -1255,34 +1178,10 @@ static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 	struct mtk_vcu *vcu;
 	unsigned int core_id;
 	unsigned int gce_order;
-	struct cmdq_pkt *pkt;
 
 	buff = (struct gce_callback_data *)data.data;
 	i = (buff->cmdq_buff.codec_type == VCU_VDEC) ? VCU_VDEC : VCU_VENC;
 	core_id = buff->cmdq_buff.core_id;
-	gce_order = buff->cmdq_buff.flush_order % GCE_PENDING_CNT;
-
-	pkt = buff->pkt_ptr;
-	if (data.err < 0) {
-		/* op6893: the 4.19 vpud builds the VENC GCE packet that waits on
-		 * CMDQ_EVENT_VENC_CMDQ_FRAME_DONE, and when that event never fires
-		 * the whole encode stalls with no kernel-side symptom.  Dump the
-		 * packet verbatim so the register setup it programmed can be
-		 * checked against the hardware it expects.
-		 */
-		pr_info("[VCUDBG] VENC gce_flush err=%d codec=%u core=%u order=%u gce_idx=%d\n",
-			data.err, buff->cmdq_buff.codec_type, core_id,
-			buff->cmdq_buff.flush_order, vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle));
-		vcu_dump_pkt(pkt);
-	} else if (buff->cmdq_buff.codec_type == VCU_VENC && vcu_pkt_ok_cnt++ < 2) {
-		/* a completed VENC flush: the SEQ_HDR packet must complete like
-		 * this, so print it as the "known good" reference.
-		 */
-		pr_info("[VCUDBG] VENC gce_flush ok codec=%u core=%u order=%u gce_idx=%d\n",
-			buff->cmdq_buff.codec_type, core_id,
-			buff->cmdq_buff.flush_order, vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle));
-		vcu_dump_pkt(pkt);
-	}
 
 	vcu = buff->vcu_ptr;
 	j = vcu_gce_get_inst_id(buff->cmdq_buff.gce_handle);
@@ -1308,11 +1207,8 @@ static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 				buff->cmdq_buff.core_id, &vcu->flags[i]);
 
 			//TODO: ask CMDQ owner add mtee param
-			/* op6893: see the CMD_SEC_WRITE note in vcu_set_gce_cmd(). */
-#if IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
 			if (buff->cmdq_buff.secure != 0)
 				cmdq_sec_mbox_switch_normal(vcu->clt_venc_sec[0]);
-#endif
 
 			vcu->cbf.enc_unlock(vcu->gce_info[j].v4l2_ctx,
 				buff->cmdq_buff.core_id);
@@ -1322,10 +1218,8 @@ static void vcu_gce_flush_callback(struct cmdq_cb_data data)
 				if (vcu->clt_venc[core_id] != NULL)
 					cmdq_mbox_disable(vcu->clt_venc[core_id]->chan);
 			} else {
-#if IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
 				if (vcu->clt_venc_sec[0] != NULL)
 					cmdq_sec_mbox_disable(vcu->clt_venc_sec[0]->chan);
-#endif
 				if (vcu->clt_venc[1] != NULL)
 					cmdq_mbox_disable(vcu->clt_venc[1]->chan);
 			}
@@ -1521,11 +1415,8 @@ static int vcu_gce_cmd_flush(struct mtk_vcu *vcu,
 				if (vcu->clt_venc[core_id] != NULL)
 					cmdq_mbox_enable(vcu->clt_venc[core_id]->chan);
 			} else {
-				/* op6893: see the CMD_SEC_WRITE note in vcu_set_gce_cmd(). */
-#if IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
 				if (vcu->clt_venc_sec[0] != NULL)
 					cmdq_sec_mbox_enable(vcu->clt_venc_sec[0]->chan);
-#endif
 				if (vcu->clt_venc[1] != NULL)
 					cmdq_mbox_enable(vcu->clt_venc[1]->chan);
 			}
@@ -1563,11 +1454,6 @@ static int vcu_gce_cmd_flush(struct mtk_vcu *vcu,
 
 	if (buff.cmdq_buff.codec_type == VCU_VENC) {
 		if (buff.cmdq_buff.secure != 0) {
-			/* op6893: see the CMD_SEC_WRITE note in vcu_set_gce_cmd().
-			 * The dapc/port engine masks go with the calls, or -Werror
-			 * trips over them being unused.
-			 */
-#if IS_ENABLED(CONFIG_MTK_GZ_TZ_SYSTEM)
 			const u64 dapc_engine =
 				(1LL << CMDQ_SEC_VENC_BSDMA) |
 				(1LL << CMDQ_SEC_VENC_CUR_LUMA) |
@@ -1610,10 +1496,6 @@ static int vcu_gce_cmd_flush(struct mtk_vcu *vcu,
 
 			//CMDQ SCENARIO hint WFD
 			cmdq_sec_pkt_set_secid(pkt_ptr, SEC_ID_WFD);
-#else
-			pr_info_once("[VCU] %s secure venc unavailable: no GZ secure CMDQ in this build\n",
-				__func__);
-#endif
 
 			// one normal cmdq thread is for sec encoding
 			//coworking with cmdq secure thread
@@ -2073,11 +1955,6 @@ static int vcu_ipi_handler(struct mtk_vcu *vcu, unsigned long arg)
 	}
 
 	i = ipi_id_to_inst_id(share_buff_data.id);
-
-	if (atomic_inc_return(&vcu_dbg_cnt) <= VCU_DBG_MAX)
-		pr_info("[VCUDBG] recv id=%d msg=0x%X len=%u comm=%s\n",
-			share_buff_data.id, *(u32 *)share_buff_data.share_buf,
-			share_buff_data.len, current->comm);
 
 	if (vcu->abort) {
 		pr_info("[VCU] aborted not handled: %s %d %d: ipi %d\n",
@@ -2971,9 +2848,7 @@ static int mtk_vcu_write(const char *val, const struct kernel_param *kp)
 			}
 			usleep_range(10000, 20000);
 		}
-		/* op6893: log_test_nofuse has no "type" field, it is ioctl ABI
-		 * shared with the 4.19 vpud -- see mtk_vcu_controls.h.
-		 */
+		vcu_ptr->vdec_log_info->type = 0;
 		memcpy(vcu_ptr->vdec_log_info->log_info,
 			val, strnlen(val, LOG_INFO_SIZE - 1) + 1);
 	} else
@@ -2990,8 +2865,9 @@ static int mtk_vcu_write(const char *val, const struct kernel_param *kp)
 		vcu_ptr->enable_vcu_dbg_log = 0;
 	}
 
-	pr_info("[log wakeup VPUD] log_info %p type ks->us vcu_ptr %p val %p: %s %lu\n",
+	pr_info("[log wakeup VPUD] log_info %p type %d vcu_ptr %p val %p: %s %lu\n",
 		(char *)vcu_ptr->vdec_log_info->log_info,
+		vcu_ptr->vdec_log_info->type,
 		vcu_ptr, val, val,
 		(unsigned long)strnlen(val, LOG_INFO_SIZE - 1) + 1);
 
@@ -3042,9 +2918,11 @@ int vcu_get_log(char *val, unsigned int val_len)
 		}
 		usleep_range(10000, 20000);
 	}
-	/* op6893: no "type" field, see mtk_vcu_controls.h. */
-	pr_info("[log wakeup VPUD] log_info %p type us->ks vcu_ptr %p\n",
-		(char *)vcu_ptr->vdec_log_info->log_info, vcu_ptr);
+	vcu_ptr->vdec_log_info->type = 1;
+
+	pr_info("[log wakeup VPUD] log_info %p type %d vcu_ptr %p\n",
+		(char *)vcu_ptr->vdec_log_info->log_info,
+		vcu_ptr->vdec_log_info->type, vcu_ptr);
 
 	atomic_set(&vcu_ptr->vdec_log_got, 1);
 	wake_up(&vcu_ptr->vdec_log_get_wq);
@@ -3385,27 +3263,12 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 		}
 	}
 
-	/*
-	 * op6893: the 4.19 DTB names these with underscores
-	 * (mediatek,dec_gce_th_num / mediatek,enc_gce_th_num); upstream renamed
-	 * them to hyphens without a fallback.  This device ships a 4.19 DTB that
-	 * cannot be regenerated, so accept both.  Without it the encoder path is
-	 * silently misconfigured: the DTB asks for 2 VENC cmdq threads and the
-	 * fallback below creates only 1, which also shifts clt_venc_sec[0]'s
-	 * thread index (4.19: dec+enc = 3, here: 2).
-	 */
 	ret = of_property_read_u32(dev->of_node, "mediatek,dec-gce-th-num",
-					  &vcu->gce_th_num[VCU_VDEC]);
-	if (ret != 0)
-		ret = of_property_read_u32(dev->of_node, "mediatek,dec_gce_th_num",
 					  &vcu->gce_th_num[VCU_VDEC]);
 	if (ret != 0 || vcu->gce_th_num[VCU_VDEC] > GCE_THNUM_MAX)
 		vcu->gce_th_num[VCU_VDEC] = 1;
 
 	ret = of_property_read_u32(dev->of_node, "mediatek,enc-gce-th-num",
-					  &vcu->gce_th_num[VCU_VENC]);
-	if (ret != 0)
-		ret = of_property_read_u32(dev->of_node, "mediatek,enc_gce_th_num",
 					  &vcu->gce_th_num[VCU_VENC]);
 	if (ret != 0 || vcu->gce_th_num[VCU_VENC] > GCE_THNUM_MAX)
 		vcu->gce_th_num[VCU_VENC] = 1;
@@ -3427,14 +3290,6 @@ static int mtk_vcu_probe(struct platform_device *pdev)
 	if (vcu->gce_th_num[VCU_VENC] > 0)
 		vcu->clt_venc_sec[0] =
 			cmdq_mbox_create(dev, vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC]);
-
-	/* op6893: acceptance evidence for the underscore fallback above --
-	 * the DTB asks for dec=1 enc=2, so venc must own mboxes 1 and 2. */
-	dev_info(dev, "[VCU] gce_th_num dec=%d enc=%d (venc mbox %d..%d, sec %d)",
-		vcu->gce_th_num[VCU_VDEC], vcu->gce_th_num[VCU_VENC],
-		vcu->gce_th_num[VCU_VDEC],
-		vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC] - 1,
-		vcu->gce_th_num[VCU_VDEC] + vcu->gce_th_num[VCU_VENC]);
 
 	ret = of_property_read_u16(pdev->dev.of_node, "gce-norm-token",
 		&vcu->cmdq_venc_norm_token);

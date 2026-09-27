@@ -3304,7 +3304,6 @@ static int vidioc_vdec_s_fmt(struct file *file, void *priv,
 	struct mtk_q_data *q_data;
 	int ret = 0;
 	struct mtk_video_fmt *fmt;
-	unsigned long in[2];	/* op6893: container frame size for the daemon */
 
 	if (IS_ERR_OR_NULL(f)) {
 		mtk_v4l2_err("fail to get v4l2_format");
@@ -3367,21 +3366,6 @@ static int vidioc_vdec_s_fmt(struct file *file, void *priv,
 			ret = mtk_vcodec_dec_init(ctx, q_data);
 			if (ret)
 				return -EINVAL;
-
-			/*
-			 * op6893: 4.19 tells the daemon the container frame size
-			 * immediately after vdec_if_init().  This tree dropped
-			 * SET_PARAM_FRAME_SIZE, and without it the 4.19 daemon
-			 * cannot open its codec instance -- it logs
-			 * "[H264_GetInstByID] There is no any H264 instance" and
-			 * answers every AP_IPIMSG_DEC_START with status -1.
-			 * Not fatal if it fails: the size is only a hint here.
-			 */
-			in[0] = pix_mp->width;
-			in[1] = pix_mp->height;
-			if (vdec_if_set_param(ctx, SET_PARAM_FRAME_SIZE, in) != 0)
-				mtk_v4l2_err("[%d] Error!! Cannot set param SET_PARAM_FRAME_SIZE",
-					ctx->id);
 		}
 	}
 
@@ -3571,15 +3555,7 @@ static int vidioc_vdec_g_fmt(struct file *file, void *priv,
 		}
 		q_data->coded_width = ctx->picinfo.buf_w;
 		q_data->coded_height = ctx->picinfo.buf_h;
-		/*
-		 * op6893 bring-up: vdec_pic_info lost `field' when the struct
-		 * was put back to its 4.19 layout, and this was its only
-		 * reader.  4.19's decoder never derived the field order from
-		 * picinfo either -- mtk_vcodec_dec.c sets V4L2_FIELD_NONE
-		 * everywhere, as this file already does at the two
-		 * queue-init sites.
-		 */
-		q_data->field = V4L2_FIELD_NONE;
+		q_data->field = ctx->picinfo.field;
 		fourcc = ctx->picinfo.fourcc;
 		q_data->fmt = mtk_find_fmt_by_pixel(fourcc);
 
@@ -3876,13 +3852,6 @@ static void vb2ops_vdec_buf_queue(struct vb2_buffer *vb)
 	dma_addr_t new_dma_addr;
 	bool new_dma = false;
 	char debug_bs[50] = "";
-	/*
-	 * op6893: the 4.19 driver tells the daemon the container frame size again
-	 * right before the decode that carries the SPS/PPS, and the daemon wants
-	 * both messages.  Must stay `unsigned long': vcu_dec_set_param() walks it
-	 * as a pointer to 64-bit words (see the SET_PARAM_FRAME_SIZE case).
-	 */
-	unsigned long frame_size[2] = { 0, 0 };
 #ifdef VDEC_CHECK_ALIVE
 	struct vdec_check_alive_work_struct *retrigger_ctx_work;
 #endif
@@ -4024,24 +3993,6 @@ static void vb2ops_vdec_buf_queue(struct vb2_buffer *vb)
 		  ((char *)src_mem->va)[3], ((char *)src_mem->va)[4], ((char *)src_mem->va)[5],
 		  ((char *)src_mem->va)[6], ((char *)src_mem->va)[7], ((char *)src_mem->va)[8]);
 	}
-
-	/*
-	 * op6893: 4.19 sends the container frame size here, immediately before
-	 * the header-parse decode, and then again in vidioc_vdec_s_fmt() right
-	 * after vdec_if_init() -- the daemon gets two of them before the first
-	 * AP_IPIMSG_DEC_START and this tree was only sending one.  The value is
-	 * 0/0 on both kernels: the 4.19 HAL never sets
-	 * V4L2_CID_MPEG_MTK_FRAME_SIZE (0x992003), so 4.19's
-	 * dec_params.frame_size_* stay 0 and this tree dropped the control
-	 * entirely.  Reproduce the message, not a size.
-	 *
-	 * 4.19's conditional SET_PARAM_DECODE_MODE that follows this call is
-	 * deliberately not mirrored: see the SET_PARAM_DECODE_MODE case in
-	 * vdec/vdec_common_if.c for the measurement behind that.
-	 */
-	if (vdec_if_set_param(ctx, SET_PARAM_FRAME_SIZE, frame_size) != 0)
-		mtk_v4l2_err("[%d] Error!! Cannot set param SET_PARAM_FRAME_SIZE",
-			ctx->id);
 
 	ret = vdec_if_decode(ctx, src_mem, NULL, &src_chg);
 	mtk_vdec_set_param(ctx);

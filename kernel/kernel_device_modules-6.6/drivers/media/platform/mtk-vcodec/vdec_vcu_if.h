@@ -31,12 +31,7 @@ struct vdec_vcu_inst {
 	enum ipi_id id;
 	void *vsi;
 	int32_t failure;
-	/*
-	 * op6893: the 4.19 daemon exchanges a 32-bit DMEM offset here, not a
-	 * pointer, so this must stay 32-bit -- it goes straight onto the wire in
-	 * every message that carries vcu_inst_addr.
-	 */
-	uint32_t inst_addr;
+	uint64_t inst_addr;
 	unsigned int signaled;
 	unsigned int signaled_res;
 	bool in_ipi;
