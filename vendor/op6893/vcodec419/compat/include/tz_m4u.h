@@ -1,0 +1,5 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* 4.19-only header; stubbed for the 6.6 forward port. */
+#ifndef _C419_TZ_M4U_H
+#define _C419_TZ_M4U_H
+#endif

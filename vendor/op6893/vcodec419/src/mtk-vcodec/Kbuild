@@ -1,0 +1,15 @@
+# One module: in 4.19 all of this was obj-y and the dec/enc/common objects call
+# each other's unexported functions (mtk_vcodec_util.c even calls into dec and
+# enc), so splitting them the way the file names suggest does not link.
+obj-m += mtk-vcodec-419.o
+mtk-vcodec-419-y := \
+	mtk_vcodec_dec_drv.o vdec_drv_if.o mtk_vcodec_dec.o mt6885/mtk_vcodec_dec_pm.o \
+	vdec/vdec_common_if.o vdec/vdec_log_if.o vdec_vcu_if.o \
+	mtk_vcodec_enc.o mtk_vcodec_enc_drv.o mt6885/mtk_vcodec_enc_pm.o \
+	venc_drv_if.o venc/venc_common_if.o venc/venc_log_if.o venc_vcu_if.o \
+	mt6885/mtk_vcodec_intr.o mtk_vcodec_util.o \
+	mt6885/vcodec_dvfs.o mt6885/vcodec_bw.o compat419_smi.o \
+	mtk_vcodec_419_main.o \
+	mtk_vcu.o mtk_vcodec_mem.o
+ccflags-y += -I$(PORT_ROOT)/src/mtk-vcodec -I$(PORT_ROOT)/src/mtk-vcodec/mt6885
+include $(PORT_ROOT)/common.mk
