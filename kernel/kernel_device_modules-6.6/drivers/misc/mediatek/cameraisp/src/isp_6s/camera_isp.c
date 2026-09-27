@@ -6511,9 +6511,19 @@ static int ISP_release(struct inode *pInode, struct file *pFile)
 	for (i = ISP_CAM_A_IDX; i < ISP_CAMSV_START_IDX; i++) {
 		int clkcnt = 0;
 		int j = 0;
+		bool vf_was_on;
 
+		/*
+		 * op6893 6.6 bring-up: G_u4EnableClockCount stays 0 under
+		 * EP_NO_CLKMGR (camsys is held on by the probe-time bulk enable,
+		 * g_camsys_clk_cnt), so this abnormal-exit cleanup never ran.
+		 * When camerahalserver died mid-stream, CAM_A kept streaming with
+		 * the dead session's CQ; the next session's ISP_Reset timed out
+		 * ("wait SW idle timeout") and CQI_R1 read iova 0 -> m4u fault ->
+		 * "ISP pass1 deque fail".  Run it whenever the regs are powered.
+		 */
 		spin_lock(&(IspInfo.SpinLockClock));
-		if (G_u4EnableClockCount[i] == 0) {
+		if (G_u4EnableClockCount[i] == 0 && g_camsys_clk_cnt <= 0) {
 			spin_unlock(&(IspInfo.SpinLockClock));
 			LOG_DBG("G_u4EnableClockCount[%d] already be 0, cannot r/w reg\n", i);
 			continue;
@@ -6525,6 +6535,13 @@ static int ISP_release(struct inode *pInode, struct file *pFile)
 		/* reason of close vf is to make sure */
 		/* camera can serve regular after previous abnormal exit */
 		Reg = ISP_RD32(CAM_REG_TG_VF_CON(i));
+		/*
+		 * op6893: the VF-on edge in ISP_VF_LOG unmasked this CAM's IRQ;
+		 * a HAL that died with VF on never hit the matching VF-off, so
+		 * re-mask to keep enable_irq/disable_irq balanced -- after
+		 * ISP_StopHW(), which waits for VS through this very IRQ.
+		 */
+		vf_was_on = Reg & 0x1;
 		Reg &= 0xfffffffE; /* close Vfinder */
 		ISP_WR32(CAM_REG_TG_VF_CON(i), Reg);
 
@@ -6547,6 +6564,11 @@ static int ISP_release(struct inode *pInode, struct file *pFile)
 		 */
 		ISP_WR32(CAM_REG_CTL_TWIN_STATUS(i), 0x0);
 		ISP_StopHW(i);
+		if (vf_was_on && isp_devs[i].irq > 0) {
+			disable_irq(isp_devs[i].irq);
+			LOG_INF("CAM dev(%d) disable_irq(%d) on release, VF was on\n",
+				i, isp_devs[i].irq);
+		}
 		LOG_INF("dev(%d): Disable all clk, cnt(%d)\n", i, clkcnt);
 		for (j = 0; j < clkcnt; j++)
 			ISP_EnableClock(i, MFALSE);
