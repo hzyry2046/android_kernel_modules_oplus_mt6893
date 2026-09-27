@@ -200,6 +200,22 @@ enum ION_SYS_CMDS {
 #define ION_SYS_OFF_CMD		0
 #define ION_SYS_OFF_ARG		8
 
+/*
+ * struct ion_sys_get_phys_param, nested in struct ion_sys_data at ION_SYS_OFF_ARG.
+ * The camera isp_drv (isp_drv_cam.cpp setDeviceInfo, "legacy ion") asks for the
+ * *device* address via ION_SYS_GET_PHYS rather than the ION_MM_GET_IOVA that
+ * libdpframework uses.  Layout is union{handle,kernel_ptr} then phy_addr then
+ * len; the union is pointer-wide, so on lp64 the fields land at 8/16/24 from the
+ * struct base.  32-bit callers pack them at 4/8/12.  Verified against the raw
+ * arg dump this handler emits.
+ */
+#define ION_SYS_PHYS_OFF_HANDLE_64	(ION_SYS_OFF_ARG + 0)
+#define ION_SYS_PHYS_OFF_PHYADDR_64	(ION_SYS_OFF_ARG + 8)
+#define ION_SYS_PHYS_OFF_LEN_64		(ION_SYS_OFF_ARG + 16)
+#define ION_SYS_PHYS_OFF_HANDLE_32	(ION_SYS_OFF_ARG - 4)
+#define ION_SYS_PHYS_OFF_PHYADDR_32	(ION_SYS_OFF_ARG + 0)
+#define ION_SYS_PHYS_OFF_LEN_32		(ION_SYS_OFF_ARG + 4)
+
 /* ------------------------------------------------------------- larb map ---- */
 
 #define ION_MAX_LARB	64
@@ -296,10 +312,30 @@ struct ion_handle {
 	int module_id;
 	unsigned int security;
 	unsigned int coherent;
+	/* resolved from a synthetic fd: SHARE hands out a proxy, see below */
+	bool synthetic;
+	/*
+	 * Device address the publisher already holds for this buffer.  GET_IOVA
+	 * returns it instead of making a mapping of our own: vpud FREEs the
+	 * handle right after GET_IOVA yet keeps using the address for reference
+	 * frames, so a per-handle mapping is torn down (and its iova reused)
+	 * while the hardware still reads through it -- P frames decode against
+	 * garbage and are dropped.  4.19 m4u mappings lived with the buffer.
+	 */
+	dma_addr_t fixed_iova;
 };
 
 struct ion_client {
 	struct xarray handles;
+	/*
+	 * op6893 camera diagnostic: a client that has issued a non-compat
+	 * GET_IOVA is a camera-like caller (isp_drv / mtkcam).  Only such
+	 * clients log their IMPORT/ALLOC/MAP/SHARE mix, so boot-time display
+	 * and vcodec traffic cannot exhaust a global budget before the camera
+	 * test even starts.
+	 */
+	bool verbose;
+	atomic_t log_budget;
 };
 
 static DEFINE_IDA(ion_handle_ida);
@@ -393,19 +429,40 @@ static int ion_map(struct ion_handle *h, int module_id)
 /* ---------------------------------------------------------- ioctl impl ----- */
 
 /* Shared by the 64-bit and 32-bit entry points. */
-static int ion_do_alloc(struct ion_client *client, u64 len, int *out_id)
+static int ion_do_alloc(struct ion_client *client, u64 len,
+			u32 heap_id_mask, u32 flags, int *out_id)
 {
 	struct dma_heap *heap;
 	struct dma_buf *dmabuf;
 	struct ion_handle *h;
+	const char *heap_name;
+	bool cached = flags & 1;	/* ION_FLAG_CACHED */
 	int id;
 
 	if (!len)
 		return -EINVAL;
 
-	heap = dma_heap_find("system");
-	if (!heap)
-		return -ENODEV;
+	/*
+	 * op6893: honour the requested ION heap.  The camera isp_drv allocates
+	 * its CQ/config/dummy buffers from the multimedia heaps (mask 0x400 =
+	 * ION_HEAP_MULTIMEDIA_ID uncached, 0x1000 = MM map-mva cached); feeding
+	 * those back a plain "system" dma-buf made isp_drv's _set_ion_handle
+	 * reject them (the MM engines need the mtk_mm heap's iommu-backed
+	 * pages).  Map the MM masks to mtk_mm[-uncached]; everything else keeps
+	 * the system heap.
+	 */
+	if (heap_id_mask & (0x400 | 0x1000))
+		heap_name = cached ? "mtk_mm" : "mtk_mm-uncached";
+	else
+		heap_name = cached ? "system" : "system-uncached";
+
+	heap = dma_heap_find(heap_name);
+	if (!heap) {
+		/* fall back to system so an unknown mask cannot fail alloc */
+		heap = dma_heap_find("system");
+		if (!heap)
+			return -ENODEV;
+	}
 	dmabuf = dma_heap_buffer_alloc(heap, len, O_RDWR, 0);
 	dma_heap_put(heap);
 	if (IS_ERR(dmabuf))
@@ -424,6 +481,11 @@ static int ion_do_alloc(struct ion_client *client, u64 len, int *out_id)
 		dma_heap_buffer_free(dmabuf);
 		return id;
 	}
+
+	if (client->verbose &&
+	    atomic_dec_if_positive(&client->log_budget) >= 0)
+		pr_info("ion: alloc[%s] handle=%d len=%llu heap_mask=0x%x flags=0x%x -> %s\n",
+			current->comm, id, len, heap_id_mask, flags, heap_name);
 
 	*out_id = id;
 	return 0;
@@ -451,7 +513,7 @@ static long ion_ioctl_alloc(struct ion_client *client, void __user *argp)
 	if (copy_from_user(&data, argp, sizeof(data)))
 		return -EFAULT;
 
-	ret = ion_do_alloc(client, data.len, &id);
+	ret = ion_do_alloc(client, data.len, data.heap_id_mask, data.flags, &id);
 	if (ret)
 		return ret;
 
@@ -471,7 +533,7 @@ static long ion_ioctl_alloc32(struct ion_client *client, void __user *argp)
 	if (copy_from_user(&data, argp, sizeof(data)))
 		return -EFAULT;
 
-	ret = ion_do_alloc(client, data.len, &id);
+	ret = ion_do_alloc(client, data.len, data.heap_id_mask, data.flags, &id);
 	if (ret)
 		return ret;
 
@@ -556,6 +618,7 @@ static long ion_ioctl_free(struct ion_client *client, void __user *argp)
 
 struct mtk_ion_synthetic {
 	struct dma_buf *dmabuf;
+	dma_addr_t iova;	/* publisher's own device address, 0 if none */
 };
 
 static DEFINE_XARRAY(mtk_ion_synthetic);
@@ -580,7 +643,8 @@ static int mtk_ion_synthetic_id(int fd)
  * value: one of the two bases is negative, so a descriptor and an errno are
  * both "a small negative int" and the caller could not tell them apart.
  */
-static int mtk_ion_publish(struct dma_buf *dmabuf, int base, int limit, int *fd)
+static int mtk_ion_publish(struct dma_buf *dmabuf, dma_addr_t iova, int base,
+			   int limit, int *fd)
 {
 	struct mtk_ion_synthetic *entry;
 	void *old;
@@ -601,6 +665,7 @@ static int mtk_ion_publish(struct dma_buf *dmabuf, int base, int limit, int *fd)
 
 	get_dma_buf(dmabuf);
 	entry->dmabuf = dmabuf;
+	entry->iova = iova;
 	old = xa_store(&mtk_ion_synthetic, id, entry, GFP_KERNEL);
 	if (xa_is_err(old)) {
 		ida_free(&mtk_ion_synthetic_ida, id);
@@ -623,10 +688,25 @@ static int mtk_ion_publish(struct dma_buf *dmabuf, int base, int limit, int *fd)
  */
 int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf, int *fd)
 {
-	return mtk_ion_publish(dmabuf, MTK_ION_SYNTHETIC_FD_BASE,
+	return mtk_ion_publish(dmabuf, 0, MTK_ION_SYNTHETIC_FD_BASE,
 			       MTK_ION_SYNTHETIC_FD_LIMIT, fd);
 }
 EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf);
+
+/**
+ * mtk_ion_publish_dmabuf_iova - as mtk_ion_publish_dmabuf(), and GET_IOVA on
+ * the imported handle answers @iova instead of mapping the buffer itself
+ * @dmabuf: buffer to publish
+ * @iova:   the publisher's device address for it, valid in the multimedia
+ *          iommu domain for as long as the publisher keeps the buffer
+ * @fd:     out, the descriptor
+ */
+int mtk_ion_publish_dmabuf_iova(struct dma_buf *dmabuf, dma_addr_t iova, int *fd)
+{
+	return mtk_ion_publish(dmabuf, iova, MTK_ION_SYNTHETIC_FD_BASE,
+			       MTK_ION_SYNTHETIC_FD_LIMIT, fd);
+}
+EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf_iova);
 
 /**
  * mtk_ion_publish_dmabuf_s16 - as mtk_ion_publish_dmabuf(), but the descriptor
@@ -640,10 +720,19 @@ EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf);
  */
 int mtk_ion_publish_dmabuf_s16(struct dma_buf *dmabuf, int *fd)
 {
-	return mtk_ion_publish(dmabuf, MTK_ION_SYNTHETIC_SMALL_BASE,
+	return mtk_ion_publish(dmabuf, 0, MTK_ION_SYNTHETIC_SMALL_BASE,
 			       -MTK_ION_SYNTHETIC_SMALL_BASE, fd);
 }
 EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf_s16);
+
+/* The __s16 form of mtk_ion_publish_dmabuf_iova(). */
+int mtk_ion_publish_dmabuf_s16_iova(struct dma_buf *dmabuf, dma_addr_t iova,
+				    int *fd)
+{
+	return mtk_ion_publish(dmabuf, iova, MTK_ION_SYNTHETIC_SMALL_BASE,
+			       -MTK_ION_SYNTHETIC_SMALL_BASE, fd);
+}
+EXPORT_SYMBOL_GPL(mtk_ion_publish_dmabuf_s16_iova);
 
 /**
  * mtk_ion_unpublish_dmabuf - drop a descriptor published above
@@ -672,7 +761,7 @@ EXPORT_SYMBOL_GPL(mtk_ion_unpublish_dmabuf);
  * Resolve a synthetic descriptor, taking a reference for the caller so the
  * result can stand in for dma_buf_get().  NULL when @fd is not one of ours.
  */
-static struct dma_buf *mtk_ion_synthetic_get(int fd)
+static struct dma_buf *mtk_ion_synthetic_get(int fd, dma_addr_t *iova)
 {
 	struct mtk_ion_synthetic *entry;
 	int id = mtk_ion_synthetic_id(fd);
@@ -685,6 +774,7 @@ static struct dma_buf *mtk_ion_synthetic_get(int fd)
 		return NULL;
 
 	get_dma_buf(entry->dmabuf);
+	*iova = entry->iova;
 	return entry->dmabuf;
 }
 
@@ -693,6 +783,8 @@ static long ion_ioctl_import(struct ion_client *client, void __user *argp)
 	struct ion_fd_data data;
 	struct dma_buf *dmabuf;
 	struct ion_handle *h;
+	bool synthetic = false;
+	dma_addr_t fixed_iova = 0;
 	int id, ret;
 
 	if (copy_from_user(&data, argp, sizeof(data)))
@@ -702,22 +794,24 @@ static long ion_ioctl_import(struct ion_client *client, void __user *argp)
 	if (IS_ERR(dmabuf)) {
 		long err = PTR_ERR(dmabuf);
 
+		synthetic = true;
+
 		/*
 		 * Not a descriptor in this process.  It may be one the vcodec
 		 * driver published for the 4.19 vpud daemon, which has no other
 		 * way to name a buffer -- see mtk_ion_publish_dmabuf().
 		 */
-		dmabuf = mtk_ion_synthetic_get(data.fd);
+		dmabuf = mtk_ion_synthetic_get(data.fd, &fixed_iova);
 		if (!dmabuf) {
 			/*
 			 * op6893 diagnostic: a vdec fd that is neither in this
 			 * process nor in the registry is the one failure this
-			 * layer cannot recover from, so name the caller.
+			 * layer cannot recover from, so name the caller.  Log
+			 * every failure (not just synthetic) while chasing the
+			 * camera isp_drv buffer path.
 			 */
-			if (mtk_ion_synthetic_id(data.fd) >= 0)
-				pr_info("ion: import FAILED pid=%d(%s) fd=0x%x err=%ld\n",
-					current->tgid, current->comm,
-					data.fd, err);
+			pr_info("ion: import FAILED pid=%d(%s) fd=0x%x err=%ld\n",
+				current->tgid, current->comm, data.fd, err);
 			return err;
 		}
 		pr_info("ion: import synthetic pid=%d(%s) fd=0x%x ok\n",
@@ -730,6 +824,8 @@ static long ion_ioctl_import(struct ion_client *client, void __user *argp)
 		return -ENOMEM;
 	}
 	h->dmabuf = dmabuf;
+	h->synthetic = synthetic;
+	h->fixed_iova = fixed_iova;
 
 	id = ion_handle_add(client, h);
 	if (id < 0) {
@@ -747,7 +843,91 @@ static long ion_ioctl_import(struct ion_client *client, void __user *argp)
 		dma_buf_put(dmabuf);
 		return -EFAULT;
 	}
+	{
+		if (client->verbose &&
+		    atomic_dec_if_positive(&client->log_budget) >= 0)
+			pr_info("ion: import[%s] fd=0x%x -> handle=%d size=%zu\n",
+				current->comm, data.fd, id, dmabuf->size);
+	}
 	return 0;
+}
+
+/*
+ * op6893: SHARE of a buffer that reached this client through a synthetic fd.
+ *
+ * Those dma-bufs are the vcodec's vb2 buffers, exported in the media client's
+ * process, so their struct file carries that client's SELinux label.  Handing
+ * the same file to vpud trips "vpud_native <client>:fd use" (vendor policy
+ * only allows mediaserver) and the daemon's mmap() of the bitstream returns
+ * -1 -> SIGSEGV in Vdec_Drv_H264_open.  4.19 MTK ION never hit this: its
+ * SHARE exported a fresh dma-buf per call, created in the caller's context.
+ * Do the same: export a proxy owned by the caller that forwards CPU access
+ * and mmap to the real buffer.  Device mapping is not needed on this path
+ * (vpud gets the iova through GET_IOVA) and is refused.
+ */
+static struct sg_table *ion_proxy_map(struct dma_buf_attachment *a,
+				      enum dma_data_direction dir)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static void ion_proxy_unmap(struct dma_buf_attachment *a, struct sg_table *sgt,
+			    enum dma_data_direction dir)
+{
+}
+
+static void ion_proxy_release(struct dma_buf *proxy)
+{
+	dma_buf_put(proxy->priv);
+}
+
+static int ion_proxy_mmap(struct dma_buf *proxy, struct vm_area_struct *vma)
+{
+	return dma_buf_mmap(proxy->priv, vma, vma->vm_pgoff);
+}
+
+static int ion_proxy_begin_cpu(struct dma_buf *proxy,
+			       enum dma_data_direction dir)
+{
+	return dma_buf_begin_cpu_access(proxy->priv, dir);
+}
+
+static int ion_proxy_end_cpu(struct dma_buf *proxy, enum dma_data_direction dir)
+{
+	return dma_buf_end_cpu_access(proxy->priv, dir);
+}
+
+static const struct dma_buf_ops ion_proxy_ops = {
+	.map_dma_buf = ion_proxy_map,
+	.unmap_dma_buf = ion_proxy_unmap,
+	.release = ion_proxy_release,
+	.mmap = ion_proxy_mmap,
+	.begin_cpu_access = ion_proxy_begin_cpu,
+	.end_cpu_access = ion_proxy_end_cpu,
+};
+
+static int ion_proxy_fd(struct dma_buf *real)
+{
+	DEFINE_DMA_BUF_EXPORT_INFO(info);
+	struct dma_buf *proxy;
+	int fd;
+
+	info.exp_name = "ion_compat_proxy";
+	info.ops = &ion_proxy_ops;
+	info.size = real->size;
+	info.flags = O_RDWR;
+	info.priv = real;
+
+	get_dma_buf(real);		/* dropped in ion_proxy_release() */
+	proxy = dma_buf_export(&info);
+	if (IS_ERR(proxy)) {
+		dma_buf_put(real);
+		return PTR_ERR(proxy);
+	}
+	fd = dma_buf_fd(proxy, O_CLOEXEC);
+	if (fd < 0)
+		dma_buf_put(proxy);	/* releases real too */
+	return fd;
 }
 
 /* ION_IOC_SHARE / ION_IOC_MAP: hand back a new fd for the buffer. */
@@ -764,11 +944,19 @@ static long ion_ioctl_get_fd(struct ion_client *client, void __user *argp)
 	if (!h)
 		return -EINVAL;
 
-	/* dma_buf_fd() consumes a reference, so take one for it. */
-	get_dma_buf(h->dmabuf);
-	fd = dma_buf_fd(h->dmabuf, O_CLOEXEC);
-	if (fd < 0)
-		return fd;
+	if (h->synthetic) {
+		fd = ion_proxy_fd(h->dmabuf);
+		if (fd < 0)
+			return fd;
+	} else {
+		/* dma_buf_fd() consumes a reference, so take one for it. */
+		get_dma_buf(h->dmabuf);
+		fd = dma_buf_fd(h->dmabuf, O_CLOEXEC);
+		if (fd < 0) {
+			dma_buf_put(h->dmabuf);
+			return fd;
+		}
+	}
 
 	data.fd = fd;
 	ret = copy_to_user(argp, &data, sizeof(data));
@@ -799,20 +987,159 @@ static long ion_ioctl_sync(struct ion_client *client, void __user *argp)
 	return 0;
 }
 
-static long ion_custom_system(struct ion_client *client, u64 arg)
-{
-	u32 sys_cmd;
+/*
+ * ION_SYS_CACHE_SYNC.  The 4.19 vpud issues this ~6x/s while decoding (4.19
+ * kprobe baseline), around CPU access to buffers it also hands to the codec, so
+ * the old "return 0" left it with stale lines on a cached mtk_mm buffer.
+ *
+ * 4.19 struct ion_sys_cache_sync_param, nested in ion_sys_data at the same
+ * union offset GET_PHYS uses (4 for 32-bit callers, 8 for 64-bit):
+ *	{ int handle / ptr; void *va; unsigned int size;
+ *	  enum ION_CACHE_SYNC_TYPE sync_type; u64 iova; }
+ * Only handle and sync_type are read.  The whole buffer is maintained, not the
+ * [va, va+size) range: a superset of what 4.19 did, and independent of the
+ * va/size offsets, which have not been measured for 32-bit callers.  The
+ * dma-buf exporter performs the maintenance on its mapped attachments.
+ */
+enum {
+	ION_CACHE_CLEAN_BY_RANGE,
+	ION_CACHE_INVALID_BY_RANGE,
+	ION_CACHE_FLUSH_BY_RANGE,
+	ION_CACHE_CLEAN_BY_RANGE_USE_PA,
+	ION_CACHE_INVALID_BY_RANGE_USE_PA,
+	ION_CACHE_FLUSH_BY_RANGE_USE_PA,
+	ION_CACHE_CLEAN_ALL,
+	ION_CACHE_INVALID_ALL,
+	ION_CACHE_FLUSH_ALL,
+};
 
-	if (copy_from_user(&sys_cmd, (void __user *)(uintptr_t)arg,
-			   sizeof(sys_cmd)))
+#define ION_SYS_SYNC_OFF_HANDLE_64	(ION_SYS_OFF_ARG + 0)
+#define ION_SYS_SYNC_OFF_TYPE_64	(ION_SYS_OFF_ARG + 20)
+/*
+ * 32-bit: 4.19 compat_ion_sys_cache_sync_param holds a u64 iova, so the union
+ * is 8-aligned: handle @8, va @12, size @16, sync_type @20, iova @24.  Checked
+ * against vpud's raw args (arg[2]=handle, arg[4]=size, arg[5]=type).  The old
+ * @4/@16 guess read the size as the type, which always looked like an *_ALL
+ * op, so every vpud cache sync was dropped.
+ */
+#define ION_SYS_SYNC_OFF_HANDLE_32	(ION_SYS_OFF_ARG + 0)
+#define ION_SYS_SYNC_OFF_TYPE_32	(ION_SYS_OFF_ARG + 12)
+
+static atomic_t ion_sync_log_budget = ATOMIC_INIT(32);
+
+static long ion_sys_cache_sync(struct ion_client *client, void __user *uarg,
+			       bool compat)
+{
+	int off_handle = compat ? ION_SYS_SYNC_OFF_HANDLE_32
+				: ION_SYS_SYNC_OFF_HANDLE_64;
+	int off_type = compat ? ION_SYS_SYNC_OFF_TYPE_32
+			      : ION_SYS_SYNC_OFF_TYPE_64;
+	struct ion_handle *h;
+	s32 handle;
+	u32 type, word;
+	int i, ret = 0;
+
+	if (copy_from_user(&handle, uarg + off_handle, sizeof(handle)) ||
+	    copy_from_user(&type, uarg + off_type, sizeof(type)))
+		return -EFAULT;
+
+	if (atomic_dec_if_positive(&ion_sync_log_budget) >= 0) {
+		pr_info("ion: cache_sync handle %d type %u (compat=%d)\n",
+			handle, type, compat);
+		for (i = 0; i < 10; i++)
+			if (!copy_from_user(&word, uarg + i * 4, sizeof(word)))
+				pr_info("ion: cache_sync arg[%d] = 0x%x\n", i, word);
+	}
+
+	if (type >= ION_CACHE_CLEAN_ALL) {
+		/* No dma-buf equivalent of a whole-cache operation. */
+		pr_info_ratelimited("ion: cache_sync type %u (ALL) ignored\n", type);
+		return 0;
+	}
+
+	h = ion_handle_get(client, handle);
+	if (!h) {
+		pr_info_ratelimited("ion: cache_sync bad handle %d (compat=%d)\n",
+				    handle, compat);
+		return -EINVAL;
+	}
+
+	switch (type % 3) {
+	case ION_CACHE_CLEAN_BY_RANGE:		/* CPU wrote -> device reads */
+		ret = dma_buf_end_cpu_access(h->dmabuf, DMA_TO_DEVICE);
+		break;
+	case ION_CACHE_INVALID_BY_RANGE:	/* device wrote -> CPU reads */
+		ret = dma_buf_begin_cpu_access(h->dmabuf, DMA_FROM_DEVICE);
+		break;
+	case ION_CACHE_FLUSH_BY_RANGE:
+		ret = dma_buf_end_cpu_access(h->dmabuf, DMA_TO_DEVICE);
+		if (!ret)
+			ret = dma_buf_begin_cpu_access(h->dmabuf, DMA_FROM_DEVICE);
+		break;
+	}
+	return ret ? -EINVAL : 0;
+}
+
+static long ion_custom_system(struct ion_client *client, u64 arg, bool compat)
+{
+	void __user *uarg = (void __user *)(uintptr_t)arg;
+	int off_handle = compat ? ION_SYS_PHYS_OFF_HANDLE_32
+				: ION_SYS_PHYS_OFF_HANDLE_64;
+	int off_phy = compat ? ION_SYS_PHYS_OFF_PHYADDR_32
+			     : ION_SYS_PHYS_OFF_PHYADDR_64;
+	int off_len = compat ? ION_SYS_PHYS_OFF_LEN_32
+			     : ION_SYS_PHYS_OFF_LEN_64;
+	struct ion_handle *h;
+	u32 sys_cmd, word;
+	s32 handle;
+	u64 phys;
+	int ret, i;
+
+	if (copy_from_user(&sys_cmd, uarg + ION_SYS_OFF_CMD, sizeof(sys_cmd)))
 		return -EFAULT;
 
 	switch (sys_cmd) {
-	case ION_SYS_SET_CLIENT_NAME:
-	case ION_SYS_CACHE_SYNC:
 	case ION_SYS_GET_PHYS:
+		/*
+		 * The camera's "legacy ion" path: hand back a device address for
+		 * the buffer, exactly as ION_MM_GET_IOVA does.  Answering 0 here
+		 * (the old no-op) made isp_drv_cam's Res_Attach reject the buffer
+		 * ("can't be 0") and configPipe fail -22, so P1 never started.
+		 */
+		if (copy_from_user(&handle, uarg + off_handle, sizeof(handle)))
+			return -EFAULT;
+		h = ion_handle_get(client, handle);
+		if (!h) {
+			pr_info("ion: get_phys bad handle %d (compat=%d)\n",
+				handle, compat);
+			for (i = 0; i < 8; i++) {
+				if (!copy_from_user(&word, uarg + i * 4,
+						    sizeof(word)))
+					pr_info("ion: phys arg[%d] = 0x%x\n",
+						i, word);
+			}
+			return -EINVAL;
+		}
+
+		ret = ion_map(h, h->module_id);
+		if (ret)
+			return ret;
+
+		phys = h->iova;
+		pr_info("ion: get_phys handle %d (port 0x%x) -> 0x%llx len %lu\n",
+			handle, h->module_id, (unsigned long long)phys, h->len);
+		if (copy_to_user(uarg + off_phy, &phys, sizeof(phys)))
+			return -EFAULT;
+		if (copy_to_user(uarg + off_len, &h->len, sizeof(h->len)))
+			return -EFAULT;
+		return 0;
+
+	case ION_SYS_CACHE_SYNC:
+		return ion_sys_cache_sync(client, uarg, compat);
+
+	case ION_SYS_SET_CLIENT_NAME:
 	case ION_SYS_DMA_OP:
-		/* Nothing to do at this layer; the dma-buf owns coherency. */
+		/* Nothing to do at this layer. */
 		return 0;
 	default:
 		pr_info("ion: unhandled system cmd %u\n", sys_cmd);
@@ -829,16 +1156,20 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 	u32 word;
 	int module_id, ret;
 	int i;
-	/* op6893: vpud is 32-bit, its struct ion_mm_data packs module_id @12,
-	 * phy_addr @16 and len @24; the 64-bit layout (libdpframework) has
-	 * them @16/@40/@48.  Using the 64-bit offsets for a 32-bit caller
-	 * reads module_id as 0 (maps to larb0 instead of larb7) and writes
-	 * the iova where the caller never looks, so it keeps a stale
-	 * 0x0f... address and VENC never starts.
+	/* op6893: vpud is 32-bit.  Its struct ion_mm_data is the EABI layout
+	 * of 4.19's compat_ion_mm_get_iova_param (compat_ion.c): the union
+	 * holds a u64, so it is 8-aligned -- handle @8, module_id @12,
+	 * security @16, coherent @20, reserve_iova_start/end @24/@28,
+	 * phy_addr @32, len (compat_size_t, 4 bytes) @40.  The 64-bit layout
+	 * (libdpframework) has module_id/phy_addr/len @16/@40/@48.
+	 * An earlier @16/@24 guess wrote the iova over security/coherent and
+	 * left phy_addr zero, so vpud dropped every bitstream buffer right
+	 * after GET_IOVA (IMPORT -> CUSTOM -> FREE, no SHARE/mmap) and each
+	 * AP_IPIMSG_DEC_START came back -1 ("need first seq header").
 	 */
 	int off_module = compat ? 12 : ION_MM_OFF_MODULE_ID;
-	int off_phy = compat ? 16 : ION_MM_OFF_PHY_ADDR;
-	int off_len = compat ? 24 : ION_MM_OFF_LEN;
+	int off_phy = compat ? 32 : ION_MM_OFF_PHY_ADDR;
+	int off_len = compat ? 40 : ION_MM_OFF_LEN;
 
 	if (compat) {
 		/*
@@ -862,9 +1193,20 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 	if (copy_from_user(&handle, uarg + ION_MM_OFF_HANDLE, sizeof(handle)))
 		return -EFAULT;
 
+	/*
+	 * op6893 camera bring-up diagnostic: the camera isp_drv ("legacy ion",
+	 * isp_drv_cam.cpp setDeviceInfo) reports _set_ion_handle error(7_<handle>_<plane>)
+	 * for the image-output buffers.  struct layout is cmd@0, handle@8,
+	 * module_id@16 (same as libdpframework).  Log the outcome for the buffer
+	 * commands so we can see what the failing handles get.  Bounded, compact.
+	 */
 	h = ion_handle_get(client, handle);
-	if (!h)
+	if (!h) {
+		if (mm_cmd != ION_MM_SET_DEBUG_INFO)
+			pr_info("ion: mm[%s] cmd=%u handle=%d NOT FOUND in client\n",
+				current->comm, mm_cmd, handle);
 		return -EINVAL;
+	}
 
 	switch (mm_cmd) {
 	case ION_MM_CONFIG_BUFFER:
@@ -887,16 +1229,41 @@ static long ion_custom_mm(struct ion_client *client, u64 arg, bool compat)
 				   sizeof(module_id)))
 			return -EFAULT;
 
-		ret = ion_map(h, module_id);
+		if (h->fixed_iova) {
+			h->iova = h->fixed_iova;
+			h->len = h->dmabuf->size;
+			h->module_id = module_id;
+			ret = 0;
+		} else {
+			ret = ion_map(h, module_id);
+		}
+		if (!compat)
+			client->verbose = true;	/* camera-like caller */
+		{
+			static atomic_t giova_budget = ATOMIC_INIT(400);
+
+			/* skip the port 0x200 CQ retry spam; log the rest */
+			if (module_id != 0x200 &&
+			    atomic_dec_if_positive(&giova_budget) >= 0)
+				pr_info("ion: getiova[%s] handle=%d port=0x%x ret=%d iova=0x%llx len=%lu\n",
+					current->comm, handle, module_id, ret,
+					(unsigned long long)h->iova, h->len);
+		}
 		if (ret)
 			return ret;
 
 		if (copy_to_user(uarg + off_phy, &h->iova,
 				 sizeof(u64)))
 			return -EFAULT;
-		if (copy_to_user(uarg + off_len, &h->len,
-				 sizeof(unsigned long)))
+		if (compat) {
+			u32 len32 = (u32)h->len;
+
+			if (copy_to_user(uarg + off_len, &len32, sizeof(len32)))
+				return -EFAULT;
+		} else if (copy_to_user(uarg + off_len, &h->len,
+					sizeof(unsigned long))) {
 			return -EFAULT;
+		}
 		return 0;
 
 	default:
@@ -914,7 +1281,7 @@ static long ion_ioctl_custom(struct ion_client *client, void __user *argp)
 
 	switch (data.cmd) {
 	case ION_CMD_SYSTEM:
-		return ion_custom_system(client, data.arg);
+		return ion_custom_system(client, data.arg, false);
 	case ION_CMD_MULTIMEDIA:
 		return ion_custom_mm(client, data.arg, false);
 	default:
@@ -932,7 +1299,7 @@ static long ion_ioctl_custom32(struct ion_client *client, void __user *argp)
 
 	switch (data.cmd) {
 	case ION_CMD_SYSTEM:
-		return ion_custom_system(client, (u64)data.arg);
+		return ion_custom_system(client, (u64)data.arg, true);
 	case ION_CMD_MULTIMEDIA:
 		return ion_custom_mm(client, (u64)data.arg, true);
 	default:
@@ -945,6 +1312,27 @@ static long ion_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct ion_client *client = file->private_data;
 	void __user *argp = (void __user *)arg;
+
+	/*
+	 * op6893 camera diagnostic: log the non-CUSTOM ioctl mix per caller so
+	 * we can see whether isp_drv's failing "_set_ion_handle" buffer path
+	 * uses MAP/SHARE/ALLOC (which we answer with an fd, not an address) or
+	 * hits an import failure.  Bounded so it cannot flood; CUSTOM has its
+	 * own logging already.
+	 */
+	if (client->verbose && cmd != ION_IOC_CUSTOM &&
+	    cmd != ION_IOC_CUSTOM32 && cmd != ION_IOC_SYNC) {
+		const char *nm =
+			cmd == ION_IOC_ALLOC   ? "ALLOC"   :
+			cmd == ION_IOC_ALLOC32 ? "ALLOC32" :
+			cmd == ION_IOC_FREE    ? "FREE"    :
+			cmd == ION_IOC_IMPORT  ? "IMPORT"  :
+			cmd == ION_IOC_MAP     ? "MAP"     :
+			cmd == ION_IOC_SHARE   ? "SHARE"   : "?";
+
+		if (atomic_dec_if_positive(&client->log_budget) >= 0)
+			pr_info("ion: ioctl[%s] %s\n", current->comm, nm);
+	}
 
 	switch (cmd) {
 	case ION_IOC_ALLOC:
@@ -978,6 +1366,8 @@ static int ion_open(struct inode *inode, struct file *file)
 	if (!client)
 		return -ENOMEM;
 	xa_init(&client->handles);
+	client->verbose = false;
+	atomic_set(&client->log_budget, 800);
 	file->private_data = client;
 	return 0;
 }

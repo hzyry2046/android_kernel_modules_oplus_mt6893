@@ -25,10 +25,17 @@
 #ifndef _MTK_ION_COMPAT_H_
 #define _MTK_ION_COMPAT_H_
 
+#include <linux/types.h>
+
+struct dma_buf;
+
 struct dma_buf;
 
 int mtk_ion_publish_dmabuf(struct dma_buf *dmabuf, int *fd);
 int mtk_ion_publish_dmabuf_s16(struct dma_buf *dmabuf, int *fd);
+int mtk_ion_publish_dmabuf_iova(struct dma_buf *dmabuf, dma_addr_t iova, int *fd);
+int mtk_ion_publish_dmabuf_s16_iova(struct dma_buf *dmabuf, dma_addr_t iova,
+				    int *fd);
 void mtk_ion_unpublish_dmabuf(int fd);
 
 #endif /* _MTK_ION_COMPAT_H_ */
