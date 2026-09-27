@@ -147,6 +147,21 @@ static void sched_queue_task_hook(void *data, struct rq *rq, struct task_struct 
 	int type = *(int *)data;
 	struct sugov_rq_data *sugov_data_ptr;
 
+	/*
+	 * op6893 6.6 bring-up: forward the dequeue to sched_assist BEFORE the
+	 * eas-hook gate, exactly as mtk_hook_after_enqueue_task() already does
+	 * for the enqueue.  get_eas_hook() is legacy-api-support from the
+	 * eas-info DT node, which this board's (4.19) DTB does not have, so it
+	 * is 0 here: UX tasks were added to the oplus ux_list on every enqueue
+	 * and never removed on dequeue.  The stale entries were then picked by
+	 * oplus_replace_next_task_fair() / checked by need_wakeup_preempt(), and
+	 * the box oopsed (pick_eevdf() NULL, logs/sched-chain-crash.txt).
+	 */
+#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
+	if (type == dequeue)
+		android_rvh_dequeue_task_handler(data, rq, p, flags);
+#endif
+
 	if (!get_eas_hook())
 		return;
 
@@ -199,10 +214,6 @@ static void sched_queue_task_hook(void *data, struct rq *rq, struct task_struct 
 				p->cpus_ptr->bits[0]);
 	}
 
-#if IS_ENABLED(CONFIG_OPLUS_FEATURE_SCHED_ASSIST)
-	if (type == dequeue)
-		android_rvh_dequeue_task_handler(data, rq, p, flags);
-#endif
 	irq_log_store();
 }
 
