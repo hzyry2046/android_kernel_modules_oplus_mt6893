@@ -315,6 +315,61 @@ static struct SENSOR_VC_INFO_STRUCT SENSOR_VC_INFO[3] = {
 };
 
 
+/* VC_INFO2：新 HAL(configureMipi)按 VC_FEATURE==VC_RAW_DATA 取主通道给 TgInfo。
+ * 旧 SENSOR_VC_INFO 无 VC_FEATURE 字段，本 sensor 又没实现 GET_VC_INFO2，
+ * 导致 HAL 拿到全零 VC_INFO2、找不到 raw 通道 → TgInfo=0。补上主 raw 通道。
+ * 尺寸沿用上面 SENSOR_VC_INFO 各 scenario 的 VC0(raw,DT0x2b)。 */
+static struct SENSOR_VC_INFO2_STRUCT SENSOR_VC_INFO2[3] = {
+	{	/* [0] preview / capture / custom1 : 4608x3456 */
+		0x01, 0x0a, 0x00, 0x08, 0x40, 0x00,
+		{
+			{VC_RAW_DATA, 0x00, 0x2b, 0x1200, 0x0D80},
+		},
+		1
+	},
+	{	/* [1] normal video : 4608x2592 */
+		0x01, 0x0a, 0x00, 0x08, 0x40, 0x00,
+		{
+			{VC_RAW_DATA, 0x00, 0x2b, 0x1200, 0x0A20},
+		},
+		1
+	},
+	{	/* [2] video60fps */
+		0x01, 0x0a, 0x00, 0x08, 0x40, 0x00,
+		{
+			{VC_RAW_DATA, 0x00, 0x2b, 0x1200, 0x0A20},
+		},
+		1
+	}
+};
+
+static void imx682_get_vc_info_2(struct SENSOR_VC_INFO2_STRUCT *pvcinfo2,
+		kal_uint32 scenario)
+{
+	switch (scenario) {
+	case MSDK_SCENARIO_ID_VIDEO_PREVIEW:
+	case MSDK_SCENARIO_ID_CUSTOM2:
+		memcpy((void *)pvcinfo2, (void *)&SENSOR_VC_INFO2[1],
+			sizeof(struct SENSOR_VC_INFO2_STRUCT));
+		break;
+	case MSDK_SCENARIO_ID_CUSTOM3:
+		memcpy((void *)pvcinfo2, (void *)&SENSOR_VC_INFO2[2],
+			sizeof(struct SENSOR_VC_INFO2_STRUCT));
+		break;
+	case MSDK_SCENARIO_ID_CAMERA_PREVIEW:
+	case MSDK_SCENARIO_ID_CAMERA_CAPTURE_JPEG:
+	case MSDK_SCENARIO_ID_CUSTOM1:
+	case MSDK_SCENARIO_ID_CUSTOM5:
+	case MSDK_SCENARIO_ID_SLIM_VIDEO:
+	default:
+		memcpy((void *)pvcinfo2, (void *)&SENSOR_VC_INFO2[0],
+			sizeof(struct SENSOR_VC_INFO2_STRUCT));
+		break;
+	}
+}
+
+
+
 /* If mirror flip */
 static struct SET_PD_BLOCK_INFO_T imgsensor_pd_info = {
 	.i4OffsetX = 17,
@@ -4149,6 +4204,12 @@ static kal_uint32 feature_control(MSDK_SENSOR_FEATURE_ENUM feature_id,
 		default:
 			break;
 		}
+		break;
+	case SENSOR_FEATURE_GET_VC_INFO2:
+		pr_info("[VCDBG] imx682 GET_VC_INFO2 scenario=%d\n", *feature_data_32);
+		imx682_get_vc_info_2(
+			(struct SENSOR_VC_INFO2_STRUCT *)(uintptr_t)(*(feature_data+1)),
+			*feature_data_32);
 		break;
 	case SENSOR_FEATURE_GET_SENSOR_PDAF_CAPACITY:
 		LOG_DEBUG("SENSOR_FEATURE_GET_SENSOR_PDAF_CAPACITY scenarioId:%d\n", (UINT16)*feature_data);

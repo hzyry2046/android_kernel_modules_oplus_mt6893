@@ -90,9 +90,39 @@ int seninf_dfs_ctrl(struct seninf_dfs_ctx *ctx,
 	 * op6893 6.6 bring-up: DVFS is disabled when the DTB carries no
 	 * seninf opp table / dvfsrc-vcore (ctx->reg == NULL); skip all
 	 * voltage scaling and let seninf run at its default clock.
+	 *
+	 * We still MUST answer the ISP-clock query ioctls with a non-zero
+	 * value: the seninf HAL (SET_DFS_FOR_MUX) picks a mux/ISP clock from
+	 * the reported supported list and, if it comes back empty/0, computes
+	 * target_clk=0 -> "sensor mux will overrun" -> the CamIO resource
+	 * manager cannot attach a raw pipe (Res_Attach "can't be 0") and
+	 * configPipe fails with TG=0.  Report the fixed default ISP clock the
+	 * hardware actually runs at without MM-DVFS (624 MHz, matching the
+	 * cameraisp EP_PMQOS default in cam_qos.c), so the HAL sees a valid
+	 * clock and stops zeroing the TG.
 	 */
-	if (!ctx->reg)
+	if (!ctx->reg) {
+		const unsigned int def_isp_clk_mhz = 624;
+
+		switch (option) {
+		case DFS_SUPPORTED_ISP_CLOCKS:
+		{
+			struct IMAGESENSOR_GET_SUPPORTED_ISP_CLK *pIspclks =
+				(struct IMAGESENSOR_GET_SUPPORTED_ISP_CLK *) pbuff;
+
+			pIspclks->clklevelcnt = 1;
+			pIspclks->clklevel[0] = def_isp_clk_mhz;
+			break;
+		}
+		case DFS_CUR_ISP_CLOCK:
+			*(unsigned int *)pbuff = def_isp_clk_mhz;
+			break;
+		default:
+			/* DFS_UPDATE / ENABLE / DISABLE / RELEASE: no-op */
+			break;
+		}
 		return 0;
+	}
 
 	switch (option) {
 	case DFS_CTRL_ENABLE:

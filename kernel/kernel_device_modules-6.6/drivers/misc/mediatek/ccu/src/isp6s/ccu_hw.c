@@ -553,7 +553,17 @@ int ccu_power(struct ccu_power_s *power)
 
 		// #if defined(CONFIG_MTK_IOMMU_PGTABLE_EXT) && \
 		// (CONFIG_MTK_IOMMU_PGTABLE_EXT == 34)
-		ccu_write_reg_bit(ccu_base, CTRL, H2X_MSB, 1);
+		/*
+		 * op6893 6.6 bring-up: keep CCU in 32-bit addressing.  Our CCU
+		 * buffers are mapped through a borrowed pseudo-m4u port that hands
+		 * back 32-bit iovas (~0xf0000000).  With H2X_MSB=1 the CCU AXI
+		 * prepends bank bits (observed 0x2<<32) and accesses 0x2_f0xxxxxx,
+		 * which is unmapped -> mtk_iommu_isr translation fault -> firmware
+		 * never inits ("CCU init timeout").  4.19 paired H2X_MSB=1 with
+		 * ccu_config_m4u_port()/reserved-iova domain setup that we don't
+		 * have here; matching the buffer's 32-bit domain is simpler.
+		 */
+		ccu_write_reg_bit(ccu_base, CTRL, H2X_MSB, 0);
 		// #endif
 
 		/*use user space buffer*/

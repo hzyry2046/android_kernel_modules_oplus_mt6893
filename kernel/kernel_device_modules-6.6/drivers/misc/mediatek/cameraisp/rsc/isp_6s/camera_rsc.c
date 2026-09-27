@@ -3303,9 +3303,20 @@ static signed int RSC_probe(struct platform_device *pDev)
 		    /*CCF: Grab clock pointer (struct clk*) */
 		rsc_clk.CG_IPESYS_LARB20 = devm_clk_get(&pDev->dev, "RSC_CLK_IPE_LARB20");
 
+		/*
+		 * op6893 6.6 bring-up: the frozen 4.19 DTB's rsc node only names
+		 * "RSC_CLK_IPE_RSC".  Failing here aborted probe after the chrdev
+		 * was registered, so /dev/camera-rsc never appeared and the HAL's
+		 * RSC stage timed out every frame, starving the preview stream.
+		 * larb20 (with its scp-ipe MTCMOS and ipe-larb20 gate) is powered
+		 * through the mediatek,larb device link on pm_runtime_get_sync(),
+		 * so this gate is optional: NULL makes clk_prepare_enable() and
+		 * clk_disable_unprepare() no-ops.
+		 */
 		if (IS_ERR(rsc_clk.CG_IPESYS_LARB20)) {
-			LOG_ERR("cannot get CG_IPESYS_LARB20 clock\n");
-			return PTR_ERR(rsc_clk.CG_IPESYS_LARB20);
+			LOG_INF("no CG_IPESYS_LARB20 clock (%ld), larb20 via device link\n",
+				PTR_ERR(rsc_clk.CG_IPESYS_LARB20));
+			rsc_clk.CG_IPESYS_LARB20 = NULL;
 		}
 
 		rsc_clk.CG_IPESYS_RSC = devm_clk_get(&pDev->dev, "RSC_CLK_IPE_RSC");

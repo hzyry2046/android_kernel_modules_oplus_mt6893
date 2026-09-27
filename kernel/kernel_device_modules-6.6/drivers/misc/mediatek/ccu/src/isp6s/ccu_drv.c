@@ -104,10 +104,17 @@ static struct mtk_ccu_clk_name MT6877_ccu_clock_name[] = {
 	{false, ""}};
 
 static struct mtk_ccu_clk_name MT6893_ccu_clock_name[] = {
-	{true, "TOP_CCU_CLK"},
-	{true, "CCU_CLK_CAM_CAM"},
-	{true, "CCU_CLK_CAM_LARB13"},
-	{true, "CCU_CLK_CAM_CCU0"},
+	/*
+	 * op6893 6.6 bring-up: match the frozen 4.19 DTB ccu@1a101000
+	 * clock-names exactly (see 4.19 mt6893 ccu_drv.c, and the [0..3]
+	 * comment above). The upstream 6.6 names (TOP_CCU_CLK/CCU_CLK_CAM_CAM/
+	 * LARB13/CCU0) don't exist in this DTB, so devm_clk_get failed for all
+	 * of them -> CCU core never clocked -> ccu_run "CCU init timeout".
+	 */
+	{true, "CCU_CLK_TOP_MUX"},
+	{true, "MDP_PWR"},
+	{true, "CAM_PWR"},
+	{true, "CCU_CLK_CAM_CCU"},
 	{false, ""}};
 
 static struct mtk_ccu_clk_name clock_name[CCU_CLK_PWR_NUM];
@@ -726,19 +733,25 @@ int ccu_clock_enable(void)
 	}
 
 	/* TODO: still need smi_dev?*/
-	ret = pm_runtime_resume_and_get(g_ccu_device->smi_dev);
+	/* op6893 6.6 bring-up: smi_dev may be NULL when the DTB has no
+	 * mediatek,larbs; skip the SMI larb pm_runtime in that case.
+	 */
+	if (g_ccu_device->smi_dev) {
+		ret = pm_runtime_resume_and_get(g_ccu_device->smi_dev);
 
-	if (ret) {
-		LOG_ERR("mtk_smi_larb_get fail.\n");
-		--_clk_count;
-		mutex_unlock(&g_ccu_device->clk_mutex);
-		return ret;
+		if (ret) {
+			LOG_ERR("mtk_smi_larb_get fail.\n");
+			--_clk_count;
+			mutex_unlock(&g_ccu_device->clk_mutex);
+			return ret;
+		}
 	}
 
 	ret = pm_runtime_get_sync(g_ccu_device->dev);
 
 	if (ret) {
-		pm_runtime_put_sync(g_ccu_device->smi_dev);
+		if (g_ccu_device->smi_dev)
+			pm_runtime_put_sync(g_ccu_device->smi_dev);
 		LOG_ERR("pm_runtime_get_sync fail.\n");
 		--_clk_count;
 		mutex_unlock(&g_ccu_device->clk_mutex);
@@ -770,7 +783,8 @@ ERROR:
 		clk_disable_unprepare(ccu_clk_pwr_ctrl[i]);
 
 	pm_runtime_put_sync(g_ccu_device->dev);
-	pm_runtime_put_sync(g_ccu_device->smi_dev);
+	if (g_ccu_device->smi_dev)
+		pm_runtime_put_sync(g_ccu_device->smi_dev);
 
 	--_clk_count;
 #endif
@@ -791,7 +805,8 @@ void ccu_clock_disable(void)
 			clk_disable_unprepare(ccu_clk_pwr_ctrl[i]);
 
 		pm_runtime_put_sync(g_ccu_device->dev);
-		pm_runtime_put_sync(g_ccu_device->smi_dev);
+		if (g_ccu_device->smi_dev)
+			pm_runtime_put_sync(g_ccu_device->smi_dev);
 #ifdef CCU_QOS_SUPPORT_ENABLE
 		ccu_qos_uninit(g_ccu_device);
 #endif
@@ -1349,8 +1364,22 @@ static long ccu_ioctl(struct file *flip, unsigned int cmd,
 		LOG_ERR(
 			"[CCU_IOCTL_GET_IOVA] dma_buf_get va=%llx\n", (uint64_t)buf);
 		ccu_iova[iova_buf_count].dma_buf = buf;
-		ccu_iova[iova_buf_count].attach =
-			dma_buf_attach(ccu_iova[iova_buf_count].dma_buf, g_ccu_device->dev1);
+		{
+			/*
+			 * op6893 6.6 bring-up: map HAL dma-bufs through an
+			 * IOMMU-domain device (borrowed pseudo-m4u port) rather
+			 * than g_ccu_device->dev1, which has no IOMMU domain on
+			 * the frozen DTB and would hand back an unmapped/physical
+			 * address -> CCU faults (mtk_iommu_isr) reading e.g. the
+			 * CpuRef/Ctrl buffer during boot -> "CCU init timeout".
+			 */
+			struct device *iodev = ccu_iommu_dev();
+
+			if (!iodev)
+				iodev = g_ccu_device->dev1;
+			ccu_iova[iova_buf_count].attach =
+				dma_buf_attach(ccu_iova[iova_buf_count].dma_buf, iodev);
+		}
 		if (IS_ERR(ccu_iova[iova_buf_count].attach)) {
 			LOG_ERR(
 			"[CCU_IOCTL_GET_IOVA] dma_buf_attach failed, attach=%llx va=%llx\n",
@@ -1637,7 +1666,16 @@ static int ccu_read_platform_info_from_dt(struct device_node
 
 	ret = of_property_read_u32(node, "ccu_version", &ccu_version);
 	if (ret < 0)
-		ccu_version = CCU_VER_MT6833;
+		/*
+		 * op6893 6.6 bring-up: the frozen 4.19 DTB ccu node has no
+		 * "ccu_version" property, so this used to fall back to
+		 * CCU_VER_MT6833 and pick the 6-entry MT6833 clock table whose
+		 * names don't exist in this DTB -> every devm_clk_get failed ->
+		 * CCU core left unclocked -> "CCU init timeout".  This is an
+		 * mt6893, so default to MT6893 and use its (DTB-matched) 4-clock
+		 * table.
+		 */
+		ccu_version = CCU_VER_MT6893;
 
 	LOG_DBG("ccu mt%u read dt property ccu_hw_base = %x\n",
 		ccu_version, ccu_hw_base);
@@ -1751,8 +1789,21 @@ static int ccu_probe(struct platform_device *pdev)
 				break;
 			ccu_clk_pwr_ctrl[clki] = devm_clk_get(g_ccu_device->dev,
 				clock_name[clki].name);
-			if (IS_ERR(ccu_clk_pwr_ctrl[clki]))
+			if (IS_ERR(ccu_clk_pwr_ctrl[clki])) {
 				LOG_ERR("Get %s fail.\n", clock_name[clki].name);
+				/*
+				 * op6893 6.6 bring-up: the frozen 4.19 DTB ccu node
+				 * exposes different clock-names than this driver asks
+				 * for, so every devm_clk_get returns an ERR_PTR.
+				 * Storing that error pointer would later blow up in
+				 * ccu_clock_enable() -> clk_prepare_enable(ERR_PTR)
+				 * (Oops at clk_prepare, reboot). NULL it out instead;
+				 * clk_prepare_enable(NULL) is a safe no-op and the CCU
+				 * clocks are already powered by the camsys bulk-clock
+				 * patch (EP-style bring-up), so we don't need them here.
+				 */
+				ccu_clk_pwr_ctrl[clki] = NULL;
+			}
 		}
 
 		if (clki >= CCU_CLK_PWR_NUM) {
@@ -1765,24 +1816,36 @@ static int ccu_probe(struct platform_device *pdev)
 
 		pm_runtime_enable(g_ccu_device->dev);
 
+		/*
+		 * op6893 6.6 bring-up: the frozen 4.19 DTB ccu@1a101000 node has
+		 * no "mediatek,larbs" phandle (new-convention property missing).
+		 * The original code returns -ENODEV here, which aborts probe BEFORE
+		 * device_create() and so /dev/ccu is never created -> HAL CcuDrv
+		 * _openCcuKdrv fails (ENOENT) -> 3A/AE dead -> black preview + crash.
+		 * Treat the missing larb phandle as non-fatal (same class as the CAM
+		 * larb-shim): skip the SMI device_link and continue to device_create.
+		 * CCU power/clocks come from the bulk-clock/EP path, not this link.
+		 */
 		smi_node = of_parse_phandle(node, "mediatek,larbs", 0);
 		if (!smi_node) {
-			LOG_DERR(g_ccu_device->dev, "get smi larb from DTS fail!\n");
-			return -ENODEV;
-		}
-		smi_pdev = of_find_device_by_node(smi_node);
-		if (WARN_ON(!smi_pdev)) {
-			of_node_put(smi_node);
-			return -ENODEV;
-		}
-		of_node_put(smi_node);
+			LOG_INF_MUST("no mediatek,larbs in DTS, skip smi larb link (bring-up)\n");
+			g_ccu_device->smi_dev = NULL;
+		} else {
+			smi_pdev = of_find_device_by_node(smi_node);
+			if (WARN_ON(!smi_pdev)) {
+				of_node_put(smi_node);
+				g_ccu_device->smi_dev = NULL;
+			} else {
+				of_node_put(smi_node);
 
-		link = device_link_add(&pdev->dev, &smi_pdev->dev,
-				DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
-		if (!link)
-			LOG_ERR("Unable to link smi larb\n");
+				link = device_link_add(&pdev->dev, &smi_pdev->dev,
+						DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+				if (!link)
+					LOG_ERR("Unable to link smi larb\n");
 
-		g_ccu_device->smi_dev = &smi_pdev->dev;
+				g_ccu_device->smi_dev = &smi_pdev->dev;
+			}
+		}
 
 #ifdef CCU_QOS_SUPPORT_ENABLE
 		g_ccu_device->path_ccuo = of_mtk_icc_get(g_ccu_device->dev, "ccu_o");
@@ -1790,23 +1853,38 @@ static int ccu_probe(struct platform_device *pdev)
 		g_ccu_device->path_ccug = of_mtk_icc_get(g_ccu_device->dev, "ccu_g");
 #endif
 
+		/*
+		 * op6893 6.6 bring-up: frozen DTB has no "mediatek,ccu1" either.
+		 * The original code returns -ENODEV, again aborting before
+		 * device_create(). Make it non-fatal, and fall back to the main
+		 * ccu device for dev1 so CCU_IOCTL_GET_IOVA (dma_buf_attach) still
+		 * maps against a device that has the CCU iommu binding.
+		 * (This SoC uses a single CCU core in this bring-up; the 2nd core
+		 * handle is only used by dual-CCU paths we don't exercise yet.)
+		 */
 		ret = of_property_read_u32(node, "mediatek,ccu1",
 			&ccu1_phandle);
-		node1 = of_find_node_by_phandle(ccu1_phandle);
-		if (!node1) {
-			dev_err(dev, "failed to get ccu1 node handle\n");
-			return -ENODEV;
+		if (ret) {
+			LOG_INF_MUST("no mediatek,ccu1 in DTS, fall back dev1=dev (bring-up)\n");
+			g_ccu_device->dev1 = g_ccu_device->dev;
+		} else {
+			node1 = of_find_node_by_phandle(ccu1_phandle);
+			if (!node1) {
+				dev_err(dev, "failed to get ccu1 node handle, fall back dev1=dev\n");
+				g_ccu_device->dev1 = g_ccu_device->dev;
+			} else {
+				pdev1 = of_find_device_by_node(node1);
+				if (WARN_ON(!pdev1)) {
+					dev_err(dev, "failed to get ccu1 pdev, fall back dev1=dev\n");
+					of_node_put(node1);
+					g_ccu_device->dev1 = g_ccu_device->dev;
+				} else {
+					g_ccu_device->dev1 = &pdev1->dev;
+					LOG_INF("ccu1@0x%llx\n",
+						(uint64_t)g_ccu_device->dev1);
+				}
+			}
 		}
-
-		pdev1 = of_find_device_by_node(node1);
-		if (WARN_ON(!pdev1)) {
-			dev_err(dev, "failed to get ccu1 pdev\n");
-			of_node_put(node1);
-			return -ENODEV;
-		}
-
-		g_ccu_device->dev1 = &pdev1->dev;
-		LOG_INF("ccu1@0x%llx\n", (uint64_t)g_ccu_device->dev1);
 
 		g_ccu_device->irq_num = irq_of_parse_and_map(node, 0);
 		LOG_INF_MUST("probe 1, ccu_base: 0x%llx, bin_base: 0x%llx,",

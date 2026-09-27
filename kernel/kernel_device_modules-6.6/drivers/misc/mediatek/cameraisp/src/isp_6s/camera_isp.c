@@ -33,6 +33,8 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
+#include <linux/iommu.h>
 #include <linux/suspend.h>
 
 #include <soc/mediatek/smi.h>
@@ -412,6 +414,14 @@ struct ISP_CLK_STRUCT {
 	struct clk *ISP_TOP_MUX_CAMTM;
 };
 struct ISP_CLK_STRUCT isp_clk;
+
+/*
+ * op6893 6.6 bring-up: all cam power-gate domains + CG clocks hang off the
+ * camsys@1a000000 node; keep the bulk handle so they stay enabled for the
+ * driver's lifetime (see the clk_bulk_prepare_enable in ISP_probe).
+ */
+static struct clk_bulk_data *g_camsys_clks;
+static int g_camsys_clk_cnt;
 
 struct isp_device {
 	void __iomem *regs;
@@ -3881,6 +3891,37 @@ static int ISP_WaitIrq(struct ISP_WAIT_IRQ_STRUCT *WaitIrq)
 			WaitIrq->EventInfo.Status, WaitIrq->EventInfo.Timeout,
 			WaitIrq->EventInfo.UserKey);
 
+		/*
+		 * op6893 6.6 bring-up [SOFDBG]: on any WaitIrq timeout dump the
+		 * CAM_A raw TG state so we can see, from the kernel side, whether
+		 * the TG is actually armed to receive the seninf frame and whether
+		 * its SOF interrupt is unmasked -- devmem to these regs is blocked
+		 * by device_apc, so this is the only view.  TG_SEN_MODE=input mode,
+		 * TG_VF_CON=viewfinder on, TG_INTER_ST=TG state machine,
+		 * CTL_RAW_INT_EN=which CAM ints (incl SOF) are unmasked,
+		 * CTL_EN=engine enable, CG_CON=clock-gate status of RAWA.
+		 */
+		if (ISP_CAM_A_BASE) {
+			/*
+			 * [SOFDBG] distinguish "TG never generated SOF" from "SOF
+			 * generated but not delivered to GIC": read the raw INT STATUSX
+			 * (0x108, non-clearing shadow) -- if bit6 (SOF_INT_ST=0x40) is
+			 * latched there while cam1 /proc/interrupts stays 0, the CAM
+			 * raised SOF internally but it never reached the CPU (GIC/mask
+			 * problem); if it's 0, the TG is scanning but not hitting a
+			 * frame boundary (seninf not delivering frame-valid/vsync).
+			 */
+			LOG_NOTICE(
+			"[SOFDBG] CAM_A SEN_MODE(0x%08X) VF(0x%08X) INTER_ST(0x%08X) RAW_INT_EN(0x%08X) RAW_INT_STATUSX(0x%08X) RAW_INT2_STATUSX(0x%08X) CTL_EN(0x%08X)\n",
+			ISP_RD32(CAM_REG_TG_SEN_MODE(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_TG_VF_CON(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_TG_INTER_ST(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_CTL_RAW_INT_EN(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_CTL_RAW_INT_STATUSX(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_CTL_RAW_INT2_STATUSX(ISP_CAM_A_IDX)),
+			ISP_RD32(CAM_REG_CTL_EN(ISP_CAM_A_IDX)));
+		}
+
 		Ret = -EFAULT;
 		goto EXIT;
 	}
@@ -4274,6 +4315,165 @@ static inline void ISP_StopSVHW(unsigned int module)
 /*******************************************************************************
  *
  ******************************************************************************/
+/* ---------------------------------------------------------------------------
+ * op6893 6.6 bring-up: ion-buffer -> iova import for the legacy ISP HAL.
+ *
+ * The 4.19 isp_6s driver imported HAL ion buffers through the MTK ion + M4U
+ * client; that whole stack is gone on 6.6.  libcamdrv_isp.so still issues
+ * ISP_ION_IMPORT (_IOW('k',27,ISP_DEV_ION_NODE_STRUCT)) with memID = the
+ * dma-buf fd and expects the mapped iova back in dma_pa.  With no handler the
+ * ioctl fell through to default:"Unknown Cmd" (-EPERM) -> setDeviceInfo
+ * _set_ion_handle error -> Res_Attach == 0 -> configPipe -22 -> no frames.
+ *
+ * The cam/M4U page table is global on this SoC (see mtk_ion_compat), so a
+ * buffer mapped through any device that carries an IOMMU domain is reachable
+ * by the ISP DMA engines.  mtk_ion_compat's larb driver has already bound the
+ * `mediatek,mt-pseudo_m4u-port` nodes and given them domains; we borrow one
+ * such device for dma_buf_attach + dma_buf_map_attachment and hand back
+ * sg_dma_address() as the iova.  Mappings are tracked per-fd so ISP_ION_FREE
+ * and ISP_release can tear them down.
+ * -------------------------------------------------------------------------*/
+struct isp_ion_map {
+	struct list_head           list;
+	struct file               *filp;   /* owning fd, for teardown scoping */
+	int                        memID;  /* dma-buf fd as passed by the HAL */
+	struct dma_buf            *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table           *sgt;
+	dma_addr_t                 iova;
+	int                        refcnt;
+};
+
+static LIST_HEAD(g_isp_ion_maps);
+static DEFINE_MUTEX(g_isp_ion_lock);
+
+/* dma_buf_* live in the DMA_BUF symbol namespace. */
+MODULE_IMPORT_NS(DMA_BUF);
+
+/* A cam-domain device to attach dma-bufs to; cached after first lookup. */
+static struct device *isp_ion_dev(void)
+{
+	static struct device *cached;
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	if (cached)
+		return cached;
+
+	for_each_compatible_node(np, NULL, "mediatek,mt-pseudo_m4u-port") {
+		pdev = of_find_device_by_node(np);
+		if (pdev && iommu_get_domain_for_dev(&pdev->dev)) {
+			cached = &pdev->dev;
+			of_node_put(np);
+			return cached;
+		}
+	}
+	LOG_NOTICE("ion: no mt-pseudo_m4u-port dev with iommu domain (mtk_ion_compat loaded?)\n");
+	return NULL;
+}
+
+/* Map memID (a dma-buf fd) into the cam domain; caches by (filp, memID). */
+static int isp_ion_import(struct file *filp, int memID, dma_addr_t *out_iova)
+{
+	struct isp_ion_map *m;
+	struct device *dev;
+	struct dma_buf *dmabuf;
+	struct dma_buf_attachment *attach;
+	struct sg_table *sgt;
+
+	mutex_lock(&g_isp_ion_lock);
+	list_for_each_entry(m, &g_isp_ion_maps, list) {
+		if (m->filp == filp && m->memID == memID) {
+			m->refcnt++;
+			*out_iova = m->iova;
+			mutex_unlock(&g_isp_ion_lock);
+			return 0;
+		}
+	}
+	mutex_unlock(&g_isp_ion_lock);
+
+	dev = isp_ion_dev();
+	if (!dev)
+		return -ENODEV;
+
+	dmabuf = dma_buf_get(memID);
+	if (IS_ERR(dmabuf)) {
+		LOG_NOTICE("ion: dma_buf_get(fd=%d) failed %ld\n",
+			   memID, PTR_ERR(dmabuf));
+		return PTR_ERR(dmabuf);
+	}
+	attach = dma_buf_attach(dmabuf, dev);
+	if (IS_ERR(attach)) {
+		dma_buf_put(dmabuf);
+		return PTR_ERR(attach);
+	}
+	sgt = dma_buf_map_attachment(attach, DMA_BIDIRECTIONAL);
+	if (IS_ERR(sgt)) {
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return PTR_ERR(sgt);
+	}
+
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m) {
+		dma_buf_unmap_attachment(attach, sgt, DMA_BIDIRECTIONAL);
+		dma_buf_detach(dmabuf, attach);
+		dma_buf_put(dmabuf);
+		return -ENOMEM;
+	}
+	m->filp = filp;
+	m->memID = memID;
+	m->dmabuf = dmabuf;
+	m->attach = attach;
+	m->sgt = sgt;
+	m->iova = sg_dma_address(sgt->sgl);
+	m->refcnt = 1;
+
+	mutex_lock(&g_isp_ion_lock);
+	list_add(&m->list, &g_isp_ion_maps);
+	mutex_unlock(&g_isp_ion_lock);
+
+	*out_iova = m->iova;
+	return 0;
+}
+
+/* caller holds g_isp_ion_lock */
+static void isp_ion_unmap_locked(struct isp_ion_map *m)
+{
+	list_del(&m->list);
+	dma_buf_unmap_attachment(m->attach, m->sgt, DMA_BIDIRECTIONAL);
+	dma_buf_detach(m->dmabuf, m->attach);
+	dma_buf_put(m->dmabuf);
+	kfree(m);
+}
+
+static void isp_ion_free(struct file *filp, int memID)
+{
+	struct isp_ion_map *m, *tmp;
+
+	mutex_lock(&g_isp_ion_lock);
+	list_for_each_entry_safe(m, tmp, &g_isp_ion_maps, list) {
+		if (m->filp == filp && m->memID == memID) {
+			if (--m->refcnt <= 0)
+				isp_ion_unmap_locked(m);
+			break;
+		}
+	}
+	mutex_unlock(&g_isp_ion_lock);
+}
+
+static void isp_ion_free_all(struct file *filp)
+{
+	struct isp_ion_map *m, *tmp;
+
+	mutex_lock(&g_isp_ion_lock);
+	list_for_each_entry_safe(m, tmp, &g_isp_ion_maps, list) {
+		if (m->filp == filp)
+			isp_ion_unmap_locked(m);
+	}
+	mutex_unlock(&g_isp_ion_lock);
+}
+
 static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 {
 	int Ret = 0;
@@ -4499,8 +4699,19 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 				Ret = -EFAULT;
 				break;
 			}
+			/*
+			 * op6893 6.6 bring-up: under EP_NO_CLKMGR the HAL never
+			 * issues ISP_POWER_CTRL, so G_u4EnableClockCount stays 0
+			 * and this reset was always skipped.  After a session that
+			 * died mid-stream the CAM CQ kept the dead session's
+			 * descriptor base; the next VF-on fetched it through an
+			 * already-unmapped iova (m4u read fault) and P1 stalled
+			 * after one SOF.  camsys is held powered by the probe-time
+			 * bulk-clock enable (g_camsys_clk_cnt), so honour the reset.
+			 */
 			spin_lock(&(IspInfo.SpinLockClock));
-			if (G_u4EnableClockCount[dev_node_module] != 0) {
+			if (G_u4EnableClockCount[dev_node_module] != 0 ||
+			    g_camsys_clk_cnt > 0) {
 				spin_unlock(&(IspInfo.SpinLockClock));
 				ISP_Reset(dev_node_module);
 			} else {
@@ -4836,9 +5047,44 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 						"CAM_%d: vf already enabled\n",
 						module);
 				} else {
+					/*
+					 * op6893 6.6 bring-up: apply the CAM DMA
+					 * FIFO/DRS "urgent" control (IMGO/RRZO/PDO/
+					 * TSFSO CON/DRS, CQI_R2_DRS, CAMSYS HALT_EN)
+					 * here.  These normally come from
+					 * ISP_EnableClock()->ISP_ConfigDMAControl()
+					 * on the ISP_POWER_CTRL path, which the HAL
+					 * never calls under EP_NO_CLKMGR -> the CQ
+					 * read-DMA runs with reset-default thresholds
+					 * and "TrigCQ: RDMA fail" -> no valid SOF/P1
+					 * done -> ISP_WaitIrq timeout -> black+crash.
+					 * Re-apply on every VF off->on so it survives
+					 * the HAL's configPipe CAM reset.
+					 */
+					if (dev_node_idx <= ISP_CAM_C_IDX)
+						ISP_ConfigDMAControl(dev_node_idx);
 					ISP_WR32(
 						CAM_REG_TG_VF_CON(dev_node_idx),
 						(vf + 0x1));
+					/*
+					 * op6893 6.6 bring-up: unmask the CAM raw
+					 * IRQ here (VF off->on edge).  Under
+					 * EP_NO_CLKMGR ISP_EnableClock() is never
+					 * called, so the CCF enable_irq() path never
+					 * runs and the line stays masked -- the CAM
+					 * raises SOF (latched in RAW_INT_STATUSX bit6)
+					 * but it never reaches the CPU (cam1 count
+					 * stuck at 0, HAL "wait SOF fail").  Tying the
+					 * unmask to VF-on (and re-mask to VF-off
+					 * below) keeps it balanced across stream
+					 * start/stop.
+					 */
+					if (isp_devs[dev_node_idx].irq > 0) {
+						enable_irq(isp_devs[dev_node_idx].irq);
+						LOG_INF("CAM_%d enable_irq(%d) on VF-on\n",
+							module,
+							isp_devs[dev_node_idx].irq);
+					}
 					/*For RAWI DMA Err debug*/
 					ISP_WR32(CAM_REG_DBG_SET(ISP_CAM_A_IDX),
 						0x00040000);
@@ -4893,6 +5139,17 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 						CAM_REG_TG_VF_CON(dev_node_idx),
 						(vf - 0x1));
 					cq_recovery[module] = 0;
+					/*
+					 * op6893 6.6 bring-up: re-mask the CAM raw
+					 * IRQ on the VF on->off edge to balance the
+					 * enable_irq() done at VF-on above.
+					 */
+					if (isp_devs[dev_node_idx].irq > 0) {
+						disable_irq(isp_devs[dev_node_idx].irq);
+						LOG_INF("CAM_%d disable_irq(%d) on VF-off\n",
+							module,
+							isp_devs[dev_node_idx].irq);
+					}
 				} else {
 					LOG_NOTICE(
 						"CAM_%d: vf already disabled\n",
@@ -5743,6 +6000,48 @@ static long ISP_ioctl(struct file *pFile, unsigned int Cmd, unsigned long Param)
 			Ret = -EFAULT;
 		}
 	} break;
+	case ISP_ION_IMPORT:
+	case ISP_ION_MAP_PA:
+	case ISP_ION_GET_PA: {
+		struct ISP_DEV_ION_NODE_STRUCT node;
+		dma_addr_t iova = 0;
+
+		if (copy_from_user(&node, (void *)Param, sizeof(node)) != 0) {
+			LOG_NOTICE("ISP_ION_IMPORT copy_from_user failed\n");
+			Ret = -EFAULT;
+			break;
+		}
+		Ret = isp_ion_import(pFile, node.memID, &iova);
+		if (Ret == 0) {
+			node.dma_pa = (unsigned long long)iova;
+			if (copy_to_user((void *)Param, &node,
+					 sizeof(node)) != 0) {
+				LOG_NOTICE("ISP_ION_IMPORT copy_to_user failed\n");
+				Ret = -EFAULT;
+			}
+		} else {
+			LOG_NOTICE("ISP_ION_IMPORT memID=%d port=%d fail %d\n",
+				   node.memID, node.dmaPort, Ret);
+		}
+	} break;
+	case ISP_ION_FREE:
+	case ISP_ION_UNMAP_PA: {
+		struct ISP_DEV_ION_NODE_STRUCT node;
+
+		if (copy_from_user(&node, (void *)Param, sizeof(node)) != 0) {
+			LOG_NOTICE("ISP_ION_FREE copy_from_user failed\n");
+			Ret = -EFAULT;
+			break;
+		}
+		isp_ion_free(pFile, node.memID);
+	} break;
+	case ISP_ION_FREE_BY_HWMODULE:
+	case ISP_ION_UNMAP_PA_BY_HWMODULE:
+		/* Coarse per-module teardown is unsafe while other modules on
+		 * this fd still hold mappings; defer real teardown to
+		 * ISP_ION_FREE / ISP_release.  Ack so the HAL proceeds.
+		 */
+		break;
 	default: {
 		LOG_NOTICE("Unknown Cmd(%d)\n", Cmd);
 		Ret = -EPERM;
@@ -6174,6 +6473,9 @@ static int ISP_release(struct inode *pInode, struct file *pFile)
 	mutex_lock(&open_isp_mutex);
 	LOG_DBG("- E. UserCount: %d.\n", IspInfo.UserCount);
 
+	/* Release any ion buffers this fd imported via ISP_ION_IMPORT. */
+	isp_ion_free_all(pFile);
+
 	/*  */
 	/* LOG_DBG("UserCount(%d)",IspInfo.UserCount); */
 	/*  */
@@ -6582,6 +6884,61 @@ static void ISP_add_device_link(struct platform_device *pDev)
 	LOG_INF("larb_num: %d; (%d, %d)\n", larb_num, mtk_larb, mtk_larbs);
 
 	if (larb_num <= 0) {
+		/*
+		 * op6893 6.6 bring-up: the frozen 4.19 DTB's cam nodes carry no
+		 * mediatek,larb(s) phandle, so the CAM raw engine never links to
+		 * its SMI larb.  The larb device binds fine (via the added
+		 * "mediatek,smi_larb" of_match in mtk-smi.c) but stays
+		 * runtime-suspended -> the RAWA SMI datapath and its
+		 * SCP_SYS_RAWA power / port config never come up -> the CAM TG
+		 * has VF on and data at cam_mux but never advances a frame
+		 * (cam1 IRQ stays 0, HAL sees "wait SOF fail").  Fall back to the
+		 * fixed mt6893 mapping and force-resume the larb(s) for the
+		 * driver's lifetime (cam1->larb16/RAWA, cam2->larb17/RAWB,
+		 * cam3->larb18/RAWC, camsys top->larb13/14/15), which pulls up
+		 * their clocks (incl. the scpsys MTCMOS "clock") and applies the
+		 * SMI port setup.
+		 */
+		static const char * const cam_larb_map[][4] = {
+			{"cam1",   "mediatek,smi_larb16", NULL, NULL},
+			{"cam2",   "mediatek,smi_larb17", NULL, NULL},
+			{"cam3",   "mediatek,smi_larb18", NULL, NULL},
+			{"camsys", "mediatek,smi_larb13", "mediatek,smi_larb14",
+				   "mediatek,smi_larb15"},
+		};
+		const char *nm = pDev->dev.of_node->name;
+		int m, k;
+
+		for (m = 0; m < (int)ARRAY_SIZE(cam_larb_map); m++) {
+			if (strcmp(nm, cam_larb_map[m][0]) != 0)
+				continue;
+			for (k = 1; k < 4 && cam_larb_map[m][k]; k++) {
+				struct device_node *ln =
+					of_find_compatible_node(NULL, NULL,
+						cam_larb_map[m][k]);
+				struct platform_device *lp;
+				struct device_link *dl;
+
+				if (!ln) {
+					LOG_NOTICE("larb-shim: no node %s\n",
+						cam_larb_map[m][k]);
+					continue;
+				}
+				lp = of_find_device_by_node(ln);
+				of_node_put(ln);
+				if (!lp) {
+					LOG_NOTICE("larb-shim: no pdev %s\n",
+						cam_larb_map[m][k]);
+					continue;
+				}
+				dl = device_link_add(&pDev->dev, &lp->dev,
+					DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+				pm_runtime_get_sync(&lp->dev);
+				LOG_INF("larb-shim: %s -> %s link=%d resumed\n",
+					nm, cam_larb_map[m][k], !!dl);
+			}
+			return;
+		}
 		LOG_INF("%s: find no larb", pDev->dev.of_node->name);
 		return;
 	}
@@ -6679,6 +7036,35 @@ static int ISP_probe(struct platform_device *pDev)
 		atomic_read(&G_u4DevNodeCt),
 		pDev->dev.of_node->name,
 		(unsigned long)isp_devs[dev_idx].regs);
+
+	/*
+	 * op6893 6.6 bring-up: the frozen 4.19 DTB carries no power-domains
+	 * phandle on the cam nodes, and EP_NO_CLKMGR compiles out
+	 * Prepare_Enable_ccf_clock, so the CAM MTCMOS domains (exposed as the
+	 * scpsys "ISP_SCP_SYS_*" power-gate clocks on camsys@1a000000, ahead of
+	 * the CAMSYS_*_CGPDN gates) were never powered.  CAM_A/B/C then read back
+	 * "module is power off", P1 configPipe blocked in DrvCfg and failed -22.
+	 * The legacy HAL never issues ISP_POWER_CTRL on this path, so bring the
+	 * whole camsys clock/domain tree up here and keep it up for the driver's
+	 * lifetime.  DT order puts the power domains first, matching the required
+	 * "PM domain -> CG clock" enable order.
+	 */
+	if (dev_idx == ISP_CAMSYS_CONFIG_IDX) {
+		int n = devm_clk_bulk_get_all(&pDev->dev, &g_camsys_clks);
+
+		if (n > 0) {
+			int r = clk_bulk_prepare_enable(n, g_camsys_clks);
+
+			if (r)
+				LOG_NOTICE("camsys clk_bulk_prepare_enable fail %d\n", r);
+			else {
+				g_camsys_clk_cnt = n;
+				LOG_INF("camsys: powered on %d clocks/domains\n", n);
+			}
+		} else {
+			LOG_NOTICE("camsys devm_clk_bulk_get_all -> %d\n", n);
+		}
+	}
 #ifndef EP_NO_CLKMGR /* MTCMOS */
 	if ((strncmp(pDev->dev.of_node->name, "cam1_legacy", strlen("cam1_legacy")) == 0) ||
 		(strncmp(pDev->dev.of_node->name, "cam2_legacy", strlen("cam2_legacy")) == 0) ||
@@ -6732,8 +7118,24 @@ static int ISP_probe(struct platform_device *pDev)
 					return Ret;
 				}
 
+#ifndef EP_NO_CLKMGR
 				/* Reset irq ref cnt after request_irq by disable_irq. */
 				disable_irq(isp_devs[dev_idx].irq);
+#else
+				/*
+				 * op6893 6.6 bring-up: with EP_NO_CLKMGR the CAM clocks are
+				 * force-on at probe (bulk-clock patch) and ISP_EnableClock()
+				 * is never invoked by the HAL (no "camsyscg" ever logged),
+				 * so the CCF enable_irq() path that would undo this
+				 * disable_irq() never runs -> the CAM TG interrupt would stay
+				 * masked forever and SOF never reaches the handler
+				 * (cam1/2/3 irq count stuck at 0, HAL loops "wait SOF fail").
+				 * Leave the IRQ enabled after request_irq() to match the
+				 * always-on clock model.
+				 */
+				LOG_INF("keep irq enabled (EP_NO_CLKMGR) cam node %s irq=%d\n",
+					pDev->dev.of_node->name, isp_devs[dev_idx].irq);
+#endif
 
 				LOG_INF(
 				"G_u4DevNodeCt=%d, devnode(%s), irq=%d, ISR: %s\n",

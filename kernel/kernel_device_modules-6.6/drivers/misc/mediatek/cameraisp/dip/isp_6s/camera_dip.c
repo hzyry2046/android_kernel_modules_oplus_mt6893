@@ -31,6 +31,7 @@
 #include <linux/seq_file.h>
 #include <linux/dma-mapping.h>
 #include <linux/dma-buf.h>
+#include <linux/iommu.h>
 #include <linux/pm_runtime.h>
 #include <linux/suspend.h>
 #include <linux/rtc.h>
@@ -466,6 +467,35 @@ struct dip_device {
 static struct dip_device *dip_devs;
 static int nr_dip_devs;
 #endif
+
+/*
+ * op6893 6.6 bring-up: the DIP nodes carry no `iommus` in the frozen 4.19 DTB,
+ * so dma_buf_attach(dip_devs->dev) would hand back a *physical* address and the
+ * DIP DMA engines (which go through larb -> M4U) would fault.  The cam/M4U page
+ * table is global on this SoC, so borrow a `mediatek,mt-pseudo_m4u-port` device
+ * that mtk_ion_compat's larb driver has already bound and given an IOMMU domain
+ * (same trick as camera_isp's ISP_ION_IMPORT).  Cached after first lookup.
+ */
+static struct device *dip_ion_dev(void)
+{
+	static struct device *cached;
+	struct device_node *np;
+	struct platform_device *pdev;
+
+	if (cached)
+		return cached;
+
+	for_each_compatible_node(np, NULL, "mediatek,mt-pseudo_m4u-port") {
+		pdev = of_find_device_by_node(np);
+		if (pdev && iommu_get_domain_for_dev(&pdev->dev)) {
+			cached = &pdev->dev;
+			of_node_put(np);
+			return cached;
+		}
+	}
+	LOG_ERR("dip: no mt-pseudo_m4u-port dev with iommu domain (mtk_ion_compat loaded?)\n");
+	return NULL;
+}
 
 
 #ifndef CONFIG_FPGA_EARLY_PORTING
@@ -6355,7 +6385,7 @@ static long DIP_ioctl(
 				dip_ion_list->fd = ion_mem_info.buf_fd;
 				dip_ion_list->buf = dma_buf_get(ion_mem_info.buf_fd);
 				dip_ion_list->attach = dma_buf_attach(dip_ion_list->buf,
-						dip_devs->dev);
+						dip_ion_dev());
 				dip_ion_list->sgt = dma_buf_map_attachment_unlocked(dip_ion_list->attach,
 						DMA_BIDIRECTIONAL);
 				dip_ion_list->dma_addr =
@@ -7172,6 +7202,70 @@ static void DIP_add_device_link(struct platform_device *pDev)
 		LOG_INF("WPE larb_num: %d; (%d, %d)\n", larb_num, mtk_larb, mtk_larbs);
 
 		if (larb_num <= 0) {
+			/*
+			 * op6893 6.6 bring-up: the frozen 4.19 DTB's imgsys/dip
+			 * nodes carry no mediatek,larb(s) phandle, so the DIP/P2
+			 * engine never links to its SMI larb.  The larb device
+			 * binds fine (via the "mediatek,smi_larb" of_match in
+			 * mtk-smi.c) but stays runtime-suspended -> the imgsys SMI
+			 * datapath and its scpsys MTCMOS power never come up -> the
+			 * DIP DMA/compute never completes -> GCE event 33 never
+			 * fires -> CMDQ thread 12 WFE timeout -> HAL "S_P2A: Frame
+			 * has not dequed TIMEOUT".  Mirror the CAM larb-shim: fall
+			 * back to the fixed mt6893 mapping and force-resume the
+			 * larb(s) for the driver's lifetime (imgsys/dip1 -> larb9,
+			 * imgsys2/dip2 -> larb11), which pulls up their clocks
+			 * (incl. the scpsys MTCMOS "clock") and applies SMI port
+			 * setup.  Same pattern as camera_isp.c DIP_add_device_link.
+			 */
+			/*
+			 * imgsys_config carries the CG clocks of *both* imgsys1
+			 * and imgsys2 (DIP_CG_IMG_LARB11/DIP2 are imgsys2 gates),
+			 * so it must bring up both MTCMOS domains (larb9 ->
+			 * scp-isp, larb11 -> scp-isp2) before DIP_probe
+			 * bulk-enables them; see the call site.
+			 */
+			static const char * const dip_larb_map[][3] = {
+				{"imgsys_config",  "mediatek,smi_larb9",
+						   "mediatek,smi_larb11"},
+				{"dip_a0",         "mediatek,smi_larb9", NULL},
+				{"imgsys2_config", "mediatek,smi_larb11", NULL},
+				{"dip_b0",         "mediatek,smi_larb11", NULL},
+			};
+			const char *nm = pDev->dev.of_node->name;
+			int m, k;
+
+			for (m = 0; m < (int)ARRAY_SIZE(dip_larb_map); m++) {
+				if (strcmp(nm, dip_larb_map[m][0]) != 0)
+					continue;
+
+				for (k = 1; k < 3 && dip_larb_map[m][k]; k++) {
+					struct device_node *ln;
+					struct platform_device *lp;
+					struct device_link *dl;
+
+					ln = of_find_compatible_node(NULL, NULL,
+							dip_larb_map[m][k]);
+					if (!ln) {
+						LOG_ERR("DIP larb-shim: no node %s\n",
+							dip_larb_map[m][k]);
+						continue;
+					}
+					lp = of_find_device_by_node(ln);
+					of_node_put(ln);
+					if (!lp) {
+						LOG_ERR("DIP larb-shim: no pdev %s\n",
+							dip_larb_map[m][k]);
+						continue;
+					}
+					dl = device_link_add(&pDev->dev, &lp->dev,
+						DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);
+					pm_runtime_get_sync(&lp->dev);
+					LOG_INF("DIP larb-shim: %s -> %s link=%d resumed\n",
+						nm, dip_larb_map[m][k], !!dl);
+				}
+				return;
+			}
 			LOG_ERR("WPE %s: find no larb", pDev->dev.of_node->name);
 			return;
 			}
@@ -7318,6 +7412,42 @@ static signed int DIP_probe(struct platform_device *pDev)
 		pDev->dev.of_node->name,
 		(unsigned long)dip_dev->regs);
 
+	/*
+	 * op6893 6.6 bring-up: EP_NO_CLKMGR compiles out the devm_clk_get path,
+	 * so the DIP_CG_IMG_* gates (all hung off imgsys_config@15020000) were
+	 * never ungated -> DIP registers dead, P2 config failed.  The frozen DTB
+	 * has no power-domains phandle here either.  Bulk-enable whatever clocks
+	 * this node carries and keep them up for the driver's lifetime; nodes
+	 * without a `clocks` property return 0 and are a no-op.
+	 */
+	/*
+	 * The larb-shim must run first: resuming larb9/larb11 is what powers the
+	 * ISP/ISP2 MTCMOS domains (their "scp-isp"/"scp-isp2" clocks).  Enabling
+	 * the imgsys CG gates while a domain is still off writes CG_CLR into an
+	 * unpowered block; the domain then comes up with every CG at its gated
+	 * default while CCF believes the gates are on and never rewrites them.
+	 * Measured: imgsys1 CG_CON=0xfffffffe (only LARB9, which larb9's own
+	 * resume re-enabled), DIP gated -> all DIP regs read 0, GCE never gets
+	 * IMG1 TX_FRAME_DONE_0 (event 33), P2 frame never dequeues.
+	 */
+	DIP_add_device_link(pDev);
+
+	{
+		struct clk_bulk_data *dip_clks = NULL;
+		int nclk = devm_clk_bulk_get_all(&pDev->dev, &dip_clks);
+
+		if (nclk > 0) {
+			int r = clk_bulk_prepare_enable(nclk, dip_clks);
+
+			if (r)
+				LOG_ERR("dip %s: clk_bulk_prepare_enable fail %d\n",
+					pDev->dev.of_node->name, r);
+			else
+				LOG_INF("dip %s: powered on %d clocks\n",
+					pDev->dev.of_node->name, nclk);
+		}
+	}
+
 	/* get IRQ ID and request IRQ */
 	dip_dev->irq = irq_of_parse_and_map(pDev->dev.of_node, 0);
 
@@ -7390,8 +7520,7 @@ static signed int DIP_probe(struct platform_device *pDev)
 		msf_base_hw = 0x15810000;
 	}
 	max_tdr_no = MAX_ISP_TILE_TDR_TOTAL_HEXNO * mtk_dip_count;
-
-	DIP_add_device_link(pDev);
+	/* DIP_add_device_link() moved ahead of the bulk-clock enable, see there */
 
 	/* Only register char driver in the 1st time */
 	if (nr_dip_devs == 1) {

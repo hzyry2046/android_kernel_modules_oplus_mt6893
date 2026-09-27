@@ -37,4 +37,10 @@ int ccu_allocate_mem(struct ccu_device_s *dev, struct CcuMemHandle *memHandle,
 			 int size, bool cached);
 int ccu_deallocate_mem(struct ccu_device_s *dev, struct CcuMemHandle *memHandle);
 struct CcuMemInfo *ccu_get_binary_memory(void);
+/*
+ * op6893 6.6 bring-up: a device carrying an IOMMU domain (borrowed pseudo-m4u
+ * port) for CCU dma_alloc / dma_buf_attach, so CCU buffers get real iovas the
+ * CCU DMA engines can reach. Returns NULL if none is available.
+ */
+struct device *ccu_iommu_dev(void);
 #endif

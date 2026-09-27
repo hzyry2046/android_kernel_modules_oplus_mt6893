@@ -823,6 +823,8 @@ unsigned int mtk_dfs_get_cur_freq(void)
 
 #define mtk_dfs_clr()	do { \
 	int volt = 0, ret = 0; \
+	if (!mmdvfsRegulator) \
+		break; \
 	ret = regulator_set_voltage(mmdvfsRegulator, volt, INT_MAX);\
 	if (ret) \
 		LOG_NOTICE("Error: E_CLK_UPDATE fail\n"); \
@@ -834,8 +836,19 @@ unsigned int mtk_dfs_get_cur_freq(void)
 	opp = dev_pm_opp_find_freq_ceil(mmdvfsDev, &clk); \
 	if (IS_ERR(opp)) \
 		opp = dev_pm_opp_find_freq_floor(mmdvfsDev, &clk); \
+	if (IS_ERR(opp)) { \
+		/* op6893 6.6 bring-up: the 4.19 DTB has no camera MM-DVFS opp \
+		 * table, so both ceil/floor lookups return ERR_PTR.  Calling \
+		 * dev_pm_opp_get_voltage()/dev_pm_opp_put() on that pointer \
+		 * NULL-derefs and panics the kernel the moment the HAL sets a \
+		 * clock (now that E_CLK_SUPPORTED reports a default clock).  No \
+		 * opp table just means no voltage scaling -- skip it. */ \
+		break; \
+	} \
 	volt = dev_pm_opp_get_voltage(opp); \
 	dev_pm_opp_put(opp); \
+	if (!mmdvfsRegulator) \
+		break; \
 	ret = regulator_set_voltage(mmdvfsRegulator, volt, INT_MAX);\
 	if (ret) \
 		LOG_NOTICE("Error: E_CLK_UPDATE fail\n"); \
@@ -999,6 +1012,25 @@ int ISP_SetPMQOS(
 		if (num_available > 0)
 			target_clk = pvalue[num_available - 1];
 
+		/*
+		 * op6893 6.6 bring-up: the 4.19 DTB carries no camera MM-DVFS
+		 * opp table, so num_available is 0 and the supported-clock list
+		 * comes back EMPTY.  The mtkcam pipeline resource manager reads
+		 * this list to size the CAM/ISP raw pipe; an empty list means it
+		 * cannot place a raw pipe on any TG -> camResConfig.targetTG=0 ->
+		 * NormalPipe "Unknown tg (0)" / ResMgr Res_Attach "can't be 0" ->
+		 * configPipe -22.  Report the fixed default ISP clock the hardware
+		 * runs at without MM-DVFS (624 MHz, the same value the EP_PMQOS
+		 * build reports above), so the resource manager sees a usable
+		 * clock and allocates a valid TG.
+		 */
+		if (num_available == 0) {
+			pvalue[0] = target_clk = 624;
+			LOG_INF("no MM-DVFS opp; report default ISP clk %d MHz\n",
+				pvalue[0]);
+			return 1;
+		}
+
 		for (i = 0 ; i < num_available; i++) {
 			int tmp = 0;
 
@@ -1042,6 +1074,13 @@ int ISP_SetPMQOS(
 		do_div(pvalue[0], 1000000);
 #endif
 #endif
+		/*
+		 * op6893 6.6 bring-up: without an MM-DVFS opp table mtk_dfs_cur()
+		 * reports 0; fall back to the default ISP clock so callers never
+		 * see a current clock of 0 (see E_CLK_SUPPORTED above).
+		 */
+		if (pvalue[0] == 0)
+			pvalue[0] = target_clk ? target_clk : 624;
 		pvalue[1] = (unsigned int)target_clk;
 		LOG_INF("cur clk:%d MHz,tar clk:%d MHz\n", pvalue[0], pvalue[1]);
 	}
@@ -1151,6 +1190,13 @@ int SV_SetPMQOS(
 		do_div(pvalue[0], 1000000);
 #endif
 #endif
+		/*
+		 * op6893 6.6 bring-up: without an MM-DVFS opp table mtk_dfs_cur()
+		 * reports 0; fall back to the default ISP clock so callers never
+		 * see a current clock of 0 (see E_CLK_SUPPORTED above).
+		 */
+		if (pvalue[0] == 0)
+			pvalue[0] = target_clk ? target_clk : 624;
 		pvalue[1] = (unsigned int)target_clk;
 		LOG_INF("cur clk:%d MHz,tar clk:%d MHz\n", pvalue[0], pvalue[1]);
 	}
@@ -1217,6 +1263,14 @@ int SV_SetPMQOS(
 		}
 		if (num_available > 0)
 			target_clk = pvalue[num_available - 1];
+
+		/* op6893 6.6 bring-up: no MM-DVFS opp -> report default ISP clk
+		 * (see the matching fallback in ISP_SetPMQOS E_CLK_SUPPORTED).
+		 */
+		if (num_available == 0) {
+			pvalue[0] = target_clk = 624;
+			return 1;
+		}
 
 		for (i = 0 ; i < num_available; i++)
 			LOG_INF("2:DFS Clk_%d:%d MHz\n", i, pvalue[i]);
@@ -1372,6 +1426,19 @@ static int cam_qos_probe(struct platform_device *pdev)
 	dev_pm_opp_of_add_table(&pdev->dev);
 	mmdvfsDev = &pdev->dev;
 	mmdvfsRegulator = devm_regulator_get(&pdev->dev, "dvfsrc-vcore");
+	/*
+	 * op6893 6.6 bring-up: the 4.19 DTB has no dvfsrc-vcore supply on the
+	 * cam_qos node, so devm_regulator_get can hand back an ERR_PTR.  Every
+	 * mtk_dfs_*() voltage call passes this straight to regulator_set_voltage
+	 * and NULL-derefs (panic in ISP_SetPMQOS the moment the HAL scales the
+	 * clock at stream start).  Normalise to NULL and let the call sites skip
+	 * voltage scaling when there is no regulator.
+	 */
+	if (IS_ERR(mmdvfsRegulator)) {
+		dev_info(&pdev->dev, "no dvfsrc-vcore (%ld), MM-DVFS voltage scaling disabled\n",
+			PTR_ERR(mmdvfsRegulator));
+		mmdvfsRegulator = NULL;
+	}
 #endif
 
 	/* parse m4u port from dts. */

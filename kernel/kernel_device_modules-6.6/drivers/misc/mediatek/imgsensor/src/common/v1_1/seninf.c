@@ -39,6 +39,7 @@
 #include "kd_imgsensor_errcode.h"
 #include "imgsensor_ca.h"
 #include <linux/delay.h>
+#include <linux/debugfs.h>
 #include "platform_common.h"
 
 
@@ -70,12 +71,29 @@ MINT32 seninf_dump_reg(void)
 	int i = 0;
 	int k = 0;
 	unsigned int seninf_max_num = 0;
+
+	if (!gseninf.pseninf_base[0]) {
+		PK_PR_ERR("- E. pseninf_base[0]=NULL (seninf not probed?)\n");
+		return -1;
+	}
 	PK_PR_ERR("- E.");
 	/*Sensor interface Top mux and Package counter */
 	PK_PR_ERR(
 	"seninf_top: SENINF_TOP_MUX_CTROL_0(0x%x) SENINF_TOP_MUX_CTROL_1(0x%x)\n",
 	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0010),
 	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0014));
+
+	/* CAM_MUX_CTRL_0..3: 每 word 装 4 个 cam_mux 的 4-bit TG 域
+	 * (mux0=[3:0] mux1=[11:8] mux2=[19:16] mux3=[27:24]);
+	 * CTRL_0=mux0-3 CTRL_1=mux4-7 CTRL_2=mux8-11 CTRL_3=mux12.
+	 * TgInfo=0 ⇒ 对应 mux 的 4-bit 域读回 0 (定位 tg=0 用). */
+	PK_PR_ERR(
+	"seninf_cam_mux_tg: CTRL_0/mux0-3(0x%x) CTRL_1/mux4-7(0x%x) CTRL_2/mux8-11(0x%x) CTRL_3/mux12(0x%x) MUX0_OPT(0x%x)\n",
+	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0400),
+	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0404),
+	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0408),
+	     SENINF_RD32(gseninf.pseninf_base[0] + 0x040C),
+	     SENINF_RD32(gseninf.pseninf_base[0] + 0x0420));
 
 	PK_PR_ERR(
 	"seninf_cam_mux: SENINF_CAM_MUX_CTRL1(0x%x) SENINF_CAM_MUX_CTRL2(0x%x) SENINF_CAM_MUX_IRQ_EN(0x%x) SENINF_CAM_MUX_IRQ_STATUS(0x%x)\n",
@@ -354,6 +372,24 @@ static long seninf_ioctl(struct file *pfile,
 			preg->gpio.map_addr = SENINF_MAP_BASE_GPIO;
 			preg->gpio.map_length = SENINF_MAP_LENGTH_GPIO;
 		}
+		/* [TGDBG] 临时验证:CAM_MUX_CTRL_0(+0x400) 的 nibble[mux] = cam_mux
+		 * 绑定的 CAM TG。硬件复位默认是恒等 0x03020100,即 cam_mux0->TG0;
+		 * HAL 的 getSeninfCamTGMuxCtrl(0) 读回低 4bit=0 -> SensorDynamicInfo.
+		 * TgInfo=0 -> NormalPipe "Unknown tg(0)" -> Res_Attach can't be 0 ->
+		 * configPipe -22。本轮实测确认取流全程该寄存器都停在恒等默认(HAL 从
+		 * 不调用 setSeninfCamTGMuxCtrl)。这里在 HAL 映射寄存器时(早于
+		 * ae_mgr getSensorDynamicInfo)把 mux0 绑到 TG1,验证是否解开 configPipe。 */
+		if (gseninf.pseninf_base[0]) {
+			unsigned int v =
+				SENINF_RD32(gseninf.pseninf_base[0] + 0x0400);
+			if ((v & 0xf) == 0) {
+				v = (v & ~0xfu) | 0x1u;
+				SENINF_WR32(gseninf.pseninf_base[0] + 0x0400, v);
+				PK_PR_ERR(
+				"[TGDBG] force CAM_MUX_CTRL_0 mux0->TG1 = 0x%x\n",
+				v);
+			}
+		}
 		break;
 
 	case KDSENINFIOC_X_SET_MCLK_PLL:
@@ -590,6 +626,21 @@ static int seninf_pm_runtime_disable(struct SENINF *seninf)
 }
 #endif
 
+/* debugfs 触发 seninf_dump_reg()：相机尝试期间 cat /sys/kernel/debug/seninf_cammux
+ * 把 CAM_MUX_CTRL_0..3(cam_mux→TG 4-bit 域) 打进 dmesg，定位 TgInfo=0. */
+static ssize_t seninf_cammux_dbg_read(struct file *f, char __user *ubuf,
+		size_t cnt, loff_t *ppos)
+{
+	if (*ppos)
+		return 0;
+	seninf_dump_reg();
+	return 0;
+}
+static const struct file_operations seninf_cammux_dbg_fops = {
+	.owner = THIS_MODULE,
+	.read = seninf_cammux_dbg_read,
+};
+
 static MINT32 seninf_probe(struct platform_device *pDev)
 {
 	struct SENINF *pseninf = &gseninf;
@@ -598,8 +649,8 @@ static MINT32 seninf_probe(struct platform_device *pDev)
 	int irq;
 
 	seninf_reg_char_dev(pseninf);
-
-	mutex_init(&pseninf->seninf_mutex);
+	debugfs_create_file("seninf_cammux", 0444, NULL, NULL,
+			&seninf_cammux_dbg_fops);
 	atomic_set(&pseninf->seninf_open_cnt, 0);
 	pseninf->dev = &pDev->dev;
 

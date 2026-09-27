@@ -434,6 +434,13 @@ imgsensor_sensor_feature_control(
 #endif
 		ret = psensor_func->SensorFeatureControl(
 			FeatureId, pFeaturePara, pFeatureParaLen);
+		/* [FEATDBG] 记录 idx=0 主 sensor 每个 feature 请求 + 返回,
+		 * 用于对齐 HAL 配置序列、找 TgInfo 未及时填充的缺口 sensor feature */
+		if (psensor_inst->sensor_idx == 0)
+			pr_info("[FEATDBG] idx0 feat=%u ret=%d state=%d len=%u\n",
+				(unsigned int)FeatureId, ret,
+				psensor_inst->state,
+				pFeatureParaLen ? *pFeatureParaLen : 0);
 #if defined(CONFIG_MTK_CAM_SECURE_I2C)
 	}
 #endif
@@ -1467,6 +1474,14 @@ static inline int adopt_CAMERA_HW_FeatureControl(void *pBuf)
 					pFeatureCtrl->FeatureId,
 					(unsigned char *)pFeaturePara,
 					(unsigned int *)&FeatureParaLen);
+
+			/* tg=0 定位：看 sensor 是否真填了 VC_INFO2 及首条 VC_FEATURE */
+			pr_info("[VCDBG] GET_VC_INFO2 idx=%d ret=%d VC_Num=%d vc0.FEATURE=%d vc0.DT=0x%x\n",
+				psensor->inst.sensor_idx,
+				ret, pVcInfo2->VC_Num,
+				pVcInfo2->vc_info[0].VC_FEATURE,
+				pVcInfo2->vc_info[0].VC_DataType);
+
 
 			if (copy_to_user
 			    ((void __user *)usr_ptr, (void *)pVcInfo2,
