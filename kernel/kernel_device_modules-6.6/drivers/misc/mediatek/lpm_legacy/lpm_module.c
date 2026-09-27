@@ -364,7 +364,22 @@ static int lpm_cpuidle_prepare(struct cpuidle_driver *drv, int index)
 	return veto;
 }
 
-static void lpm_cpuidle_resume(struct cpuidle_driver *drv, int index, int ret)
+/*
+ * @ct_index is the state the cpuidle core actually selected, and the only one
+ * whose CPUIDLE_FLAG_RCU_IDLE says who owns RCU-idle for this entry.  It
+ * differs from @index when a model vetoed and lpm_state_enter() demoted the
+ * entry to WFI (index 0).  op6893: this used to test states[index] -- i.e.
+ * WFI, which has no RCU_IDLE -- and so ran ct_cpuidle_exit()/ct_cpuidle_enter()
+ * around the notifiers while RCU was already watching.  That pair is not a
+ * no-op: the exit bumps dynticks_nesting 1->2 and the enter drops it back but
+ * crowbars dynticks_nmi_nesting to 0, leaving the CPU "watching, yet in no
+ * interrupt nesting".  Its next idle entry then WARNed in ct_kernel_exit()
+ * (context_tracking.c:128) and a tick on it in rcu/tree.c:371 -- the two
+ * warnings that had been blamed on MCUSYS-off, and that fired on every boot
+ * the oneshot veto was demoting entries.
+ */
+static void lpm_cpuidle_resume(struct cpuidle_driver *drv, int index,
+			       int ct_index, int ret)
 {
 	struct lpm_models *lpmmods = NULL;
 	struct lpm_model *lpm = NULL;
@@ -376,7 +391,7 @@ static void lpm_cpuidle_resume(struct cpuidle_driver *drv, int index, int ret)
 
 	if (index < 0)
 		return;
-	target_state = &drv->states[index];
+	target_state = &drv->states[ct_index];
 	lpmmods = this_cpu_ptr(&lpm_mods);
 
 	if (lpmmods && lpmmods->mod[index])
@@ -412,10 +427,12 @@ static void lpm_cpuidle_resume(struct cpuidle_driver *drv, int index, int ret)
 		ct_cpuidle_enter();
 }
 
+
 static int lpm_state_enter(int type, struct cpuidle_device *dev,
 			   struct cpuidle_driver *drv, int idx)
 {
 	int ret;
+	const int sel_idx = idx;
 	struct lpm_states_enter *cstate = this_cpu_ptr(&lpm_cstate);
 	state_enter enter;
 
@@ -446,7 +463,7 @@ static int lpm_state_enter(int type, struct cpuidle_device *dev,
 						   : drv->states[idx].enter;
 
 	ret = enter(dev, drv, idx);
-	lpm_cpuidle_resume(drv, idx, ret);
+	lpm_cpuidle_resume(drv, idx, sel_idx, ret);
 
 	return ret;
 }

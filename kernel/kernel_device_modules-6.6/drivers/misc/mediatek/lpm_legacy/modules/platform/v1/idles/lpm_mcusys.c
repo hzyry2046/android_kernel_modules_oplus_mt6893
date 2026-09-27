@@ -33,7 +33,6 @@
 #include <linux/cpuidle.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/sched/clock.h>
 
 #include <lpm.h>
 #include <lpm_module.h>
@@ -43,70 +42,7 @@
 #include "lpm_plat.h"
 #include "lpm_plat_comm.h"
 
-/* Rate-limit for the bring-up diagnostic below: one line per 5 s. */
-#define MCUSYS_DUMP_INFO_INTERVAL_NS	5000000000ULL
-
 static unsigned int lpm_mcusys_status;
-
-/*
- * op6893 6.6 bring-up diagnostic.  Registering the model was necessary but is
- * not on its own sufficient -- MCUSYS still does not power down -- and from
- * outside there is no way to tell "we are never the last core in" from "ATF's
- * resource manager allows nothing", because both end with mcusys_status 0 and
- * no prepare.  smc_res is a mask of MT_RM_CONSTRAINT_ALLOW_*; 0 means the
- * resource manager refused everything, which would fit the SPM side reporting
- * spmfw ready: 0.  Rate-limited to one line per 5 s: this is the idle path.
- * Drop this once the answer is in.
- *
- * Measured with the counter alone: min settles at 1 within seconds of enabling
- * the state and never once reaches 0, over hundreds of seconds and thousands
- * of entries, and it stays at 1 even with cores taken offline (which makes
- * cpuhp recompute the count).  That is one slot held permanently rather than a
- * rendezvous the eight cores keep missing by luck -- so the useful question is
- * no longer "how close does it get" but "which core is it".  in_mask is the
- * set of cores currently inside mcusysoff, maintained under the same
- * lpm_mod_locker that serialises prompt and reflect; miss_mask is the set that
- * was still out at the moment the floor was reached.  A miss_mask that names
- * the same core every time is a stuck slot; one that wanders is scheduling.
- */
-static u64 lpm_mcusys_dbg_last_ns;
-static unsigned int lpm_mcusys_dbg_min = UINT_MAX;
-static unsigned long lpm_mcusys_in_mask;
-static unsigned long lpm_mcusys_miss_mask;
-static unsigned int lpm_mcusys_dbg_lastcore;
-
-static bool lpm_mcusys_oneshot = true;
-module_param_named(oneshot, lpm_mcusys_oneshot, bool, 0644);
-MODULE_PARM_DESC(oneshot,
-	"take exactly one MCUSYS-off then demote to WFI (1: default, survives; 0: free-run, hangs the SoC)");
-
-static void lpm_mcusys_dbg(bool last_core, unsigned int smc_res,
-			   unsigned int status)
-{
-	unsigned int cnt = lpm_plat_mcusys_pwr_cnt();
-	unsigned long online = cpumask_bits(cpu_online_mask)[0];
-	u64 now;
-
-	/*
-	 * Track the floor on every call, not just the ones we print: the
-	 * whole question is whether the count ever gets close to 0.  Stuck at
-	 * the core count means nothing is decrementing; reaching 1 or 2 means
-	 * the eight cores are simply never all in mcusysoff at once, which is
-	 * a scheduling problem and not a plumbing one.
-	 */
-	if (cnt <= lpm_mcusys_dbg_min) {
-		lpm_mcusys_dbg_min = cnt;
-		lpm_mcusys_miss_mask = online & ~lpm_mcusys_in_mask;
-	}
-
-	now = sched_clock();
-	if (now - lpm_mcusys_dbg_last_ns <= MCUSYS_DUMP_INFO_INTERVAL_NS)
-		return;
-	lpm_mcusys_dbg_last_ns = now;
-	pr_info("[name:mtk_lpm][P] - mcusys prompt: last_core=%d cnt=%u min=%u in=0x%lx miss=0x%lx online=0x%lx smc_res=0x%x status=0x%x\n",
-		last_core, cnt, lpm_mcusys_dbg_min, lpm_mcusys_in_mask,
-		lpm_mcusys_miss_mask, online, smc_res, status);
-}
 
 static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 {
@@ -114,70 +50,13 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	unsigned int mcusys_status;
 
 	lpm_plat_set_mcusys_off(cpu);
-	lpm_mcusys_in_mask |= BIT(cpu);
 
 	/* Only the last core into idle can speak for the whole MCUSYS. */
-	if (!lpm_plat_is_mcusys_off()) {
-		lpm_mcusys_dbg(false, 0, 0);
+	if (!lpm_plat_is_mcusys_off())
 		return 0;
-	}
-
-	/*
-	 * op6893 bring-up: one-shot mode, on by default.
-	 *
-	 * Letting MCUSYS-off run free hangs the SoC and the watchdog resets it,
-	 * within two or three all-eight events every time -- and always before
-	 * anything can be read back.  But the FIRST event is survived, reliably
-	 * (measured: died on #2, #2 and #3 across three runs).  So take exactly
-	 * one, then veto every later one: lpm_state_enter() demotes a negative
-	 * prompt return to WFI, which keeps MCUSYS up and leaves the machine
-	 * alive to be interrogated.
-	 *
-	 * That buys the readings that matter and that no run has survived to
-	 * take: /proc/mtk_lpm/lpm/trace/common (ATF's last constraint and its
-	 * valid mask -- 4.19 shows `rc_id:3, valid:0x203`),
-	 * /proc/mtk_lpm/lpm/rc/<name>/state counts, and the SYSRAM mcusys
-	 * counter in /proc/mtk_lpm/cpuidle/info.
-	 *
-	 * Undo the decrement by hand: after a veto lpm_state_enter() enters
-	 * index 0, so lpm_cpuidle_resume() looks up mod[0], finds NULL, and
-	 * never calls our reflect -- the count would leak upward forever.
-	 */
-	if (lpm_mcusys_oneshot && lpm_mcusys_dbg_lastcore >= 1) {
-		lpm_mcusys_in_mask &= ~BIT(cpu);
-		lpm_plat_clr_mcusys_off(cpu);
-		return -EBUSY;
-	}
 
 	smc_res = lpm_smc_cpu_pm(MCUSYS_STATUS, MT_LPM_SMC_ACT_GET,
 				 MCUSYS_STATUS_PDN, 0);
-
-	/*
-	 * op6893 bring-up: the one line we have never managed to read.
-	 *
-	 * Everything else about this state is now understood -- with the
-	 * tick-broadcast device in place the count does reach 0, and cluster
-	 * power-down went from never to 649170 -- but the machine hangs on the
-	 * first real MCUSYS-off and the watchdog resets it, so the interesting
-	 * moment is also the last one.  The 5 s rate limit below has meant that
-	 * in every run so far this branch executed and printed nothing: `min`
-	 * dropped to 0 unseen and the sampled line still said min=1.
-	 *
-	 * smc_res is the MT_RM_CONSTRAINT_ALLOW_* mask ATF's resource manager
-	 * answers with.  4.19 services every MCUSYS-off under a constraint
-	 * (rc/state count:823, all of it cpu-buck-ldo) and wakes via SPM's
-	 * R12_SYS_TIMER_EVENT_B; ours reports count:0.  If smc_res is 0 here
-	 * then ATF is allowing no constraint at all, which would mean it powers
-	 * MCUSYS down without SPM being programmed to wake it -- exactly the
-	 * observed hang.  Unconditional for the first few, because console
-	 * ramoops survives the hang and a rate-limited line does not.
-	 */
-	if (lpm_mcusys_dbg_lastcore < 20) {
-		lpm_mcusys_dbg_lastcore++;
-		pr_info("[name:mtk_lpm][P] - mcusys LAST CORE #%u cpu=%d smc_res=0x%x in=0x%lx online=0x%lx\n",
-			lpm_mcusys_dbg_lastcore, cpu, smc_res,
-			lpm_mcusys_in_mask, cpumask_bits(cpu_online_mask)[0]);
-	}
 
 	/*
 	 * Deepest allowance first -- these are ordered, not a bitmask test in
@@ -204,8 +83,6 @@ static int lpm_mcusys_prompt(int cpu, const struct lpm_issuer *issuer)
 	lpm_mcusys_status = mcusys_status;
 	if (lpm_mcusys_status)
 		lpm_do_mcusys_prepare_pdn(lpm_mcusys_status, &smc_res);
-
-	lpm_mcusys_dbg(true, smc_res, mcusys_status);
 
 	return 0;
 }
@@ -236,7 +113,6 @@ static void lpm_mcusys_reflect(int cpu, const struct lpm_issuer *issuer)
 		lpm_do_mcusys_prepare_on();
 		lpm_mcusys_status = 0;
 	}
-	lpm_mcusys_in_mask &= ~BIT(cpu);
 	lpm_plat_clr_mcusys_off(cpu);
 }
 
