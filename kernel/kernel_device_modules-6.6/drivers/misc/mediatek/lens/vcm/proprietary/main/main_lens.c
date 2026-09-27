@@ -12,6 +12,7 @@
 #include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/delay.h>
+#include <linux/of.h>
 #include <linux/fs.h>
 #include <linux/i2c.h>
 #include <linux/module.h>
@@ -286,9 +287,43 @@ static void camaf_power_init(void)
 	}
 }
 
+/*
+ * op6893 (project 20615): the actuator's VDD is fan53870 LDO6 @ 2.8 V.  4.19
+ * switched it in AFRegulatorCtrl() from AF_Open/AF_Release; that function was
+ * dropped from this tree, the DT carries no camaf supply and the sensor power
+ * sequence has AFVDD commented out, so the BU64253 was never powered: every
+ * position write to 0x0c NACKed and AF moved nothing.  Same values and 20 ms
+ * settle time as 4.19.
+ */
+static bool camaf_fan53870_on;
+
+static void camaf_fan53870_power(bool on)
+{
+	int ret;
+
+	if (!of_machine_is_compatible("mediatek,MT6893"))
+		return;
+
+	if (on && !camaf_fan53870_on) {
+		ret = fan53870_cam_ldo_set_voltage(6, 2800);
+		LOG_INF("fan53870 LDO6 2800mV (%d)\n", ret);
+		if (ret >= 0) {
+			camaf_fan53870_on = true;
+			usleep_range(20000, 20500);
+		}
+	} else if (!on && camaf_fan53870_on) {
+		ret = fan53870_cam_ldo_disable(6);
+		LOG_INF("fan53870 LDO6 off (%d)\n", ret);
+		if (ret >= 0)
+			camaf_fan53870_on = false;
+	}
+}
+
 static void camaf_power_on(void)
 {
 	int ret;
+
+	camaf_fan53870_power(true);
 
 	if (vcamaf_ldo) {
 		ret = regulator_enable(vcamaf_ldo);
@@ -314,6 +349,8 @@ static void camaf_power_off(void)
 		ret = pinctrl_select_state(vcamaf_pio, vcamaf_pio_off);
 		LOG_INF("pinctrl disable (%d)\n", ret);
 	}
+
+	camaf_fan53870_power(false);
 }
 
 #ifdef CONFIG_MACH_MT6765
@@ -703,7 +740,15 @@ static const struct i2c_device_id AF_i2c_id[] = {{AF_DRVNAME, 0}, {} };
 /* PATH : vendor\mediatek\proprietary\custom\#project#\kernel\dct\dct */
 #if I2C_CONFIG_SETTING == 2
 static const struct of_device_id MAINAF_of_match[] = {
-	{.compatible = "mediatek,CAMERA_MAIN_AF"}, {},
+	{.compatible = "mediatek,CAMERA_MAIN_AF"},
+	/*
+	 * op6893: the stock DT names the actuator client in lower case
+	 * (i2c2@11D01000/camera_main_af@19); OF matching is case-sensitive,
+	 * so without this the client never bound and /dev/MAINAF never
+	 * appeared -- AF computed but never moved the lens.
+	 */
+	{.compatible = "mediatek,camera_main_af"},
+	{},
 };
 #endif
 
