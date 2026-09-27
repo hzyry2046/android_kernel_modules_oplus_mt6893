@@ -404,6 +404,17 @@ void fg_daemon_get_data(struct mtk_battery *gm, int cmd,
 			battery_algo_init(gm);
 			bm_err(gm, "[%s] op6893: no daemon SET_INIT_FLAG, kernel mode armed, init_flag=%d\n",
 				__func__, gm->init_flag);
+			/*
+			 * Publish the freshly seeded uisoc now.  Without a
+			 * daemon, battery_update() otherwise first runs from
+			 * the 60 s algo timer, so the battery psy kept its
+			 * registration-time capacity of -1 for up to a minute
+			 * -- long enough for SystemUI's BatteryViewModel to
+			 * throw on the '-' glyph and crash-loop until
+			 * RescueParty restarted system_server.
+			 */
+			if (gm->init_flag)
+				battery_update(gm->bm);
 		}
 
 	switch (cmd) {

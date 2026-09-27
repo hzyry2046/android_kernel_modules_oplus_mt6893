@@ -1180,6 +1180,16 @@ static int bs_psy_get_property(struct power_supply *psy,
 
 		if (bm->gm1->fixed_uisoc != 0xffff)
 			val->intval = bm->gm1->fixed_uisoc;
+		else if (bs_data->bat_capacity < 0)
+			/*
+			 * op6893: gauge not initialised yet (bat_capacity is
+			 * still the -1 set at registration).  Never hand a
+			 * negative level to userspace -- SystemUI's battery
+			 * glyph renderer throws on '-' and crash-loops.  Report
+			 * the same 50% placeholder MTK uses for BAT_PROP_DISABLE;
+			 * 0 would make BatteryService shut the phone down.
+			 */
+			val->intval = 50;
 		else
 			val->intval = bs_data->bat_capacity;
 		break;
