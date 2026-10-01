@@ -239,9 +239,12 @@ static u16 mss_done_event_id, msf_done_event_id;
 static u16 mss_token_id, msf_token_id;
 
 
-/* Get HW modules' base address from device nodes */
-#define MSS_DEV_NODE_IDX 1
-#define MSF_DEV_NODE_IDX 0
+/* Get HW modules' base address from device nodes.
+ * op6893: the frozen 4.19 DTB probes mss first (nr==1), msf second
+ * (nr==2).  Upstream 6.6 dtsi has them the other way round, so do NOT
+ * key the mss/msf identity off nr_MFB_devs; match the node name. */
+#define MSS_DEV_NODE_IDX 0
+#define MSF_DEV_NODE_IDX 1
 #define IMGSYS_DEV_MODE_IDX 2
 
 /* static unsigned long gISPSYS_Reg[MFB_IRQ_TYPE_AMOUNT]; */
@@ -4413,21 +4416,25 @@ static signed int MFB_probe(struct platform_device *pDev)
 	pRes = platform_get_resource(pDev, IORESOURCE_MEM, 0);
 	if (pRes == NULL)
 		return -ENOMEM;
-	if (nr_MFB_devs == 2) {
+	/* op6893: key off the node name, not nr_MFB_devs; the frozen DTB
+	 * probes mss (nr==1) before msf (nr==2), opposite to upstream. */
+	if (!strcmp(pDev->dev.of_node->name, "mss")) {
 		mss_base = pRes->start;
-		LOG_INF("mss ba 0x%08X\n",mss_base);
+		LOG_INF("mss ba 0x%08X\n", mss_base);
 	}
-	if (nr_MFB_devs == 1) {
+	if (!strcmp(pDev->dev.of_node->name, "msf")) {
 		msf_base = pRes->start;
-		LOG_INF("msf ba 0x%08X\n",msf_base);
+		LOG_INF("msf ba 0x%08X\n", msf_base);
 	}
 
 MFB_add_device_link(pDev);
 
 #ifdef CMDQ_COMMON
 	/*cmdq*/
+	/* op6893: same as above, key off the node name: the mss node
+	 * carries mss_* props, the msf node msf_* props. */
 	MFB_cmdq_dev = &pDev->dev;
-	if (nr_MFB_devs == 2) {
+	if (!strcmp(pDev->dev.of_node->name, "mss")) {
 		mss_clt = cmdq_mbox_create(MFB_cmdq_dev, 0);
 		LOG_INF("mss_clt: 0x%p\n", mss_clt);
 		of_property_read_u16(MFB_cmdq_dev->of_node,
@@ -4435,7 +4442,7 @@ MFB_add_device_link(pDev);
 		of_property_read_u16(MFB_cmdq_dev->of_node,
 				"mss_token", &mss_token_id);
 	}
-	if (nr_MFB_devs == 1) {
+	if (!strcmp(pDev->dev.of_node->name, "msf")) {
 		msf_clt = cmdq_mbox_create(MFB_cmdq_dev, 0);
 		LOG_INF("msf_clt: 0x%p\n", msf_clt);
 		of_property_read_u16(MFB_cmdq_dev->of_node,
