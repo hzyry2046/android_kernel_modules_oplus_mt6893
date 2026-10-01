@@ -35,7 +35,11 @@
 #include <cmdq-util.h>
 #endif
 #include <soc/mediatek/smi.h>
-#define MFB_PMQOS
+/* op6893 6.6 bring-up: the frozen 4.19 DTB gives the mss/msf nodes no
+ * opp-table and no dvfsrc-vcore supply, so the pmqos path dereferences
+ * a NULL speeds table as soon as qos exceeds 100 MB/s.  Kept off until
+ * DVFS data exists for this board. */
+//#define MFB_PMQOS
 #ifdef MFB_PMQOS
 #include <linux/pm_opp.h>
 #include <linux/regulator/consumer.h>
@@ -1706,8 +1710,10 @@ static inline void MFB_Prepare_Enable_ccf_clock(void)
 	}
 
 /*cmdq enable*/
-	cmdq_mbox_enable(mss_clt->chan);
-	cmdq_mbox_enable(msf_clt->chan);
+	if (mss_clt)
+		cmdq_mbox_enable(mss_clt->chan);
+	if (msf_clt)
+		cmdq_mbox_enable(msf_clt->chan);
 }
 
 static inline void MFB_Disable_Unprepare_ccf_clock(void)
@@ -1717,21 +1723,27 @@ static inline void MFB_Disable_Unprepare_ccf_clock(void)
 	 */
 
 	// cmdq disable
-	cmdq_mbox_disable(msf_clt->chan);
-	cmdq_mbox_disable(mss_clt->chan);
+	if (msf_clt)
+		cmdq_mbox_disable(msf_clt->chan);
+	if (mss_clt)
+		cmdq_mbox_disable(mss_clt->chan);
 
 	if (mfb_clk.CG_MFB_IMG_4 != NULL)
 		clk_disable_unprepare(mfb_clk.CG_MFB_IMG_4);
 	if (mfb_clk.CG_MFB_IMG_3 != NULL)
 		clk_disable_unprepare(mfb_clk.CG_MFB_IMG_3);
-	clk_disable_unprepare(mfb_clk.CG_MFB_IMG_2);
-	clk_disable_unprepare(mfb_clk.CG_MFB_IMG_1);
-	clk_disable_unprepare(mfb_clk.CG_MFB_IMG_0);
+	if (mfb_clk.CG_MFB_IMG_2 != NULL)
+		clk_disable_unprepare(mfb_clk.CG_MFB_IMG_2);
+	if (mfb_clk.CG_MFB_IMG_1 != NULL)
+		clk_disable_unprepare(mfb_clk.CG_MFB_IMG_1);
+	if (mfb_clk.CG_MFB_IMG_0 != NULL)
+		clk_disable_unprepare(mfb_clk.CG_MFB_IMG_0);
 	/*smi_bus_disable_unprepare(SMI_LARB11, MFB_DEV_NAME);*/
 /*
 	if (MFB_devs[0].larb_b != NULL)
 		mtk_smi_larb_put(MFB_devs[0].larb_b);
-	mtk_smi_larb_put(MFB_devs[0].larb);
+	if (MFB_devs[0].larb != NULL)
+		mtk_smi_larb_put(MFB_devs[0].larb);
 */
 	pm_runtime_put_sync(MFB_devs[0].dev);
 }
@@ -4458,12 +4470,18 @@ MFB_add_device_link(pDev);
 		mfb_clk.CG_MFB_IMG_4 = devm_clk_get(&pDev->dev,
 				"MFB_CG_IMG_4");
 
-		if (IS_ERR(mfb_clk.CG_MFB_IMG_0))
+		if (IS_ERR(mfb_clk.CG_MFB_IMG_0)) {
+			mfb_clk.CG_MFB_IMG_0 = NULL;
 			LOG_ERR("cannot get CG_MFB_IMG_0 clock\n");
-		if (IS_ERR(mfb_clk.CG_MFB_IMG_1))
+		}
+		if (IS_ERR(mfb_clk.CG_MFB_IMG_1)) {
+			mfb_clk.CG_MFB_IMG_1 = NULL;
 			LOG_ERR("cannot get CG_MFB_IMG_1 clock\n");
-		if (IS_ERR(mfb_clk.CG_MFB_IMG_2))
+		}
+		if (IS_ERR(mfb_clk.CG_MFB_IMG_2)) {
+			mfb_clk.CG_MFB_IMG_2 = NULL;
 			LOG_ERR("cannot get CG_MFB_IMG_2 clock\n");
+		}
 		if (IS_ERR(mfb_clk.CG_MFB_IMG_3)) {
 			mfb_clk.CG_MFB_IMG_3 = NULL;
 			LOG_ERR("cannot get CG_MFB_IMG_3 clock\n");
@@ -4483,12 +4501,21 @@ MFB_add_device_link(pDev);
 			goto EXIT;
 		/*gki smi larb*/
 		node = of_parse_phandle(MFB_dev->dev->of_node, "mediatek,larb", 0);
+		/* op6893: the frozen 4.19 DTB carries no mediatek,larb on the
+		 * mss/msf nodes; both engines sit behind imgsys1 larb9. */
 		if (!node)
-			return -EINVAL;
+			node = of_find_compatible_node(NULL, NULL,
+						       "mediatek,smi_larb9");
+		if (!node) {
+			LOG_ERR("%s: failed to get larb\n",
+				pDev->dev.of_node->name);
+			goto PM_OK;
+		}
 		pdev = of_find_device_by_node(node);
 		if (WARN_ON(!pdev)) {
 			of_node_put(node);
-			return -EINVAL;
+			MFB_dev->larb = NULL;
+			goto PM_OK;
 		}
 		of_node_put(node);
 		MFB_dev->larb = &pdev->dev;
