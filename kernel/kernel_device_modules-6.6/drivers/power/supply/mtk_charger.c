@@ -146,7 +146,6 @@ void _wake_up_charger(struct mtk_charger *info)
 	info->charger_thread_timeout = true;
 	wake_up_interruptible(&info->wait_que);
 }
-EXPORT_SYMBOL(_wake_up_charger);
 
 bool is_disable_charger(struct mtk_charger *info)
 {

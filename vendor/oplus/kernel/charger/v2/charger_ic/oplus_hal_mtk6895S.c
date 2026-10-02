@@ -926,11 +926,54 @@ const char *chg_get_cmd(void)
 }
 #endif
 
-/* op6893 6.6 bring-up: chr_get_debug_level() and _wake_up_charger() are
- * provided by mtk_charger_framework.ko (drivers/power/supply/mtk_charger.c).
- * Keeping local copies here causes "exports duplicate symbol" at first-stage
- * init.  The bodies were line-identical; callers fall through to the
- * framework's via the extern in oplus_hal_mtk6895S.h. */
+int chr_get_debug_level(void)
+{
+	struct power_supply *psy;
+	static struct mtk_charger *info;
+	int ret;
+
+	if (info == NULL) {
+		psy = power_supply_get_by_name("mtk-master-charger");
+		if (psy == NULL)
+			ret = CHRLOG_DEBUG_LEVEL;
+		else {
+			info =
+			(struct mtk_charger *)power_supply_get_drvdata(psy);
+			if (info == NULL)
+				ret = CHRLOG_DEBUG_LEVEL;
+			else
+				ret = info->log_level;
+		}
+	} else
+		ret = info->log_level;
+
+	return ret;
+}
+EXPORT_SYMBOL(chr_get_debug_level);
+
+void _wake_up_charger(struct mtk_charger *info)
+{
+#ifdef OPLUS_FEATURE_CHG_BASIC
+/* do not use mtk charger thread */
+	return;
+#else
+	unsigned long flags;
+
+	info->timer_cb_duration[2] = ktime_get_boottime();
+	if (info == NULL)
+		return;
+
+	spin_lock_irqsave(&info->slock, flags);
+	info->timer_cb_duration[3] = ktime_get_boottime();
+	if (!info->charger_wakelock->active)
+		__pm_stay_awake(info->charger_wakelock);
+	info->timer_cb_duration[4] = ktime_get_boottime();
+	spin_unlock_irqrestore(&info->slock, flags);
+	info->charger_thread_timeout = true;
+	info->timer_cb_duration[5] = ktime_get_boottime();
+	wake_up_interruptible(&info->wait_que);
+#endif
+}
 
 bool is_disable_charger(struct mtk_charger *info)
 {

@@ -732,9 +732,12 @@ extern int get_charger_zcv(struct mtk_charger *info,
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
 void _wake_up_charger(struct charger_manager *info);
 #else
-/* op6893 6.6 bring-up: the framework objects are built again (Phase 2), so
- * the real definition in mtk_charger.c is linked; declare it extern. */
-void _wake_up_charger(struct mtk_charger *info);
+/* NOTE (op6893 6.6 bring-up, chg3b): mtk_charger_framework.ko is not built
+ * (see Makefile); the only _wake_up_charger lives in oplus_chg_v2's HAL.
+ * mtk_basic_charger.c / mtk_adapter_switch.c etc. are not built either, so
+ * this header's declaration is only consumed by mtk_charger.c itself, which
+ * defines the function just below.  Keep the pre-Phase-2 stub. */
+static void _wake_up_charger(struct mtk_charger *info) __attribute__((unused));
 #endif
 extern int mtk_adapter_switch_control(struct mtk_charger *info);
 extern int mtk_selected_adapter_ready(struct mtk_charger *info);

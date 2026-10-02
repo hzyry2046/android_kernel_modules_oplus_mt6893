@@ -19,13 +19,16 @@ obj-$(CONFIG_CHARGER_BQ25601) += mtk_charger_framework.o charger_class.o adapter
 else ifeq ($(CONFIG_CHARGER_BQ25601),y)
 obj-$(CONFIG_CHARGER_BQ25601) += mtk_charger_framework.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_ufcs_adapter.o
 else
-#ifndef OPLUS_FEATURE_CHG_BASIC
-# op6893 6.6 bring-up (Phase 2, 2026-10-02): the vendor default above builds
-# the charger framework without mtk_charger.o itself, so no charger psy ever
-# registers and nothing drives the MT6360.  Build the full framework instead.
-obj-$(CONFIG_MTK_CHARGER) += mtk_charger_framework.o mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o mtk_ufcs_adapter.o
-#endif
-mtk_charger_framework-objs := mtk_charger.o mtk_charger_intf.o mtk_basic_charger.o mtk_pulse_charger.o mtk_adapter_switch.o
+# NOTE (op6893 6.6 bring-up, chg3b): mtk_charger_framework.ko is NOT built.
+# Its platform driver registers under the name "charger" -- the same name as
+# the mtk_charger driver compiled INTO oplus_chg_v2 (6991V HAL registers it
+# from its oplus_chg_module table at class_init).  Staging both panics first
+# stage with "Driver 'charger' is already registered" -> oplus_chg_v2 init
+# fails -> init killed.  The HAL is self-contained (defines + EXPORTs
+# chr_get_debug_level / _wake_up_charger / mtk_chg_enable_vbus_ovp itself and
+# probes mediatek,charger), so the framework .ko is simply unneeded here.
+#obj-$(CONFIG_MTK_CHARGER) += mtk_charger_framework.o mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o mtk_ufcs_adapter.o
+#mtk_charger_framework-objs := mtk_charger.o mtk_charger_intf.o mtk_basic_charger.o mtk_pulse_charger.o mtk_adapter_switch.o
 #else
 obj-$(CONFIG_MTK_CHARGER) += mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o
 #endif
