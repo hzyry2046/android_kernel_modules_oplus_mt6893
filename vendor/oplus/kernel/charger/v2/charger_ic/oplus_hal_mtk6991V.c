@@ -4357,12 +4357,29 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 {
 	struct mtk_charger *chip = container_of(work,
 		struct mtk_charger, pd_9v_try_work.work);
+	struct charger_device *chg = NULL;
 	int chg_vol = 0;
 	int batt_volt = 0;
 	int ret;
+	bool en = false;
 
 	if (chip->pd_type != MTK_PD_CONNECT_PE_READY_SNK_APDO) {
 		chg_info("pd_9v_try: pd_type=%d changed, skip\n", chip->pd_type);
+		return;
+	}
+
+	/* op6893 6.6 bring-up: oplus,wired/mms_wired have no DT nodes, so the
+	 * WIRED_* votables never exist (find_votable NULL) and the charger
+	 * thread is compiled out (OPLUS_FEATURE_CHG_BASIC stubs
+	 * _wake_up_charger).  Drive the buck directly, in notifier context
+	 * (no probe-time power_supply lookups). */
+	chg = chip->chg1_dev;
+	if (!chg) {
+		chg = get_charger_by_name("primary_chg");
+		chip->chg1_dev = chg;
+	}
+	if (!chg) {
+		chg_err("pd_9v_try: no primary_chg, skip\n");
 		return;
 	}
 
@@ -4382,13 +4399,26 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 		chg_info("pd_9v_try: already %dmV, skip request\n", chg_vol);
 	}
 
-	if (chip->chg1_dev)
-		charger_dev_set_input_current(chip->chg1_dev, IBUS_2A * 1000);
+	ret = charger_dev_set_mivr(chg, AICL_POINT_VOL_9V * 1000);
+	if (ret < 0)
+		chg_err("pd_9v_try: set mivr 9V fail ret=%d\n", ret);
+	ret = charger_dev_set_input_current(chg, IBUS_2A * 1000);
+	if (ret < 0)
+		chg_err("pd_9v_try: set aicr 2A fail ret=%d\n", ret);
+	ret = charger_dev_plug_in(chg);
+	if (ret < 0)
+		chg_err("pd_9v_try: plug_in fail ret=%d\n", ret);
+	ret = charger_dev_enable(chg, true);
+	if (ret < 0)
+		chg_err("pd_9v_try: enable fail ret=%d\n", ret);
+
+	ret = charger_dev_is_enabled(chg, &en);
+	chg_info("pd_9v_try: done chg_vol=%d->%d batt=%d enabled=%d\n",
+		chg_vol, battery_meter_get_charger_voltage(),
+		get_battery_voltage(chip), en);
 	batt_volt = get_battery_voltage(chip);
 	oplus_mt6379_set_aicl_point(chip->ic_dev, batt_volt);
 	chip->pd_chg_volt = VBUS_9V;
-	chg_info("pd_9v_try: done chg_vol=%d batt=%d\n",
-		battery_meter_get_charger_voltage(), batt_volt);
 }
 
 #define DEFAULT_CURR_BY_CC 100
