@@ -17,7 +17,7 @@ static struct mfd_cell mt6360_pmu_subdevs[MT6360_PMUDEV_MAX] = {
 		.pm_runtime_no_callbacks = true,
 	},
 	{
-		.name = "mt6360_pmu_adc",
+		.name = "mt6360-adc",
 		.of_compatible = "mediatek,mt6360_pmu_adc",
 		.pm_runtime_no_callbacks = true,
 	},
@@ -54,6 +54,13 @@ static int mt6360_pmu_init_of_subdevs(struct mt6360_pmu_info *mpi)
 		}
 		if (!np)
 			continue;
+		/* op6893 6.6 bring-up: cells are singletons in the DT (one
+		 * adc/chg/core/fled/rgbled child each); of_compatible-only
+		 * matching gives every MFD reload's cells the same node,
+		 * which mfd-core hands to the first claimant only ("Failed
+		 * to locate of_node" for the rest).  Match order is cell
+		 * array order, so nothing to do here -- the fix is removing
+		 * stale cells first (subdev_unregister on remove). */
 		/* op6893 6.6 bring-up: of_irq_to_resource_table() is gone in
 		 * 6.6; fill resources with of_irq_get() one by one. */
 		for (irq_cnt = 0; of_irq_get(np, irq_cnt) > 0; irq_cnt++)

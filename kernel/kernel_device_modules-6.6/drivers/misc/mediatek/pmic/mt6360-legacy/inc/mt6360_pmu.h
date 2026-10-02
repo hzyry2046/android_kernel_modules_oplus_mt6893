@@ -10,9 +10,13 @@
 #include <linux/interrupt.h>
 #include <linux/of.h>
 #include "config.h"
-/* op6893 6.6 bring-up: rt-regmap not vendored; direct-i2c path only. */
+/* op6893 6.6 bring-up: rt-regmap not vendored; direct-i2c path only for
+ * the MFD's own access.  The charger cell (6.6 mt6360_pmu_chg.c) wants a
+ * vanilla Linux regmap on the parent via dev_get_regmap(), so the MFD also
+ * publishes one (custom 16-bit-reg/8-bit-val bus over the 0x34 client). */
 struct rt_regmap_device;
 struct rt_regmap_fops;
+struct regmap;
 
 extern bool dbg_log_en;
 #define mt_dbg(dev, fmt, ...) \
@@ -256,6 +260,7 @@ struct mt6360_pmu_info {
 	struct i2c_client *i2c;
 	struct device *dev;
 	struct rt_regmap_device *regmap;
+	struct regmap *linux_regmap;
 	struct irq_domain *irq_domain;
 	u8 cache_irq_masks[MT6360_PMU_IRQ_REGNUM];
 	struct mutex io_lock;

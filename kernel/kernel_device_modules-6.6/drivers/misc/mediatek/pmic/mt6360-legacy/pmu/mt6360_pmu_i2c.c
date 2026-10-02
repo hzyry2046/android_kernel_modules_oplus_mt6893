@@ -8,6 +8,7 @@
 #include <linux/kernel.h>
 #include <linux/version.h>
 #include <linux/i2c.h>
+#include <linux/of_gpio.h>
 #include <linux/pm_runtime.h>
 
 #include "../inc/mt6360_pmu.h"
@@ -203,9 +204,14 @@ static int mt6360_pmu_parse_dt_data(struct device *dev,
 	memcpy(pdata, &def_platform_data, sizeof(*pdata));
 	mt6360_dt_parser_helper(np, (void *)pdata,
 				mt6360_val_props, ARRAY_SIZE(mt6360_val_props));
-	/* op6893 6.6 bring-up: of_get_named_gpio()/devm_gpio_request_one() are
-	 * gone in 6.6; the live DT carries mt6360,intr_gpio_num (=0x18) which
-	 * is the MTK EINT number the 4.19 driver used directly. */
+	/* 4.19 branch verbatim: prefer the phandle form (mt6360,intr_gpio ->
+	 * pinctrl gpiochip) which works with the -1 base; fall back to the
+	 * raw EINT number for DTs that only carry intr_gpio_num. */
+	ret = of_get_named_gpio(np, "mt6360,intr_gpio", 0);
+	if (ret >= 0) {
+		pdata->irq_gpio = ret;
+		goto out_parse_dt;
+	}
 	ret = of_property_read_u32(np, "mt6360,intr_gpio_num",
 				&pdata->irq_gpio);
 	if (ret < 0) {
@@ -339,7 +345,7 @@ static void mt6360_pmu_i2c_remove(struct i2c_client *client)
 
 	dev_dbg(mpi->dev, "%s\n", __func__);
 	pm_runtime_disable(mpi->dev);
-	/* To-do: subdev unregister */
+	mt6360_pmu_subdev_unregister(mpi);
 	mt6360_pmu_irq_unregister(mpi);
 	mt6360_pmu_regmap_unregister(mpi);
 	pm_runtime_set_suspended(mpi->dev);

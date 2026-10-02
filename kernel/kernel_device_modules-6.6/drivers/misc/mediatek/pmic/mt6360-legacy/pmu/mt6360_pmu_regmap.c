@@ -6,6 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/err.h>
 #include <linux/device.h>
+#include <linux/i2c.h>
+#include <linux/mutex.h>
+#include <linux/regmap.h>
 
 #include "../inc/mt6360_pmu.h"
 
@@ -429,10 +432,95 @@ void mt6360_pmu_regmap_unregister(struct mt6360_pmu_info *mpi)
 }
 EXPORT_SYMBOL_GPL(mt6360_pmu_regmap_unregister);
 #else
+/* op6893 6.6 bring-up: no rt-regmap, so publish a vanilla Linux regmap on
+ * the MFD device itself.  Children (mt6360_pmu_chg.c, mt6360-adc.c) fetch
+ * it with dev_get_regmap(parent, NULL).  Bus format matches the chip and
+ * the 6.6 upstream mt6360-core driver: 16-bit big-endian register
+ * (0x300-0x3FF, bank in high byte), 8-bit value.  The PMU bank is plain
+ * R/W (only the PMIC/LDO banks need CRC, which this MFD never serves).
+ * NOTE: 0x356/0x358 are 16-bit ADC control regs: the ADC driver hits them
+ * with regmap_raw_write(val_len=2) while the charger hits single bytes, so
+ * the bus implements both the formatted (.read/.write) and the register
+ * (.reg_read/.reg_write) callbacks; all go to the 0x34 client behind the
+ * MFD's io_lock. */
+static int mt6360_pmu_bus_reg_read(void *context, unsigned int reg, unsigned int *val)
+{
+	struct mt6360_pmu_info *mpi = context;
+	u8 addr = reg & 0xff, data = 0;
+	int ret;
+
+	mutex_lock(&mpi->io_lock);
+	ret = i2c_smbus_read_i2c_block_data(mpi->i2c, addr, 1, &data);
+	mutex_unlock(&mpi->io_lock);
+	if (ret < 0)
+		return ret;
+	*val = data;
+	return 0;
+}
+
+static int mt6360_pmu_bus_reg_write(void *context, unsigned int reg, unsigned int val)
+{
+	struct mt6360_pmu_info *mpi = context;
+	u8 addr = reg & 0xff, data = val;
+	int ret;
+
+	mutex_lock(&mpi->io_lock);
+	ret = i2c_smbus_write_i2c_block_data(mpi->i2c, addr, 1, &data);
+	mutex_unlock(&mpi->io_lock);
+	return ret;
+}
+
+static int mt6360_pmu_bus_read(void *context, const void *reg_buf, size_t reg_size,
+			       void *val_buf, size_t val_size)
+{
+	struct mt6360_pmu_info *mpi = context;
+	u8 addr = ((const u8 *)reg_buf)[reg_size - 1];
+	int ret;
+
+	mutex_lock(&mpi->io_lock);
+	ret = i2c_smbus_read_i2c_block_data(mpi->i2c, addr, val_size, val_buf);
+	mutex_unlock(&mpi->io_lock);
+	return ret < 0 ? ret : 0;
+}
+
+static int mt6360_pmu_bus_write(void *context, const void *data, size_t count)
+{
+	struct mt6360_pmu_info *mpi = context;
+	const u8 *buf = data;
+	u8 addr;
+	int ret;
+
+	/* layout: [bank, addr, val...]; PMU bank is always 0x03 */
+	if (count < 3)
+		return -EINVAL;
+	addr = buf[1];
+	mutex_lock(&mpi->io_lock);
+	ret = i2c_smbus_write_i2c_block_data(mpi->i2c, addr, count - 2,
+					     (u8 *)(buf + 2));
+	mutex_unlock(&mpi->io_lock);
+	return ret;
+}
+
+static const struct regmap_bus mt6360_pmu_linux_regmap_bus = {
+	.read = mt6360_pmu_bus_read,
+	.write = mt6360_pmu_bus_write,
+	.reg_read = mt6360_pmu_bus_reg_read,
+	.reg_write = mt6360_pmu_bus_reg_write,
+};
+
+static const struct regmap_config mt6360_pmu_linux_regmap_config = {
+	.reg_bits = 16,
+	.val_bits = 8,
+	.reg_format_endian = REGMAP_ENDIAN_BIG,
+	.max_register = 0x3FF,
+};
+
 int mt6360_pmu_regmap_register(struct mt6360_pmu_info *mpi,
 			       struct rt_regmap_fops *fops)
 {
-	return 0;
+	mpi->linux_regmap = devm_regmap_init(mpi->dev, &mt6360_pmu_linux_regmap_bus,
+				mpi, &mt6360_pmu_linux_regmap_config);
+	return PTR_ERR_OR_ZERO(mpi->linux_regmap);
 }
 EXPORT_SYMBOL_GPL(mt6360_pmu_regmap_register);
 

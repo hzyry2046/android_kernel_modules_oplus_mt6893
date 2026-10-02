@@ -3060,6 +3060,11 @@ static void mt6360_hvdcp_result_check_work(struct work_struct *work)
 	}
 }
 
+/* op6893 6.6 bring-up: do NOT export this. mt6379-chg.ko (already in the
+ * ramdisk for the 6991V HAL) owns the global export; a second EXPORT here
+ * fails insmod with "exports duplicate symbol". The HAL's extern call
+ * resolves to the 6379 copy (no-op when its cdata is NULL); nothing in this
+ * file calls it internally. */
 void oplus_notify_hvdcp_detect_stat(void)
 {
 	struct mt6360_chg_info *mci = oplusmci;
@@ -3071,7 +3076,6 @@ void oplus_notify_hvdcp_detect_stat(void)
 				mci->hvdcp_cfg_9v_done, mci->hvdcp_detect_time);
 	}
 }
-EXPORT_SYMBOL(oplus_notify_hvdcp_detect_stat);
 
 static void mt6360_hvdcp_work(struct work_struct *work)
 {

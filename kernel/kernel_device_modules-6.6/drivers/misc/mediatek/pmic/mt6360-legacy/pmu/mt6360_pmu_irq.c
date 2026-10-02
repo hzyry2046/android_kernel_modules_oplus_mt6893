@@ -5,6 +5,8 @@
 
 #include <linux/kernel.h>
 #include <linux/err.h>
+#include <linux/gpio.h>
+#include <linux/slab.h>
 #include <linux/irqdomain.h>
 #include <linux/of_irq.h>
 #include <linux/pm_runtime.h>
@@ -155,16 +157,23 @@ static const struct irq_domain_ops mt6360_pmu_irq_domain_ops = {
 
 static int mt6360_pmu_gpio_irq_init(struct mt6360_pmu_info *mpi)
 {
+	struct mt6360_pmu_platform_data *pdata = dev_get_platdata(mpi->dev);
 	int ret;
 
-	/* op6893 6.6 bring-up: irq_gpio is the MTK EINT number (0x18), not a
-	 * linux gpio; gpio_to_irq() on it is meaningless.  The EINT is
-	 * described by the node's own interrupts property (parent = pio EINT
-	 * controller); take it from there like any platform IRQ. */
-	mpi->irq = of_irq_get(mpi->dev->of_node, 0);
-	if (mpi->irq <= 0) {
-		dev_err(mpi->dev, "of_irq_get fail [%d]\n", mpi->irq);
-		return mpi->irq ?: -ENODEV;
+	/* 4.19 path: irq_gpio is the MTK EINT number from the mt6360_pmu_dts
+	 * node (neither a linux gpio nor an of_irq index); keep the exact
+	 * gpio request + gpio_to_irq sequence on 6.6 (both still exist). */
+	ret = devm_gpio_request_one(mpi->dev, pdata->irq_gpio, GPIOF_IN,
+				    devm_kasprintf(mpi->dev, GFP_KERNEL,
+				    "%s.irq", dev_name(mpi->dev)));
+	if (ret < 0) {
+		dev_err(mpi->dev, "gpio request [%d] fail\n", pdata->irq_gpio);
+		return ret;
+	}
+	mpi->irq = gpio_to_irq(pdata->irq_gpio);
+	if (mpi->irq < 0) {
+		dev_err(mpi->dev, "irq number [%d] fail\n", mpi->irq);
+		return mpi->irq;
 	}
 	ret = devm_request_threaded_irq(mpi->dev, mpi->irq, NULL,
 					mt6360_pmu_irq_handler,
