@@ -2044,12 +2044,23 @@ static struct tcpc_ops mt6360_tcpc_ops = {
 static int mt6360_parse_dt(struct mt6360_chip *chip, struct device *dev,
 			   struct mt6360_tcpc_platform_data *pdata)
 {
-	struct device_node *np = dev->of_node;
+	struct device_node *np;
 	struct resource *res;
 	int res_cnt = 0, ret;
 	struct of_phandle_args irq;
 
 	pr_info("%s\n", __func__);
+
+	/* op6893 6.6 bring-up: the i2c client node (usb_type_c@4e) is a bare
+	 * reg/status stub; the real config lives in the top-level
+	 * "type_c_port0" node (same split as 4.19).  Prefer it when present. */
+	np = of_find_node_by_name(NULL, "type_c_port0");
+	if (np) {
+		dev->of_node = np;
+		dev_info(dev, "%s v1 version\n", __func__);
+	} else {
+		np = dev->of_node;
+	}
 #if !IS_ENABLED(CONFIG_MTK_GPIO) || IS_ENABLED(CONFIG_MTK_GPIOLIB_STAND)
 	ret = of_get_named_gpio(np, "mt6360pd,intr-gpio", 0);
 	if (ret < 0)
@@ -2336,12 +2347,18 @@ static int mt6360_i2c_probe(struct i2c_client *client)
 
 #if CONFIG_WATER_DETECTION
 #if IS_ENABLED(CONFIG_MTK_CHARGER)
+	/* op6893 6.6 bring-up: neither the oplus water-detect path (usbid_as_wd0
+	 * is false) nor the non-oplus path below touches chgdev; the charger
+	 * framework is not staged yet (Phase 2), so don't defer on it. */
+	chip->chgdev = NULL;
+#if 0
 	chip->chgdev = get_charger_by_name("primary_chg");
 	if (!chip->chgdev) {
 		dev_err(chip->dev, "%s get charger device fail\n", __func__);
 		ret = -EPROBE_DEFER;
 		goto err_get_chg;
 	}
+#endif
 #endif /* CONFIG_MTK_CHARGER */
 #endif /* CONFIG_WATER_DETECTION */
 
@@ -2371,7 +2388,7 @@ err_sw_reset:
 	tcpc_device_unregister(chip->dev, chip->tcpc);
 err_tcpc_reg:
 #if CONFIG_WATER_DETECTION
-#if IS_ENABLED(CONFIG_MTK_CHARGER)
+#if IS_ENABLED(CONFIG_MTK_CHARGER) && 0
 err_get_chg:
 #endif /* CONFIG_MTK_CHARGER */
 #endif /* CONFIG_WATER_DETECTION */
@@ -2481,6 +2498,9 @@ MODULE_DEVICE_TABLE(i2c, mt6360_id_table);
 
 static const struct of_device_id mt_match_table[] = {
 	{.compatible = "mediatek,mt6360_typec",},
+	/* op6893 6.6 bring-up: the stock 4.19 DTB still spells the MT6360
+	 * TCPC (i2c5 usb_type_c@4e) "mediatek,usb_type_c". */
+	{.compatible = "mediatek,usb_type_c",},
 	{},
 };
 
