@@ -71,6 +71,7 @@ static int oplus_pps_get_authentiate(struct oplus_chg_ic_dev *ic_dev);
 static int oplus_get_pps_info(struct oplus_chg_ic_dev *ic_dev, u32 *pdo, int num);
 static int oplus_chg_get_pps_status(struct oplus_chg_ic_dev *ic_dev, u32 *src_info);
 static int mtk_chg_set_otg_boost_vol(struct oplus_chg_ic_dev *ic_dev, int vol_mv);
+static int oplus_mt6379_set_aicl_point(struct oplus_chg_ic_dev *ic_dev, int vbatt);
 #endif /* OPLUS_FEATURE_CHG_BASIC */
 
 #define POWER_SUPPLY_TYPE_USB_HVDCP 13
@@ -283,10 +284,14 @@ bool oplus_mt_get_vbus_status(void)
 		return -ENODEV;
 	}
 
-	if (tcpm_inquire_typec_attach_state(pinfo->tcpc) == TYPEC_ATTACHED_SRC)
+	/* op6893 6.6 bring-up: pinfo->tcpc is NULL until the PD notifier
+	 * registration in probe, and tcpm_inquire_* faults on NULL
+	 * (tcpc->typec_attach_new with no check).  Treat unknown as sink. */
+	if (info->tcpc &&
+	    tcpm_inquire_typec_attach_state(info->tcpc) == TYPEC_ATTACHED_SRC)
 		return false;
 
-	if (pinfo->chrdet_state)
+	if (info->chrdet_state)
 		return true;
 	else if (mt6379_int_chrdet_attach() == true)
 		return true;
@@ -4210,7 +4215,15 @@ int chg_alg_event(struct notifier_block *notifier,
 static void mtk_tcpc_set_otg_enable(struct oplus_chg_ic_dev *ic_dev, bool en)
 {
 	struct mtk_charger *chip;
+
+	/* op6893 6.6 bring-up: ic_dev is NULL on this DTB (oplus_mtk_ic_register
+	 * bails on the missing oplus,ic_type prop), so the drvdata lookup
+	 * faults.  OTG enable has no consumer without the ic framework anyway. */
+	if (!ic_dev)
+		return;
 	chip = oplus_chg_ic_get_drvdata(ic_dev);
+	if (!chip)
+		return;
 
 	if (chip->otg_enable == en)
 		return;
@@ -4339,6 +4352,45 @@ static void oplus_sourcecap_done_work(struct work_struct *work)
 		oplus_chg_set_icl_by_vote(max_pdo_current, PD_PDO_ICL_VOTER);
 }
 
+#define PD_9V_TRY_DELAY_MS 500
+static void oplus_pd_9v_try_work(struct work_struct *work)
+{
+	struct mtk_charger *chip = container_of(work,
+		struct mtk_charger, pd_9v_try_work.work);
+	int chg_vol = 0;
+	int batt_volt = 0;
+	int ret;
+
+	if (chip->pd_type != MTK_PD_CONNECT_PE_READY_SNK_APDO) {
+		chg_info("pd_9v_try: pd_type=%d changed, skip\n", chip->pd_type);
+		return;
+	}
+
+	chg_vol = battery_meter_get_charger_voltage();
+	if (chg_vol <= OPLUS_CHG_PULL_UP_VOLT_THR) {
+		chg_info("pd_9v_try: request 9V/2A, chg_vol=%d\n", chg_vol);
+		ret = oplus_chg_set_pps_config(chip->ic_dev, VBUS_9V, IBUS_2A);
+		if (ret) {
+			chg_err("pd_9v_try: set 9V fail ret=%d, keep 5V\n", ret);
+			return;
+		}
+		if (chip->pd_type != MTK_PD_CONNECT_PE_READY_SNK_APDO) {
+			chg_info("pd_9v_try: detached during request, skip\n");
+			return;
+		}
+	} else {
+		chg_info("pd_9v_try: already %dmV, skip request\n", chg_vol);
+	}
+
+	if (chip->chg1_dev)
+		charger_dev_set_input_current(chip->chg1_dev, IBUS_2A * 1000);
+	batt_volt = get_battery_voltage(chip);
+	oplus_mt6379_set_aicl_point(chip->ic_dev, batt_volt);
+	chip->pd_chg_volt = VBUS_9V;
+	chg_info("pd_9v_try: done chg_vol=%d batt=%d\n",
+		battery_meter_get_charger_voltage(), batt_volt);
+}
+
 #define DEFAULT_CURR_BY_CC 100
 #define SINK_SUSPEND_CURRENT 5
 
@@ -4380,6 +4432,7 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 		switch (noti->pd_state.connected) {
 		case  PD_CONNECT_NONE:
 			pinfo->pd_type = MTK_PD_CONNECT_NONE;
+			cancel_delayed_work_sync(&pinfo->pd_9v_try_work);
 			oplus_chg_suspend_charger(false, PD_PDO_ICL_VOTER);
 			pinfo->pd_chg_volt = VBUS_5V;
 			chr_err("PD Notify Detach\n");
@@ -4388,6 +4441,7 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 
 		case PD_CONNECT_HARD_RESET:
 			pinfo->pd_type = MTK_PD_CONNECT_NONE;
+			cancel_delayed_work_sync(&pinfo->pd_9v_try_work);
 			chr_err("PD Notify HardReset\n");
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
@@ -4410,6 +4464,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			pinfo->pd_type = MTK_PD_CONNECT_PE_READY_SNK_APDO;
 			chr_err("PD Notify APDO Ready\n");
 			oplus_get_adapter_svid();
+			schedule_delayed_work(&pinfo->pd_9v_try_work,
+				msecs_to_jiffies(PD_9V_TRY_DELAY_MS));
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
 
@@ -7209,13 +7265,19 @@ static int oplus_mtk_ic_register(struct device *dev, struct mtk_charger *info)
 
 	rc = of_property_read_u32(node, "oplus,ic_type", &ic_type);
 	if (rc < 0) {
-		chg_err("can't get ic type, rc=%d\n", rc);
-		return -ENODEV;
-	}
-	rc = of_property_read_u32(node, "oplus,ic_index", &ic_index);
-	if (rc < 0) {
-		chg_err("can't get ic index, rc=%d\n", rc);
-		return -ENODEV;
+		/* op6893 6.6 bring-up: this DTB's /charger node predates the
+		 * v2 ic framework (no oplus,ic_type/index props).  The HAL is
+		 * the buck (type 0, index 0); assume that instead of failing,
+		 * so ic_dev registers and the PD notifier stops faulting. */
+		chg_info("no oplus,ic_type, assume buck 0\n");
+		ic_type = 0; /* OPLUS_CHG_IC_BUCK */
+		ic_index = 0;
+	} else {
+		rc = of_property_read_u32(node, "oplus,ic_index", &ic_index);
+		if (rc < 0) {
+			chg_err("can't get ic index, rc=%d\n", rc);
+			return -ENODEV;
+		}
 	}
 
 	ic_cfg.name = node->name;
@@ -8019,6 +8081,7 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&pinfo->wls_chg_check_work, oplus_wls_chg_check_work);
 	pinfo->pd_chg_volt = VBUS_5V;
 	INIT_DELAYED_WORK(&pinfo->sourcecap_done_work, oplus_sourcecap_done_work);
+	INIT_DELAYED_WORK(&pinfo->pd_9v_try_work, oplus_pd_9v_try_work);
 	INIT_DELAYED_WORK(&pinfo->charger_suspend_recovery_work, oplus_charger_suspend_recovery_work);
 	INIT_DELAYED_WORK(&pinfo->publish_close_cp_item_work, oplus_publish_close_cp_item_work);
 

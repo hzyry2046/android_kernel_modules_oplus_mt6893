@@ -1127,7 +1127,10 @@ bool mt6379_int_chrdet_attach(void)
 	u32 val;
 
 	if (NULL == oplus_cdata) {
-		return -EINVAL;
+		/* op6893 6.6 bring-up: 6379 is not on this board; an int
+		 * return of -EINVAL would read as "attached" through the
+		 * bool return type.  Report detached when unprobed. */
+		return false;
 	}
 
 	ret = mt6379_charger_field_get(oplus_cdata, F_CHRDET_EXT, &val);

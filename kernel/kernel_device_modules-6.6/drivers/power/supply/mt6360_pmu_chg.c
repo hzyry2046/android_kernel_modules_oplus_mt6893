@@ -1704,7 +1704,12 @@ static int __mt6360_enable_chg_type_det(struct mt6360_chg_info *mci, bool en)
 
 	dev_info(mci->dev, "%s: en = %d\n", __func__, en);
 
-	if (!IS_ENABLED(CONFIG_TCPC_CLASS) || pdata->bc12_sel != 0)
+	/* op6893 6.6 bring-up: CONFIG_TCPC_CLASS is on, but nobody drives
+	 * set_online on primary_chg (extcon has no "tcpc" prop on this DTB,
+	 * HAL's charger thread is compiled out).  Take it here instead: the
+	 * TCPC notifier below calls this on SNK attach/detach, and it owns
+	 * chgdet_lock already via its callers. */
+	if (pdata->bc12_sel != 0)
 		return ret;
 
 	mutex_lock(&mci->chgdet_lock);
@@ -3025,6 +3030,76 @@ out:
 	return IRQ_HANDLED;
 }
 
+#if IS_ENABLED(CONFIG_TCPC_CLASS)
+/* op6893 6.6 bring-up: TCPC->BC1.2 bridge.  With CONFIG_TCPC_CLASS on, the
+ * 4.19 design lets the TCPC stack own charger-type detection, but on this
+ * DTB nothing drives it: extcon's "tcpc" prop is missing so its notifier
+ * never registers, and the HAL's charger thread is compiled out
+ * (OPLUS_FEATURE_CHG_BASIC).  Without this bridge primary_chg stays
+ * ONLINE=0/UNKNOWN forever even with a live PD contract.
+ *
+ * On SNK attach: set tcpc_attach + run BC1.2 (pre_process reads
+ * DEVICE_TYPE and sets psy_desc.type / psy_usb_type).  PD chargers come
+ * out DCP here (data lines idle while PD negotiates) and the PD stack
+ * refines the type later via the HAL's PD notifier.  On detach: tear
+ * down (post_process) and clear tcpc_attach so ONLINE reads 0.
+ * SRC attach (we are the source) is ignored -- no charging from that. */
+static int mt6360_pmu_tcpc_notifier(struct notifier_block *nb,
+				    unsigned long event, void *data)
+{
+	struct mt6360_chg_info *mci =
+		container_of(nb, struct mt6360_chg_info, pd_nb);
+	struct tcp_notify *noti = data;
+	bool attached;
+
+	if (event != TCP_NOTIFY_TYPEC_STATE)
+		return NOTIFY_OK;
+
+	switch (noti->typec_state.new_state) {
+	case TYPEC_ATTACHED_SNK:
+	case TYPEC_ATTACHED_NORP_SRC:
+		attached = true;
+		break;
+	case TYPEC_ATTACHED_SRC:
+		/* we source VBUS: no charging, but still mark attach so
+		 * OTG paths can query it; BC1.2 stays off */
+		mutex_lock(&mci->chgdet_lock);
+		atomic_set(&mci->tcpc_attach, true);
+		mutex_unlock(&mci->chgdet_lock);
+		dev_info(mci->dev, "%s: SRC attached, tcpc_attach=1 (no bc12)\n",
+			 __func__);
+		return NOTIFY_OK;
+	default:
+		attached = false;
+		break;
+	}
+
+	__mt6360_enable_chg_type_det(mci, attached);
+	dev_info(mci->dev, "%s: %s, tcpc_attach=%d\n", __func__,
+		 attached ? "SNK attached" : "detached",
+		 atomic_read(&mci->tcpc_attach));
+	return NOTIFY_OK;
+}
+
+static void mt6360_pmu_tcpc_bridge_init(struct mt6360_chg_info *mci)
+{
+	mci->tcpc_dev = tcpc_dev_get_by_name("type_c_port0");
+	if (!mci->tcpc_dev) {
+		dev_info(mci->dev, "%s: type_c_port0 not ready, defer\n",
+			 __func__);
+		return;
+	}
+	mci->pd_nb.notifier_call = mt6360_pmu_tcpc_notifier;
+	if (register_tcp_dev_notifier(mci->tcpc_dev, &mci->pd_nb,
+				     TCP_NOTIFY_TYPE_USB) < 0) {
+		dev_notice(mci->dev, "%s: register notifier fail\n", __func__);
+		mci->tcpc_dev = NULL;
+		return;
+	}
+	dev_info(mci->dev, "%s: TCPC bridge up\n", __func__);
+}
+#endif
+
 #ifdef OPLUS_FEATURE_CHG_BASIC
 #ifdef CONFIG_OPLUS_HVDCP_SUPPORT
 static void mt6360_hvdcp_result_check_work(struct work_struct *work)
@@ -3156,6 +3231,14 @@ static irqreturn_t mt6360_pmu_chrdet_ext_evt_handler(int irq, void *data)
 			   mt6360_chgdet_post_process)(mci);
 		mutex_unlock(&mci->chgdet_lock);
 	}
+#if IS_ENABLED(CONFIG_TCPC_CLASS)
+	/* op6893 6.6: re-arm the TCPC bridge if probe ran before the tcpc
+	 * device existed (first-stage order: pmu_chg < tcpc probe).  The
+	 * TYPEC_STATE notifier is the primary attach path; this only covers
+	 * the missed-registration window. */
+	if (!mci->tcpc_dev && pwr_rdy)
+		mt6360_pmu_tcpc_bridge_init(mci);
+#endif
 	if (atomic_read(&mci->pe_complete) && pwr_rdy == true &&
 	    mci->chip_rev <= 0x02) {
 		dev_info(mci->dev, "%s: re-trigger pe20 pattern\n", __func__);
@@ -3275,6 +3358,17 @@ static void mt6360_pmu_chg_irq_register(struct platform_device *pdev)
 		if (unlikely(!irq_desc->name))
 			continue;
 		ret = platform_get_irq_byname(pdev, irq_desc->name);
+		if (ret < 0 && !strcmp(irq_desc->name, "attach_i")) {
+			/* op6893 6.6 bring-up: the 4.19 DT spells this IRQ
+			 * "attachi" while the driver asks for "attach_i";
+			 * platform_get_irq_byname() misses and BC1.2 result
+			 * never arrives (no "Charger Type" line, psy type
+			 * stuck UNKNOWN, extcon never cuts USB device role).
+			 * Driver-side alias, no DT change. */
+			dev_info(&pdev->dev, "%s: try attachi alias\n",
+				 __func__);
+			ret = platform_get_irq_byname(pdev, "attachi");
+		}
 		if (ret < 0)
 			continue;
 		irq_desc->irq = ret;
@@ -4473,6 +4567,18 @@ static int mt6360_pmu_chg_probe(struct platform_device *pdev)
 	/* Schedule work for microB's BC1.2 */
 	if (!IS_ENABLED(CONFIG_TCPC_CLASS) && pdata->bc12_sel == 0)
 		schedule_work(&mci->chgdet_work);
+#if IS_ENABLED(CONFIG_TCPC_CLASS)
+	/* op6893 6.6: arm the TCPC->BC1.2 bridge; late_sync (tcpc_class_complete
+	 * equivalent) is required for the stack to emit TYPEC_STATE, and our
+	 * own notifier registration defers silently if the tcpc device isn't
+	 * up yet -- re-arm from the chrdet IRQ when that happens (see below).
+	 * If already attached at probe (boot with cable), TYPEC_STATE won't
+	 * re-fire, so poll the current state once. */
+	mt6360_pmu_tcpc_bridge_init(mci);
+	if (mci->tcpc_dev && tcpm_inquire_typec_attach_state(mci->tcpc_dev) !=
+	    TYPEC_UNATTACHED)
+		__mt6360_enable_chg_type_det(mci, true);
+#endif
 	dev_info(&pdev->dev, "%s: successfully probed\n", __func__);
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	oplusmci = mci;
@@ -4519,6 +4625,13 @@ static int mt6360_pmu_chg_remove(struct platform_device *pdev)
 		kthread_stop(mci->mivr_task);
 	}
 	device_remove_file(mci->dev, &dev_attr_shipping_mode);
+#if IS_ENABLED(CONFIG_TCPC_CLASS)
+	if (mci->tcpc_dev) {
+		unregister_tcp_dev_notifier(mci->tcpc_dev, &mci->pd_nb,
+					    TCP_NOTIFY_TYPE_USB);
+		mci->tcpc_dev = NULL;
+	}
+#endif
 #if IS_ENABLED(CONFIG_MTK_CHARGER)
 	charger_device_unregister(mci->chg_dev);
 #endif /* CONFIG_MTK_CHARGER */
