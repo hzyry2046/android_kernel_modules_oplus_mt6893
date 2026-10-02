@@ -732,7 +732,9 @@ extern int get_charger_zcv(struct mtk_charger *info,
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0))
 void _wake_up_charger(struct charger_manager *info);
 #else
-static void _wake_up_charger(struct mtk_charger *info) __attribute__((unused));
+/* op6893 6.6 bring-up: the framework objects are built again (Phase 2), so
+ * the real definition in mtk_charger.c is linked; declare it extern. */
+void _wake_up_charger(struct mtk_charger *info);
 #endif
 extern int mtk_adapter_switch_control(struct mtk_charger *info);
 extern int mtk_selected_adapter_ready(struct mtk_charger *info);

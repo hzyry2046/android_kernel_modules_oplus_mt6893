@@ -1,0 +1,16 @@
+# op6893 6.6 bring-up: legacy MT6360 PMU MFD ported from the 4.19 v1/pmu tree.
+# The stock 4.19 DTB's subpmic@34 node (mediatek,subpmic) does not match the
+# 6.6 upstream mt6360-core (mediatek,mt6360, dummy-slave model); this MFD
+# speaks the DT's language (GPIO-EINT + software irq_domain + subdev cells).
+# Mutually exclusive with DEVICE_MODULES_MFD_MT6360: only one may bind 0x34.
+
+config MFD_MT6360_PMU_LEGACY
+	tristate "op6893: legacy MT6360 PMU MFD (4.19 port)"
+	depends on I2C
+	depends on !DEVICE_MODULES_MFD_MT6360
+	select MFD_CORE
+	help
+	  Legacy MT6360 PMU MFD (i2c/irq/subdev/core cells) ported from the
+	  4.19 v1/pmu tree for the frozen 4.19 DTB (mediatek,subpmic).
+	  Provides the IRQ domain that the TCPC (type_c_port0) and the
+	  charger cell (mediatek,mt6360_pmu_chg) need.  Say M here.

@@ -20,9 +20,12 @@ else ifeq ($(CONFIG_CHARGER_BQ25601),y)
 obj-$(CONFIG_CHARGER_BQ25601) += mtk_charger_framework.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_ufcs_adapter.o
 else
 #ifndef OPLUS_FEATURE_CHG_BASIC
-#obj-$(CONFIG_MTK_CHARGER) += mtk_charger_framework.o mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o mtk_ufcs_adapter.o
+# op6893 6.6 bring-up (Phase 2, 2026-10-02): the vendor default above builds
+# the charger framework without mtk_charger.o itself, so no charger psy ever
+# registers and nothing drives the MT6360.  Build the full framework instead.
+obj-$(CONFIG_MTK_CHARGER) += mtk_charger_framework.o mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o mtk_ufcs_adapter.o
 #endif
-#mtk_charger_framework-objs := mtk_charger.o mtk_charger_intf.o mtk_basic_charger.o mtk_pulse_charger.o mtk_adapter_switch.o
+mtk_charger_framework-objs := mtk_charger.o mtk_charger_intf.o mtk_basic_charger.o mtk_pulse_charger.o mtk_adapter_switch.o
 #else
 obj-$(CONFIG_MTK_CHARGER) += mtk_pd_charging.o charger_class.o adapter_class.o mtk_charger_algorithm_class.o mtk_pd_adapter.o
 #endif
