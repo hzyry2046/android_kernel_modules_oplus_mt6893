@@ -445,6 +445,15 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 			noti->typec_state.new_state == TYPEC_ATTACHED_DBGACC_SNK)) {
 			dev_info(dev, "Type-C SINK plug in\n");
 			mtk_usb_extcon_set_role(extcon, USB_ROLE_DEVICE);
+		} else if (extcon->bypss_typec_sink &&
+			noti->typec_state.old_state == TYPEC_UNATTACHED &&
+			(noti->typec_state.new_state == TYPEC_ATTACHED_SNK ||
+			noti->typec_state.new_state == TYPEC_ATTACHED_NORP_SRC)) {
+			/* op6893 6.6 bring-up: bypass prop is set on this DTB,
+			 * but with no ID/VBUS GPIO and no other role driver,
+			 * nothing else cuts device role on a PD power bank. */
+			dev_info(dev, "Type-C SINK plug in (bypass compat)\n");
+			mtk_usb_extcon_set_role(extcon, USB_ROLE_DEVICE);
 		} else if ((noti->typec_state.old_state == TYPEC_ATTACHED_SRC ||
 			noti->typec_state.old_state == TYPEC_ATTACHED_SNK ||
 			noti->typec_state.old_state == TYPEC_ATTACHED_NORP_SRC ||
@@ -483,12 +492,23 @@ static int mtk_usb_extcon_tcpc_init(struct mtk_extcon_info *extcon)
 	int ret;
 
 	ret = of_property_read_string(np, "tcpc", &tcpc_name);
-	if (ret < 0)
-		return -ENODEV;
+	if (ret < 0) {
+		/* op6893 6.6 bring-up: no "tcpc" prop on this DTB; fall back
+		 * to the canonical name instead of leaving the notifier
+		 * unregistered.  Defer silently (-EPROBE_DEFER style) when
+		 * the tcpc device is not up yet. */
+		tcpc_name = "type_c_port0";
+		dev_info(extcon->dev, "no tcpc prop, fallback to %s\n",
+			 tcpc_name);
+	}
 
 	tcpc_dev = tcpc_dev_get_by_name(tcpc_name);
 	if (!tcpc_dev) {
-		dev_err(extcon->dev, "get tcpc device fail\n");
+		if (extcon->tcpc_fallback == 0)
+			dev_info(extcon->dev,
+				 "tcpc %s not ready, defer fallback bind\n",
+				 tcpc_name);
+		extcon->tcpc_fallback = -1;
 		return -ENODEV;
 	}
 
@@ -502,10 +522,30 @@ static int mtk_usb_extcon_tcpc_init(struct mtk_extcon_info *extcon)
 	}
 
 	extcon->tcpc_dev = tcpc_dev;
+	if (extcon->tcpc_fallback < 0)
+		dev_info(extcon->dev, "tcpc fallback bind ok\n");
+	extcon->tcpc_fallback = 1;
 
 	return 0;
 }
 #endif
+
+static void mtk_usb_extcon_tcpc_retry_work(struct work_struct *work)
+{
+#if IS_ENABLED(CONFIG_TCPC_CLASS)
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct mtk_extcon_info *extcon = container_of(dwork,
+		struct mtk_extcon_info, wq_tcpc_retry);
+	int ret;
+
+	if (extcon->tcpc_dev)
+		return;
+	ret = mtk_usb_extcon_tcpc_init(extcon);
+	if (ret < 0)
+		queue_delayed_work(system_power_efficient_wq,
+			&extcon->wq_tcpc_retry, msecs_to_jiffies(2000));
+#endif
+}
 
 static void mtk_usb_extcon_detect_cable(struct work_struct *work)
 {
@@ -773,9 +813,14 @@ static int mtk_usb_extcon_probe(struct platform_device *pdev)
 
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
 	/* tcpc */
+	INIT_DELAYED_WORK(&extcon->wq_tcpc_retry,
+		mtk_usb_extcon_tcpc_retry_work);
 	ret = mtk_usb_extcon_tcpc_init(extcon);
-	if (ret < 0)
-		dev_err(dev, "failed to init tcpc\n");
+	if (ret < 0) {
+		dev_info(dev, "tcpc bind deferred, retry in background\n");
+		queue_delayed_work(system_power_efficient_wq,
+			&extcon->wq_tcpc_retry, msecs_to_jiffies(2000));
+	}
 #endif
 
 	platform_set_drvdata(pdev, extcon);

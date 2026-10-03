@@ -4353,6 +4353,37 @@ static void oplus_sourcecap_done_work(struct work_struct *work)
 }
 
 #define PD_9V_TRY_DELAY_MS 500
+#define PD_9V_WDT_KICK_MS 15000
+static void oplus_pd_9v_kick_work(struct work_struct *work)
+{
+	struct mtk_charger *chip = container_of(work,
+		struct mtk_charger, pd_9v_kick_work.work);
+	struct charger_device *chg = chip->chg1_dev;
+	int vbus = 0, ibus = 0, vbat = 0, ibat = 0;
+	bool en = false;
+	int ret;
+
+	/* stop kicking once detached or the buck is gone */
+	if (!chg || chip->pd_type != MTK_PD_CONNECT_PE_READY_SNK_APDO)
+		return;
+
+	ret = charger_dev_kick_wdt(chg);
+	if (ret < 0) {
+		chg_err("pd_9v_kick: kick fail ret=%d\n", ret);
+		return;
+	}
+	charger_dev_is_enabled(chg, &en);
+	charger_dev_get_vbus(chg, &vbus);
+	charger_dev_get_ibus(chg, &ibus);
+	vbat = get_battery_voltage(chip);
+	ibat = get_battery_current(chip);
+	chg_info("pd_9v_kick: en=%d vbus=%d ibus=%d vbat=%d ibat=%d\n",
+		en, vbus, ibus, vbat, ibat);
+
+	schedule_delayed_work(&chip->pd_9v_kick_work,
+		msecs_to_jiffies(PD_9V_WDT_KICK_MS));
+}
+
 static void oplus_pd_9v_try_work(struct work_struct *work)
 {
 	struct mtk_charger *chip = container_of(work,
@@ -4412,6 +4443,10 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 	if (ret < 0)
 		chg_err("pd_9v_try: enable fail ret=%d\n", ret);
 
+	ret = charger_dev_kick_wdt(chg);
+	if (ret < 0)
+		chg_err("pd_9v_try: kick fail ret=%d\n", ret);
+
 	ret = charger_dev_is_enabled(chg, &en);
 	chg_info("pd_9v_try: done chg_vol=%d->%d batt=%d enabled=%d\n",
 		chg_vol, battery_meter_get_charger_voltage(),
@@ -4419,6 +4454,12 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 	batt_volt = get_battery_voltage(chip);
 	oplus_mt6379_set_aicl_point(chip->ic_dev, batt_volt);
 	chip->pd_chg_volt = VBUS_9V;
+
+	/* keep the charger WDT fed: the charger thread is compiled out, so
+	 * nothing else touches the buck after this point. */
+	cancel_delayed_work_sync(&chip->pd_9v_kick_work);
+	schedule_delayed_work(&chip->pd_9v_kick_work,
+		msecs_to_jiffies(PD_9V_WDT_KICK_MS));
 }
 
 #define DEFAULT_CURR_BY_CC 100
@@ -4463,6 +4504,7 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 		case  PD_CONNECT_NONE:
 			pinfo->pd_type = MTK_PD_CONNECT_NONE;
 			cancel_delayed_work_sync(&pinfo->pd_9v_try_work);
+			cancel_delayed_work_sync(&pinfo->pd_9v_kick_work);
 			oplus_chg_suspend_charger(false, PD_PDO_ICL_VOTER);
 			pinfo->pd_chg_volt = VBUS_5V;
 			chr_err("PD Notify Detach\n");
@@ -4472,6 +4514,7 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 		case PD_CONNECT_HARD_RESET:
 			pinfo->pd_type = MTK_PD_CONNECT_NONE;
 			cancel_delayed_work_sync(&pinfo->pd_9v_try_work);
+			cancel_delayed_work_sync(&pinfo->pd_9v_kick_work);
 			chr_err("PD Notify HardReset\n");
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
@@ -8112,6 +8155,7 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	pinfo->pd_chg_volt = VBUS_5V;
 	INIT_DELAYED_WORK(&pinfo->sourcecap_done_work, oplus_sourcecap_done_work);
 	INIT_DELAYED_WORK(&pinfo->pd_9v_try_work, oplus_pd_9v_try_work);
+	INIT_DELAYED_WORK(&pinfo->pd_9v_kick_work, oplus_pd_9v_kick_work);
 	INIT_DELAYED_WORK(&pinfo->charger_suspend_recovery_work, oplus_charger_suspend_recovery_work);
 	INIT_DELAYED_WORK(&pinfo->publish_close_cp_item_work, oplus_publish_close_cp_item_work);
 

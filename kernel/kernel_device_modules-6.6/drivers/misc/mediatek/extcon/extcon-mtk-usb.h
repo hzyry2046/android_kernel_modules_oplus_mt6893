@@ -19,6 +19,12 @@ struct mtk_extcon_info {
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
 	struct tcpc_device *tcpc_dev;
 	struct notifier_block tcpc_nb;
+	/* op6893 6.6 bring-up: this DTB's extcon_usb node has no "tcpc" prop
+	 * and sets mediatek,bypss-typec-sink, so the TCPC notifier never
+	 * registers and SNK attach never cuts the USB device role (adb over
+	 * the PD power bank never enumerates).  Fall back to a name lookup
+	 * for type_c_port0; 0 = not tried, 1 = bound, -1 = absent. */
+	int tcpc_fallback;
 #endif
 	bool bypss_typec_sink;
 	/* id/vbus gpio */
@@ -27,6 +33,7 @@ struct mtk_extcon_info {
 	int id_irq;
 	int vbus_irq;
 	struct delayed_work wq_detcable;
+	struct delayed_work wq_tcpc_retry;
 	unsigned int vbus_limit_cur;
 	bool vbus_cur_inlimit;
 #ifdef OPLUS_FEATURE_CHG_BASIC
