@@ -1,0 +1,26 @@
+# BQ2597x charge pump / OTG boost, built standalone for the 6.6 v2 stack.
+#
+# The op6893 needs this chip for one thing: it is what produces OTG VBUS (see
+# the 4.19 capture -- "oplus_bq2597x_otg_en ok" right after "typec vbus_on").
+# On 6.6 the charging stack is CONFIG_OPLUS_CHG_V2, and the charger Makefile
+# only descends into v1/ when v2 is off, so this driver was never built.
+#
+# oplus_bq2597x.c here is a copy of the v1 tree's copy (itself byte-identical
+# to the 4.19 original); the only edits are documented in place.  Re-diff
+# against v1/charger_ic/oplus_bq2597x.c to see them.
+#
+# Header search: V1 for the v2-side headers, V1/v1 for the ones only v1 ships
+# (oplus_chg_symbol.h is a symlink into v1/ that does not resolve from here).
+# The include paths are passed as KCFLAGS, not ccflags-y: build_module_dir.sh
+# overwrites NOSTDINC_FLAGS on the make command line and a command-line
+# assignment beats anything ccflags-y would contribute.
+#
+# No v1 .c is compiled.  oplus_vooc_init_cp() is the single v1 symbol the
+# driver needs and it is a one-line setter, stubbed in bq2597x_glue.c rather
+# than pulling in v1/oplus_vooc.c and its vooc state machine, which this board
+# does not run.  If another symbol turns out to be needed, add an explicit
+# stub to bq2597x_glue.c -- do not add a v1 object.
+
+obj-m += bq2597x-charger.o
+
+bq2597x-charger-y := bq2597x_drv.o bq2597x_glue.o
