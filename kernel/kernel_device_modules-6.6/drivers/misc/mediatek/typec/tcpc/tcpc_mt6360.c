@@ -2156,6 +2156,30 @@ static int mt6360_tcpcdev_init(struct mt6360_chip *chip, struct device *dev)
 		desc->role_def = TYPEC_ROLE_DRP;
 	}
 
+	/*
+	 * op6893 6.6 OTG: never stay SNK-only.
+	 *
+	 * This DTB sets mt-tcpc,role_def = <1> (TYPEC_ROLE_SNK).  With that role
+	 * the port has two problems:
+	 *
+	 *   1. It only ever presents Rd on CC, so it can never be a host.
+	 *   2. In low power mode tcpci_set_low_power_mode() picks the CC pull
+	 *      from typec_role -- SNK means TYPEC_CC_RD -- so once the port goes
+	 *      idle it sits on Rd waiting for someone else's Rp.  Plugging a
+	 *      passive dock (which also presents Rd) then produces no CC change
+	 *      at all and nothing is ever detected.  That is why replugging the
+	 *      dock produced zero tcpc events.
+	 *
+	 * DRP fixes both: the CC toggles Rp/Rd so a source-capable partner can
+	 * be seen, and OTG has something to switch away from.  Sink operation is
+	 * unaffected -- DRP still attaches as a sink to a charger, which is the
+	 * normal path this board charges on.
+	 */
+	if (desc->role_def == TYPEC_ROLE_SNK) {
+		dev_info(dev, "%s: role_def SNK -> DRP for OTG\n", __func__);
+		desc->role_def = TYPEC_ROLE_DRP;
+	}
+
 	if (of_property_read_u32(np, "mt-tcpc,rp-level", &val) >= 0 ||
 	    of_property_read_u32(np, "mt-tcpc,rp_level", &val) >= 0) {
 		switch (val) {
