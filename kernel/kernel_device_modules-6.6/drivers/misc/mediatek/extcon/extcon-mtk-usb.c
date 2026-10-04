@@ -413,14 +413,15 @@ static ssize_t vbus_switch_store(struct device *dev,
 				    const char *buf, size_t count)
 {
 	struct mtk_extcon_info *extcon = dev_get_drvdata(dev);
-	struct regulator *vbus = extcon->vbus;
 	int is_on = 0;
 
-	/* Check whether we have vbus instance */
-	if (!vbus) {
-		dev_info(dev, "No vbus instance\n");
-		return -EOPNOTSUPP;
-	}
+	/*
+	 * op6893 6.6 OTG: there is no vbus regulator on this DTB, but
+	 * mtk_usb_extcon_set_vbus() now falls back to the BQ2597x charge pump,
+	 * so do not refuse the write just because extcon->vbus is NULL.  This
+	 * attribute is also the manual trigger for OTG while the automatic path
+	 * is still being wired up.
+	 */
 	if ((kstrtoint(buf, 10, &is_on) != 0) || (is_on != 1  && is_on != 0)) {
 		dev_info(dev, "Invalid input\n");
 		return -EINVAL;
