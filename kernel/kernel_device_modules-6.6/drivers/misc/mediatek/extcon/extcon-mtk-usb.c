@@ -118,6 +118,12 @@ static bool usb_is_online(struct mtk_extcon_info *extcon)
 	union power_supply_propval tval;
 	int ret;
 
+	/* op6893 6.6 OTG: bind late -- primary_chg probes after us. */
+	if (!extcon->usb_psy)
+		extcon->usb_psy = power_supply_get_by_name("primary_chg");
+	if (!extcon->usb_psy)
+		return false;
+
 	ret = power_supply_get_property(extcon->usb_psy,
 				POWER_SUPPLY_PROP_ONLINE, &pval);
 	if (ret < 0) {
@@ -193,10 +199,15 @@ static int mtk_usb_extcon_psy_init(struct mtk_extcon_info *extcon)
 		/* try to get by name */
 		extcon->usb_psy = power_supply_get_by_name("primary_chg");
 		if (IS_ERR_OR_NULL(extcon->usb_psy)) {
-			dev_err(dev, "fail to get usb_psy\n");
+			/*
+			 * op6893 6.6 OTG bring-up: primary_chg is an i2c device
+			 * that probes after extcon, so the lookup legitimately
+			 * fails here.  Don't give up on the whole psy chain --
+			 * retry lazily from the notifier path, the same way the
+			 * charging stack binds its own psy handles.
+			 */
+			dev_info(dev, "usb_psy not up yet, will retry lazily\n");
 			extcon->usb_psy = NULL;
-			ret = -EINVAL;
-			goto fail;
 		}
 	}
 
