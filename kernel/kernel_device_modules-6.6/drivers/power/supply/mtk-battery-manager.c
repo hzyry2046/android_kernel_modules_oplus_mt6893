@@ -1332,7 +1332,13 @@ static int bs_psy_get_property(struct power_supply *psy,
 		if (IS_ERR_OR_NULL(bs_data->chg_psy)) {
 			bs_data->chg_psy = devm_power_supply_get_by_phandle(
 				bm->dev, "charger");
-			pr_err("%s retry to get chg_psy\n", __func__);
+			/* op6893: phandle never resolves on this DTB; same
+			 * name fallback as external_power_changed. */
+			if (IS_ERR_OR_NULL(bs_data->chg_psy))
+				bs_data->chg_psy = power_supply_get_by_name(
+					"mtk-master-charger");
+			if (IS_ERR_OR_NULL(bs_data->chg_psy))
+				pr_err("%s retry to get chg_psy\n", __func__);
 		}
 		if (IS_ERR_OR_NULL(bs_data->chg_psy)) {
 			pr_err("%s Couldn't get chg_psy\n", __func__);
@@ -1415,9 +1421,19 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 	if (IS_ERR_OR_NULL(chg_psy)) {
 		chg_psy = devm_power_supply_get_by_phandle(bm->dev,
 						       "charger");
-		pr_err("%s retry to get chg_psy\n", __func__);
+		/* op6893 6.6 bring-up: the "charger" platform device carries
+		 * no phandle to the mtk-master-charger psy on this DTB, so
+		 * the phandle lookup never resolves and bat_status stays
+		 * DISCHARGING forever (no charging icon).  Fall back to a
+		 * name lookup like mt6359p-gauge.c does.  This runs in
+		 * external_power_changed (notifier context), never probe. */
+		if (IS_ERR_OR_NULL(chg_psy))
+			chg_psy = power_supply_get_by_name("mtk-master-charger");
 		bs_data->chg_psy = chg_psy;
-	} else {
+		if (IS_ERR_OR_NULL(chg_psy))
+			pr_err("%s retry to get chg_psy\n", __func__);
+	}
+	if (!IS_ERR_OR_NULL(chg_psy)) {
 		ret |= power_supply_get_property(chg_psy,
 			POWER_SUPPLY_PROP_ONLINE, &online);
 
@@ -2063,8 +2079,15 @@ static int mtk_bm_probe(struct platform_device *pdev)
 
 
 	bm->bs_data.chg_psy = devm_power_supply_get_by_phandle(&pdev->dev, "charger");
-	if (IS_ERR_OR_NULL(bm->bs_data.chg_psy))
-		pr_err("[%s]Fail to get chg_psy!\n", __func__);
+	if (IS_ERR_OR_NULL(bm->bs_data.chg_psy)) {
+		/* op6893: no phandle on this DTB.  Do NOT do a name lookup
+		 * here -- probe runs before mtk-master-charger registers and
+		 * class_find_device on unregistered psy memory faults
+		 * (6b6b6b poison, same lesson as the HAL chg_psy crash).
+		 * external_power_changed retries with the name fallback. */
+		pr_err("[%s]Fail to get chg_psy! (retry via external_power_changed)\n",
+			__func__);
+	}
 
 	bm_battery_service_init(bm);
 	mtk_bm_create_netlink(pdev);
