@@ -277,6 +277,7 @@ EXPORT_SYMBOL(oplus_get_prop_status);
 
 /* mt6360_pmu_chg: true CHARGING state from the buck's own registers. */
 extern int mt6360_chg_is_charging(void);
+static int mtk_chg_get_charger_type(struct oplus_chg_ic_dev *ic_dev, int *type);
 
 bool oplus_mt_get_vbus_status(void)
 {
@@ -4386,6 +4387,25 @@ static void oplus_sourcecap_done_work(struct work_struct *work)
 
 #define PD_9V_TRY_DELAY_MS 500
 #define PD_9V_WDT_KICK_MS 15000
+/* op6893 6.6 bring-up: the health HAL derives "plugged"/charging from
+ * /sys/devices/platform/charger/chr_type (-> chr_type_show), which the
+ * compiled-out charger thread normally refreshes via mtk_is_charger_on().
+ * Keep it in sync here so the UI shows a charging icon.  Values match
+ * enum oplus_chg_usb_type. */
+static void oplus_mt_sync_chr_type(struct mtk_charger *chip)
+{
+	int type = OPLUS_CHG_USB_TYPE_UNKNOWN;
+	int rc;
+
+	rc = mtk_chg_get_charger_type(chip->ic_dev, &type);
+	if (rc < 0)
+		type = OPLUS_CHG_USB_TYPE_UNKNOWN;
+	if (chip->chr_type != type) {
+		chg_info("chr_type %d -> %d\n", chip->chr_type, type);
+		chip->chr_type = type;
+	}
+}
+
 static void oplus_pd_9v_kick_work(struct work_struct *work)
 {
 	struct mtk_charger *chip = container_of(work,
@@ -4416,6 +4436,7 @@ static void oplus_pd_9v_kick_work(struct work_struct *work)
 	charger_dev_get_vbus(chg, &vbat);
 	chg_info("pd_9v_kick: en=%d vbus=%d ibus=%d ibat=%d\n",
 		en, vbus, ibus, ibat);
+	oplus_mt_sync_chr_type(chip);
 
 	schedule_delayed_work(&chip->pd_9v_kick_work,
 		msecs_to_jiffies(PD_9V_WDT_KICK_MS));
@@ -4640,6 +4661,10 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			/*fix the one plus charger break bug: delay to set the pd_svooc state*/
 			schedule_delayed_work(&pinfo->detach_clean_work, msecs_to_jiffies(500));
 		}
+		/* op6893 6.6: keep the HAL chr_type the health HAL reads in
+		 * sync with plug state (the charger thread would normally do
+		 * this; it is compiled out). */
+		oplus_mt_sync_chr_type(pinfo);
 		oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_PLUGIN);
 		break;
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0))
