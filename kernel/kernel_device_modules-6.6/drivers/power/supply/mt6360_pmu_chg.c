@@ -3818,6 +3818,30 @@ bool mt6360_get_vbus_status(void)
 }
 EXPORT_SYMBOL(mt6360_get_vbus_status);
 
+/* op6893 6.6 bring-up: true CHARGING state (pwr_rdy + CHG_EN + not DONE/
+ * FAULT), same criteria as primary_chg POWER_SUPPLY_PROP_STATUS.  The
+ * mtk-master-charger psy lacks the raw regmap access to compute this, and
+ * mtk_battery_manager consumes its STATUS for the charging icon. */
+int mt6360_chg_is_charging(void)
+{
+	bool pwr_rdy = false, chg_en = false;
+	enum mt6360_charging_status chg_stat = MT6360_CHG_STATUS_MAX;
+
+	if (!oplusmci || atomic_read(&oplusmci->suspended) == 1)
+		return 0;
+	if (IS_ENABLED(CONFIG_TCPC_CLASS))
+		pwr_rdy = atomic_read(&oplusmci->tcpc_attach);
+	if (!pwr_rdy)
+		return 0;
+	if (__mt6360_is_enabled(oplusmci, &chg_en) < 0 || !chg_en)
+		return 0;
+	if (mt6360_get_charging_status(oplusmci, &chg_stat) < 0)
+		return 0;
+	return (chg_stat == MT6360_CHG_STATUS_READY ||
+		chg_stat == MT6360_CHG_STATUS_PROGRESS);
+}
+EXPORT_SYMBOL(mt6360_chg_is_charging);
+
 int mt6360_get_vbus_rising(void)
 {
 	bool vbus_rising = false;

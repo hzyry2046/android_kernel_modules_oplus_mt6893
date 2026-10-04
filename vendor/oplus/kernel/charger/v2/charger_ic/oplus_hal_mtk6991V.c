@@ -275,6 +275,9 @@ int oplus_get_prop_status(void)
 }
 EXPORT_SYMBOL(oplus_get_prop_status);
 
+/* mt6360_pmu_chg: true CHARGING state from the buck's own registers. */
+extern int mt6360_chg_is_charging(void);
+
 bool oplus_mt_get_vbus_status(void)
 {
 	struct mtk_charger *info = pinfo;
@@ -3882,6 +3885,7 @@ static void oplus_publish_close_cp_item_work(struct work_struct *work)
 static enum power_supply_property charger_psy_properties[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TEMP,
@@ -3944,6 +3948,18 @@ static int psy_charger_get_property(struct power_supply *psy,
 			val->intval = true;
 		else
 			val->intval = false;
+		break;
+	case POWER_SUPPLY_PROP_STATUS:
+		/* op6893 6.6 bring-up: mtk_battery_manager reads ONLINE+
+		 * STATUS from this psy to compute bat_status (the charging
+		 * icon).  STATUS was missing from the table so the read
+		 * failed with -EINVAL before reaching any getter and the
+		 * battery stayed "Discharging" on every charger.  The real
+		 * CHG_EN/chg_stat registers live behind mt6360_pmu_chg's
+		 * regmap, so ask it. */
+		val->intval = mt6360_chg_is_charging() ?
+			POWER_SUPPLY_STATUS_CHARGING :
+			POWER_SUPPLY_STATUS_DISCHARGING;
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		val->intval = info->enable_hv_charging;
