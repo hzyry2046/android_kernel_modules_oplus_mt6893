@@ -439,9 +439,18 @@ static int mtk_usb_extcon_vbus_init(struct mtk_extcon_info *extcon)
 	int ret = 0;
 	struct device *dev = extcon->dev;
 
+	/*
+	 * op6893 6.6 OTG: this DTB has no vbus-supply, so the regulator is
+	 * unavailable -- but that is no longer a reason to bail out of the whole
+	 * function.  mtk_usb_extcon_set_vbus() drives the BQ2597x charge pump
+	 * when extcon->vbus is NULL, and the vbus_switch attribute at the end of
+	 * this function is the manual trigger for that.  Returning early here
+	 * skipped device_create_file() and left no way to switch OTG on at all.
+	 */
 	if (!of_property_read_bool(dev->of_node, "vbus-supply")) {
-		ret = -EINVAL;
-		goto fail;
+		dev_info(dev, "no vbus-supply; using charge-pump path\n");
+		extcon->vbus = NULL;
+		goto no_regulator;
 	}
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
@@ -470,6 +479,7 @@ static int mtk_usb_extcon_vbus_init(struct mtk_extcon_info *extcon)
 	extcon->vbus_on = regulator_is_enabled(extcon->vbus);
 	dev_info(dev, "vbus is %s\n", extcon->vbus_on ? "on" : "off");
 
+no_regulator:
 	if (!of_property_read_u32(dev->of_node, "vbus-voltage",
 				&extcon->vbus_vol))
 		dev_info(dev, "vbus-voltage=%d", extcon->vbus_vol);
@@ -490,6 +500,7 @@ static int mtk_usb_extcon_vbus_init(struct mtk_extcon_info *extcon)
 	if (ret)
 		dev_info(dev, "failed to create vbus switch node\n");
 
+	ret = 0;
 fail:
 	return ret;
 }
