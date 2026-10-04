@@ -77,12 +77,25 @@ int op6893_otg_boost_enable(bool en)
 	}
 
 	/*
-	 * DRP rather than SRC: 4.19 used DRP, and it keeps a charger able to
-	 * attach the normal way once OTG is switched off again.
+	 * TYPEC_ROLE_TRY_SNK, not DRP.
+	 *
+	 * The 4.19 capture shows its state machine going Try.SNK -> TryWait.SRC
+	 * on its own and only then raising VBUS:
+	 *
+	 *   389.948  TCPC-TYPEC:** Try.SNK
+	 *   390.051  TCPC-TYPEC:** TryWait.SRC
+	 *   390.066  mtk-extcon-usb: source vbus = 5000mv
+	 *   390.066  mtk_usb_extcon_set_vbus_v1: is_on=1
+	 *   390.066  oplus_bq2597x_otg_en ok
+	 *
+	 * Try.SNK is what lets a port that sees no partner give up on being a
+	 * sink and take the source role.  Plain DRP does not do that here: with
+	 * a PC attached it settles in AttachWait.SNK / Attached.SNK, sees the
+	 * PC's VBUS (vbus_valid = 1), and waits forever.
 	 */
-	tcpm_typec_change_role(tcpc, en ? TYPEC_ROLE_DRP : TYPEC_ROLE_SNK);
+	tcpm_typec_change_role(tcpc, en ? TYPEC_ROLE_TRY_SNK : TYPEC_ROLE_SNK);
 	pr_info("%s: otg %s, typec role -> %s\n", __func__,
-		en ? "on" : "off", en ? "DRP" : "SNK");
+		en ? "on" : "off", en ? "TRY_SNK" : "SNK");
 
 	return ret;
 }
