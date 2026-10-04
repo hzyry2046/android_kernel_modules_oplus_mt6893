@@ -3887,6 +3887,7 @@ static enum power_supply_property charger_psy_properties[] = {
 	POWER_SUPPLY_PROP_ONLINE,
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_TYPE,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_TEMP,
@@ -3971,6 +3972,13 @@ static int psy_charger_get_property(struct power_supply *psy,
 		val->intval = mt6360_chg_is_charging() ?
 			POWER_SUPPLY_STATUS_CHARGING :
 			POWER_SUPPLY_STATUS_DISCHARGING;
+		break;
+	case POWER_SUPPLY_PROP_TYPE:
+		/* op6893 6.6: the health HAL's BatteryMonitor maps the psy
+		 * to a charger only via the "type" file; "Unknown" means
+		 * never-a-charger regardless of online.  Report the live
+		 * type from primary_chg (USB/USB_DCP/USB_PD...). */
+		val->intval = get_charger_type(info);
 		break;
 	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
 		val->intval = info->enable_hv_charging;
@@ -8046,7 +8054,7 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	info->enable_hv_charging = true;
 
 	info->psy_desc1.name = "mtk-master-charger";
-	info->psy_desc1.type = POWER_SUPPLY_TYPE_UNKNOWN;
+	info->psy_desc1.type = POWER_SUPPLY_TYPE_USB;
 	info->psy_desc1.properties = charger_psy_properties;
 	info->psy_desc1.num_properties = ARRAY_SIZE(charger_psy_properties);
 	info->psy_desc1.get_property = psy_charger_get_property;
