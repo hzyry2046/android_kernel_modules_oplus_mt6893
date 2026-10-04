@@ -562,7 +562,23 @@ static int ssusb_role_sw_register(struct otg_switch_mtk *otg_sx)
 	if (IS_ERR(otg_sx->role_sw))
 		return PTR_ERR(otg_sx->role_sw);
 
-	ssusb_set_mode(otg_sx, otg_sx->default_role);
+	/*
+	 * op6893 6.6 OTG bring-up: don't tear the port down on probe.
+	 *
+	 * default_role is USB_ROLE_NONE when the DTB has no
+	 * "role-switch-default-mode", which is the case here.  Passing that to
+	 * ssusb_set_mode() makes it a real HOST->NONE transition (current_role
+	 * was set from is_host, true under DUAL_ROLE), and the work item then
+	 * runs ssusb_host_register(false) + switch_port_to_off() -- unregistering
+	 * the xHCI that ssusb_host_init() had just brought up 20 ms earlier.
+	 *
+	 * The working gadget-only image never hit this: dr_mode=PERIPHERAL made
+	 * current_role == default_role == DEVICE, so the call was a no-op.
+	 * Absence of a default role means "leave the port as probed", not
+	 * "power it off", so skip the switch in that case.
+	 */
+	if (otg_sx->default_role != USB_ROLE_NONE)
+		ssusb_set_mode(otg_sx, otg_sx->default_role);
 
 	return 0;
 }
