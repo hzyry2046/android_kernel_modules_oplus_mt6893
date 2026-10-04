@@ -17,8 +17,10 @@
  */
 
 #include <linux/module.h>
+#include <linux/delay.h>
 
 #include "oplus_vooc.h"
+#include "tcpm.h"
 
 static struct oplus_vooc_cp *g_vooc_cp;
 
@@ -29,15 +31,60 @@ void oplus_vooc_init_cp(struct oplus_vooc_cp *cp)
 EXPORT_SYMBOL_GPL(oplus_vooc_init_cp);
 
 /*
- * OTG VBUS control for the rest of the tree.  oplus_bq2597x_otg_en() lives in
- * oplus_bq2597x.c; re-export it under a name that says what it is for, so the
- * extcon VBUS path does not have to know about charge-pump naming.
+ * OTG VBUS control for the rest of the tree.
+ *
+ * Two halves, both needed before anything enumerates:
+ *
+ *   1. The charge pump.  oplus_bq2597x_otg_en() writes the BQ2597x registers
+ *      that put 5V on VBUS (0x0f = 0x20 then 0x22 to enable).  Without it the
+ *      port is dead no matter what the Type-C state machine thinks.
+ *
+ *   2. The Type-C role.  This board's DTB sets mt-tcpc,role_def = 1
+ *      (TYPEC_ROLE_SNK), so the tcpc starts in Unattached.SNK / AttachWait.SNK
+ *      and only ever presents Rd on CC -- a connected device sees no Rp and
+ *      never starts.  4.19 flipped this from userspace
+ *      (oplus_set_otg_switch_status -> tcpm_typec_change_role(DRP|SNK)); the
+ *      same call is what makes the port capable of being a source here.
+ *
+ * Ordering follows the 4.19 log, which shows vbus_on before the plug-in event:
+ * raise VBUS first, then let the state machine renegotiate.
  */
 extern int oplus_bq2597x_otg_en(int en);
 
+static struct tcpc_device *otg_tcpc;
+
+static struct tcpc_device *otg_get_tcpc(void)
+{
+	if (!otg_tcpc)
+		otg_tcpc = tcpc_dev_get_by_name("type_c_port0");
+	return otg_tcpc;
+}
+
 int op6893_otg_boost_enable(bool en)
 {
-	return oplus_bq2597x_otg_en(en ? 1 : 0);
+	struct tcpc_device *tcpc;
+	int ret;
+
+	ret = oplus_bq2597x_otg_en(en ? 1 : 0);
+	if (ret)
+		pr_err("%s: bq2597x otg %s failed, ret=%d\n", __func__,
+		       en ? "enable" : "disable", ret);
+
+	tcpc = otg_get_tcpc();
+	if (!tcpc) {
+		pr_info("%s: tcpc not up yet, role left as-is\n", __func__);
+		return ret;
+	}
+
+	/*
+	 * DRP rather than SRC: 4.19 used DRP, and it keeps a charger able to
+	 * attach the normal way once OTG is switched off again.
+	 */
+	tcpm_typec_change_role(tcpc, en ? TYPEC_ROLE_DRP : TYPEC_ROLE_SNK);
+	pr_info("%s: otg %s, typec role -> %s\n", __func__,
+		en ? "on" : "off", en ? "DRP" : "SNK");
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(op6893_otg_boost_enable);
 

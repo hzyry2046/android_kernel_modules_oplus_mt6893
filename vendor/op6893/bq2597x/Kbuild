@@ -21,6 +21,10 @@
 # does not run.  If another symbol turns out to be needed, add an explicit
 # stub to bq2597x_glue.c -- do not add a v1 object.
 
+# tcpm.h: bq2597x_glue.c flips the Type-C role alongside raising VBUS.
+TCPC := $(DEVICE_MODULES_PATH)/drivers/misc/mediatek/typec/tcpc
+ccflags-y += -I$(TCPC)/inc
+
 obj-m += bq2597x-charger.o
 
 bq2597x-charger-y := bq2597x_drv.o bq2597x_glue.o
