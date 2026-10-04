@@ -36,6 +36,9 @@ struct mtk_extcon_info {
 	struct delayed_work wq_tcpc_retry;
 	unsigned int vbus_limit_cur;
 	bool vbus_cur_inlimit;
+	/* op6893 6.6 OTG: VBUS was switched on deliberately; suppresses the
+	 * tcpc's spurious "source vbus 0mV" event from turning it back off. */
+	bool otg_requested;
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	bool oplus_vbus_set;
 #endif /* OPLUS_FEATURE_CHG_BASIC */

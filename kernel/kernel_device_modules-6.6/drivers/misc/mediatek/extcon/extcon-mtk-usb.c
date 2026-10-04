@@ -427,6 +427,10 @@ static ssize_t vbus_switch_store(struct device *dev,
 		return -EINVAL;
 	}
 
+	/* Mark the request so the tcpc's spurious 0 mV SOURCE_VBUS report
+	 * cannot cancel it (see mtk_extcon_tcpc_notifier). */
+	extcon->otg_requested = !!is_on;
+
 	mtk_usb_extcon_set_vbus(extcon, is_on);
 
 	return count;
@@ -524,6 +528,27 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 	case TCP_NOTIFY_SOURCE_VBUS:
 		dev_info(dev, "source vbus = %dmv\n",
 				 noti->vbus_state.mv);
+		/*
+		 * op6893 6.6 OTG: do not let this event switch VBUS off while OTG
+		 * is deliberately on.
+		 *
+		 * The tcpc reports SOURCE_VBUS with 0 mV for its own reasons --
+		 * notably right after a role change, before the pump has ramped,
+		 * and the MT6360 reports pwr_rdy = 0 in the same window.  Acting
+		 * on that produced a self-defeating loop:
+		 *
+		 *   set_vbus(1) -> role DRP -> tcpc "source vbus 0mV"
+		 *     -> set_vbus(0) -> role SNK
+		 *
+		 * i.e. OTG switched itself off a few milliseconds after being
+		 * switched on.  When OTG was requested on purpose the pump and the
+		 * role are driven from that request, so ignore a 0 mV report and
+		 * only honour the event when it is asking for VBUS on.
+		 */
+		if (!noti->vbus_state.mv && extcon->otg_requested) {
+			dev_info(dev, "source vbus 0mV while OTG on -- ignored\n");
+			break;
+		}
 #ifdef OPLUS_FEATURE_CHG_BASIC
 		/*
 		 * op6893 6.6: this DTB has no oplus,vbus_set, so the guard below
@@ -531,8 +556,8 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		 * turn on.  Run it when there is no regulator either -- that is
 		 * exactly the case the charger fallback exists for.
 		 */
-		if (extcon->oplus_vbus_set || !extcon->vbus)
-			mtk_usb_extcon_set_vbus(extcon, (noti->vbus_state.mv) ? true : false);
+		if (noti->vbus_state.mv && (extcon->oplus_vbus_set || !extcon->vbus))
+			mtk_usb_extcon_set_vbus(extcon, true);
 #else
 		vbus_on = (noti->vbus_state.mv) ? true : false;
 		mtk_usb_extcon_set_vbus(extcon, vbus_on);
