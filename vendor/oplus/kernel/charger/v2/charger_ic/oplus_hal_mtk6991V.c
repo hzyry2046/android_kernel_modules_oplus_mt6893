@@ -745,14 +745,16 @@ int get_charger_charging_current(struct mtk_charger *info,
 	if (info == NULL)
 		return 0;
 	ret = charger_dev_get_charging_current(chg, &oldua);
-	if (ret < 0)
-		chr_err("%s: get charging current failed: %d\n", __func__, ret);
-	else
-		ret = oldua;
+	if (ret < 0) {
+		/* op6893 6.6: quiet the per-poll -EOPNOTSUPP spam like the
+		 * input-current getter above. */
+		if (ret != -EOPNOTSUPP)
+			chr_err("%s: get charging current failed: %d\n",
+				__func__, ret);
+		return 0;
+	}
 
-	chr_debug("%s:%d\n", __func__,
-		ret);
-	return ret;
+	return oldua;
 }
 
 int get_charger_input_current(struct mtk_charger *info,
@@ -764,14 +766,18 @@ int get_charger_input_current(struct mtk_charger *info,
 	if (info == NULL)
 		return 0;
 	ret = charger_dev_get_input_current(chg, &oldua);
-	if (ret < 0)
-		chr_err("%s: get input current failed: %d\n", __func__, ret);
-	else
-		ret = oldua;
+	if (ret < 0) {
+		/* op6893 6.6: MT6360 has no AICR readback in its selected
+		 * mode (get_input_current -> mt6360_get_aicr is fine, but
+		 * -95 lands here when chg1_dev isn't bound yet); report 0
+		 * quietly instead of spamming the log every poll. */
+		if (ret != -EOPNOTSUPP)
+			chr_err("%s: get input current failed: %d\n",
+				__func__, ret);
+		return 0;
+	}
 
-	chr_debug("%s:%d\n", __func__,
-		ret);
-	return ret;
+	return oldua;
 }
 
 int get_charger_zcv(struct mtk_charger *info,
@@ -4375,10 +4381,15 @@ static void oplus_pd_9v_kick_work(struct work_struct *work)
 	charger_dev_is_enabled(chg, &en);
 	charger_dev_get_vbus(chg, &vbus);
 	charger_dev_get_ibus(chg, &ibus);
-	vbat = get_battery_voltage(chip);
-	ibat = get_battery_current(chip);
-	chg_info("pd_9v_kick: en=%d vbus=%d ibus=%d vbat=%d ibat=%d\n",
-		en, vbus, ibus, vbat, ibat);
+	/* bat_psy is unavailable on this DTB (the 3999/0 fallbacks would
+	 * print); read the buck's own ADCs instead.  MT6360 IBAT ADC reads
+	 * the current into VSYS, so charging current = ibus - system load is
+	 * not directly observable here; ibat is for trend only. */
+	charger_dev_get_ibat(chg, &ibat);
+	vbat = 0;
+	charger_dev_get_vbus(chg, &vbat);
+	chg_info("pd_9v_kick: en=%d vbus=%d ibus=%d ibat=%d\n",
+		en, vbus, ibus, ibat);
 
 	schedule_delayed_work(&chip->pd_9v_kick_work,
 		msecs_to_jiffies(PD_9V_WDT_KICK_MS));
@@ -4390,7 +4401,6 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 		struct mtk_charger, pd_9v_try_work.work);
 	struct charger_device *chg = NULL;
 	int chg_vol = 0;
-	int batt_volt = 0;
 	int ret;
 	bool en = false;
 
@@ -4448,11 +4458,13 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 		chg_err("pd_9v_try: kick fail ret=%d\n", ret);
 
 	ret = charger_dev_is_enabled(chg, &en);
-	chg_info("pd_9v_try: done chg_vol=%d->%d batt=%d enabled=%d\n",
-		chg_vol, battery_meter_get_charger_voltage(),
-		get_battery_voltage(chip), en);
-	batt_volt = get_battery_voltage(chip);
-	oplus_mt6379_set_aicl_point(chip->ic_dev, batt_volt);
+	chg_info("pd_9v_try: done chg_vol=%d->%d enabled=%d\n",
+		chg_vol, battery_meter_get_charger_voltage(), en);
+	/* bat_psy is unavailable on this DTB (probe-time phandle lookup
+	 * fails); battery_meter_get_charger_voltage() already serves as the
+	 * VBUS gauge here, and the aicl-point switch only needs to know
+	 * whether the contract is 9V-class, which chg_vol already tells. */
+	oplus_mt6379_set_aicl_point(chip->ic_dev, 0);
 	chip->pd_chg_volt = VBUS_9V;
 
 	/* keep the charger WDT fed: the charger thread is compiled out, so
