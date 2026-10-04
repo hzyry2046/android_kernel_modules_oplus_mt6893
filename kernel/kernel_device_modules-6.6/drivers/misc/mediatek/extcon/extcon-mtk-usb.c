@@ -31,12 +31,15 @@
 
 /*
  * OTG VBUS enable, exported by vendor/op6893/bq2597x/bq2597x-charger.ko.
- * Weak so this module still loads (and falls back to the MT6360 path) if the
- * pump driver is missing; the pointer is then NULL and the check below is
- * false.  Declared rather than #included to keep the charger headers out of
- * this file's include graph.
+ *
+ * Do NOT declare this weak.  A weak reference makes the compiler emit
+ * R_AARCH64_PLT32 (311) through the PLT, and arch/arm64/kernel/module.c has no
+ * case for it -- "module extcon_mtk_usb: unsupported RELA relocation: 311",
+ * the module fails to load and init dies with it.  symbol_request() resolves
+ * the name at runtime and pulls the module in if needed, which also keeps this
+ * driver loadable on a board without the pump.
  */
-extern int op6893_otg_boost_enable(bool en) __attribute__((weak));
+extern int op6893_otg_boost_enable(bool en);
 
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
 #ifdef CONFIG_OPLUS_PD_EXT_SUPPORT
@@ -248,13 +251,20 @@ fail:
 static int mtk_usb_extcon_set_vbus_charger(struct mtk_extcon_info *extcon,
 							bool is_on)
 {
+	int (*otg_en)(bool);
 	struct charger_device *chg;
 	int ret;
 
 	dev_info(extcon->dev, "%s: is_on=%d\n", __func__, is_on);
 
-	if (op6893_otg_boost_enable)
-		return op6893_otg_boost_enable(is_on);
+	/* Resolve at runtime; see the note on the declaration above for why
+	 * this must not be a direct call. */
+	otg_en = symbol_request(op6893_otg_boost_enable);
+	if (otg_en) {
+		ret = otg_en(is_on);
+		symbol_put(op6893_otg_boost_enable);
+		return ret;
+	}
 
 	chg = get_charger_by_name("primary_chg");
 	if (!chg)
