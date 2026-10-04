@@ -569,8 +569,20 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		dev_info(dev, "old_state=%d, new_state=%d\n",
 				noti->typec_state.old_state,
 				noti->typec_state.new_state);
-		if (noti->typec_state.old_state == TYPEC_UNATTACHED &&
-			noti->typec_state.new_state == TYPEC_ATTACHED_SRC) {
+		/*
+		 * op6893 6.6 OTG: match on new_state alone.
+		 *
+		 * Requiring old_state == TYPEC_UNATTACHED missed the case that
+		 * actually happens here.  With a dock attached the port is first
+		 * seen as a sink, so the sequence is
+		 *   AttachWait.SRC -> Try.SNK -> TryWait.SRC -> Attached.SRC
+		 * and by the time TYPEC_ATTACHED_SRC arrives the old_state is
+		 * TYPEC_ATTACHED_SNK.  Every branch below also keys on
+		 * TYPEC_UNATTACHED, so the role was never switched to host, mtu3
+		 * never brought up xhci, and nothing enumerated -- while the
+		 * tcpc and the charge pump had both done their part.
+		 */
+		if (noti->typec_state.new_state == TYPEC_ATTACHED_SRC) {
 			dev_info(dev, "Type-C SRC plug in\n");
 			mtk_usb_extcon_set_role(extcon, USB_ROLE_HOST);
 		} else if (!(extcon->bypss_typec_sink) &&
