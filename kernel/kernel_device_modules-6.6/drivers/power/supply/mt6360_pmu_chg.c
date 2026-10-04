@@ -3842,6 +3842,20 @@ int mt6360_chg_is_charging(void)
 }
 EXPORT_SYMBOL(mt6360_chg_is_charging);
 
+/* op6893 6.6 bring-up: plug state ground truth.  tcpc_attach is set on
+ * SNK attach (mt6360_pmu_tcpc_notifier) and cleared on detach, so it
+ * tracks the cable, independent of whether charging is enabled.  The
+ * mtk-master-charger is_charger_exist() consumes this as its fallback
+ * because neither chrdet_state (no CHRDET event chain on this DTB) nor
+ * mt6379_int_chrdet_attach() (no MT6379 on this board) can answer it. */
+int mt6360_chg_is_attached(void)
+{
+	if (!oplusmci || atomic_read(&oplusmci->suspended) == 1)
+		return 0;
+	return atomic_read(&oplusmci->tcpc_attach) ? 1 : 0;
+}
+EXPORT_SYMBOL(mt6360_chg_is_attached);
+
 int mt6360_get_vbus_rising(void)
 {
 	bool vbus_rising = false;

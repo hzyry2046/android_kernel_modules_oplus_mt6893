@@ -277,6 +277,8 @@ EXPORT_SYMBOL(oplus_get_prop_status);
 
 /* mt6360_pmu_chg: true CHARGING state from the buck's own registers. */
 extern int mt6360_chg_is_charging(void);
+/* mt6360_pmu_chg: SNK attach state (the plug, regardless of charging). */
+extern int mt6360_chg_is_attached(void);
 static int mtk_chg_get_charger_type(struct oplus_chg_ic_dev *ic_dev, int *type);
 
 bool oplus_mt_get_vbus_status(void)
@@ -639,8 +641,9 @@ bool is_charger_exist(struct mtk_charger *info)
 		/* op6893 6.6: this psy never resolves on this DTB.  The old
 		 * code returned -1 here, which as bool is TRUE -- the master
 		 * psy then reported online=1 forever, even after unplug.
-		 * Ground truth on this board is the MT6360 chrdet state. */
-		return oplus_mt_get_vbus_status();
+		 * chrdet_state/mt6379 can't answer either (no event chain,
+		 * no 6379 on board), so ask the MT6360 tcpc attach state. */
+		return mt6360_chg_is_attached() == 1;
 	}
 
 	tmp_ret = power_supply_get_property(chg_psy,
