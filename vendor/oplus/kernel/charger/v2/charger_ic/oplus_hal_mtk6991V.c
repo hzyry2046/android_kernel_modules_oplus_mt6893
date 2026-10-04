@@ -636,13 +636,16 @@ bool is_charger_exist(struct mtk_charger *info)
 	}
 
 	if (chg_psy == NULL || IS_ERR(chg_psy)) {
-		chg_err("%s Couldn't get chg_psy\n", __func__);
-		ret = -1;
-	} else {
-		tmp_ret = power_supply_get_property(chg_psy,
-			POWER_SUPPLY_PROP_ONLINE, &prop);
-		ret = prop.intval;
+		/* op6893 6.6: this psy never resolves on this DTB.  The old
+		 * code returned -1 here, which as bool is TRUE -- the master
+		 * psy then reported online=1 forever, even after unplug.
+		 * Ground truth on this board is the MT6360 chrdet state. */
+		return oplus_mt_get_vbus_status();
 	}
+
+	tmp_ret = power_supply_get_property(chg_psy,
+		POWER_SUPPLY_PROP_ONLINE, &prop);
+	ret = prop.intval;
 
 	chr_debug("%s:%d\n", __func__,
 		ret);
@@ -4575,6 +4578,11 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			oplus_chg_suspend_charger(false, PD_PDO_ICL_VOTER);
 			pinfo->pd_chg_volt = VBUS_5V;
 			chr_err("PD Notify Detach\n");
+			oplus_mt_sync_chr_type(pinfo);
+			/* op6893 6.6: no charger thread to run
+			 * charger_status_check(), so notify consumers
+			 * (battery psy, health HAL) here. */
+			power_supply_changed(pinfo->psy1);
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
 
@@ -4583,6 +4591,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			cancel_delayed_work_sync(&pinfo->pd_9v_try_work);
 			cancel_delayed_work_sync(&pinfo->pd_9v_kick_work);
 			chr_err("PD Notify HardReset\n");
+			oplus_mt_sync_chr_type(pinfo);
+			power_supply_changed(pinfo->psy1);
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
 
@@ -4590,6 +4600,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			pinfo->pd_type = MTK_PD_CONNECT_PE_READY_SNK;
 			chr_err("PD Notify fixe voltage ready\n");
 			oplus_get_adapter_svid();
+			oplus_mt_sync_chr_type(pinfo);
+			power_supply_changed(pinfo->psy1);
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
 
@@ -4597,6 +4609,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			pinfo->pd_type = MTK_PD_CONNECT_PE_READY_SNK_PD30;
 			chr_err("PD Notify PD30 ready\r\n");
 			oplus_get_adapter_svid();
+			oplus_mt_sync_chr_type(pinfo);
+			power_supply_changed(pinfo->psy1);
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
 
@@ -4604,6 +4618,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 			pinfo->pd_type = MTK_PD_CONNECT_PE_READY_SNK_APDO;
 			chr_err("PD Notify APDO Ready\n");
 			oplus_get_adapter_svid();
+			oplus_mt_sync_chr_type(pinfo);
+			power_supply_changed(pinfo->psy1);
 			schedule_delayed_work(&pinfo->pd_9v_try_work,
 				msecs_to_jiffies(PD_9V_TRY_DELAY_MS));
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
@@ -4614,6 +4630,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 		case PD_CONNECT_TYPEC_ONLY_SNK:
 			pinfo->pd_type = MTK_PD_CONNECT_TYPEC_ONLY_SNK;
 			chr_err("PD Notify Type-C Ready\n");
+			oplus_mt_sync_chr_type(pinfo);
+			power_supply_changed(pinfo->psy1);
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_SVID);/* not support svid */
 			oplus_chg_ic_virq_trigger(pinfo->ic_dev, OPLUS_IC_VIRQ_CHG_TYPE_CHANGE);
 			break;
