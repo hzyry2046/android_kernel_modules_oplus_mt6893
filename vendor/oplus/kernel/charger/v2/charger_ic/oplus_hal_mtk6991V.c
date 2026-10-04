@@ -3928,7 +3928,11 @@ static int psy_charger_get_property(struct power_supply *psy,
 
 	switch (psp) {
 	case POWER_SUPPLY_PROP_ONLINE:
-		if (chg == info->dvchg1_dev) {
+		/* op6893 6.6: chg1_dev stays NULL until pd_9v_try_work
+		 * lazy-binds it, and dvchg1_dev is NULL on this non-divider
+		 * board -- the NULL==NULL match sent every ONLINE read down
+		 * the pe5/dvchg path, reporting false while charging. */
+		if (chg != NULL && chg == info->dvchg1_dev) {
 			val->intval = false;
 			alg = get_chg_alg_by_name("pe5");
 			if (alg == NULL)
@@ -3938,6 +3942,12 @@ static int psy_charger_get_property(struct power_supply *psy,
 				if (ret == ALG_RUNNING)
 					val->intval = true;
 			}
+			break;
+		}
+		if (chg == NULL)
+			chg = info->chg1_dev = get_charger_by_name("primary_chg");
+		if (chg == NULL) {
+			val->intval = false;
 			break;
 		}
 
