@@ -198,11 +198,56 @@ static void ssusb_hwrscs_req_v2_v3(struct ssusb_mtk *ssusb,
 			smc_req, 0, 0, 0, 0, 0, 0, &res);
 }
 
+/*
+ * op6893 6.6 bring-up: reproduce 4.19's SMC behaviour on this board.
+ *
+ * 4.19's ssusb_smc_request() -- the path MT6893 actually took, since
+ * MTU3_USE_SPM_API was only defined for MT6779/MT6785 -- mapped only
+ * MTU3_RESOURCE_SUSPEND -> REQUEST and MTU3_RESOURCE_RESUME -> RELEASE, and
+ * fell through its switch doing NOTHING for everything else (including the
+ * ALL/NONE that role switching used).  So on MT6893 a runtime role switch
+ * never sent an SMC at all.
+ *
+ * This driver instead maps MTU3_STATE_POWER_ON/OFF to REQUEST/RELEASE and
+ * calls them from switch_port_to_on()/switch_port_to_off().  Probe switches the
+ * role to NONE, which calls POWER_OFF immediately after POWER_ON -- so the USB
+ * infra power request is taken away mid ufshcd_async_scan, and UFS aborts on
+ * its next register read (console-24, synchronous external abort, ~3.4 s).
+ * Measured: console-ramoops from the otg1 image shows exactly that pair
+ * ("state = 1" then "state = 0") at 1.63/1.71 s, abort at 3.40 s.
+ *
+ * The previously working gadget-only image came up because it recognised
+ * neither mediatek,smc-req nor mediatek,spm-mgr, so ssusb_set_power_state()
+ * returned immediately and sent nothing at all.
+ *
+ * For the legacy property the op codes must also match what this board's
+ * firmware knows: 4.19 used MTK_USB_SMC_INFRA_REQUEST=0 / _RELEASE=1, which
+ * happen to equal SSUSB_SMC_HWRECS_REQUEST/RELEASE here.
+ */
 static void ssusb_smc_request(struct ssusb_mtk *ssusb,
 	enum mtu3_power_state state)
 {
 	struct arm_smccc_res res;
 	int op;
+
+	if (ssusb->legacy_spm) {
+		/* 4.19 on MT6893: only system suspend/resume talk to SPM. */
+		switch (state) {
+		case MTU3_STATE_SUSPEND:
+			op = SSUSB_SMC_HWRECS_REQUEST;
+			break;
+		case MTU3_STATE_RESUME:
+			op = SSUSB_SMC_HWRECS_RELEASE;
+			break;
+		default:
+			return;
+		}
+		dev_info(ssusb->dev, "%s legacy state = %d op = %d\n",
+			__func__, state, op);
+		arm_smccc_smc(MTK_SIP_KERNEL_USB_CONTROL,
+			op, 0, 0, 0, 0, 0, 0, &res);
+		return;
+	}
 
 	dev_info(ssusb->dev, "%s state = %d\n", __func__, state);
 
@@ -1171,8 +1216,10 @@ get_phy:
 	 * and no USB power request ever reaches the SPM.
 	 */
 	if (!ssusb->smc_req && !ssusb->hwrscs_vers &&
-	    of_property_read_bool(node, "mediatek,spm-mgr"))
+	    of_property_read_bool(node, "mediatek,spm-mgr")) {
 		ssusb->smc_req = true;
+		ssusb->legacy_spm = true;
+	}
 
 	/* check offload support for child node */
 	for_each_child_of_node(node, child) {
