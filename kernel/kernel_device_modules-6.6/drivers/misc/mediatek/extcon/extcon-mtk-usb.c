@@ -23,6 +23,12 @@
 
 #include "extcon-mtk-usb.h"
 
+#if IS_ENABLED(CONFIG_MTK_CHARGER)
+#include "charger_class.h"
+#endif
+/* op6893 6.6 OTG bring-up: matches the 4.19 MTK6765S-era default. */
+#define OTG_BOOST_CURR_DEFAULT	1100000
+
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
 #ifdef CONFIG_OPLUS_PD_EXT_SUPPORT
 #include "../../../power/oplus/pd_ext/inc/tcpm.h"
@@ -204,6 +210,53 @@ fail:
 	return ret;
 }
 
+/*
+ * op6893 6.6 OTG bring-up: the regulator path below is dead on this board.
+ * extcon_usb has no vbus-supply in the stock 4.19 DTB, so extcon->vbus stays
+ * NULL and the whole function used to return early -- OTG VBUS was never
+ * driven.  4.19 drove it through the charger device instead
+ * (charger_dev_enable_otg(primary_charger) + charger_dev_set_boost_current_limit),
+ * which is what the MT6360 buck-boost wants anyway.  Fall back to that when
+ * there is no regulator.
+ *
+ * Looked up lazily, on first use, because this driver probes before the
+ * charger stack is up.
+ */
+static struct charger_device *extcon_primary_chg;
+
+static int mtk_usb_extcon_set_vbus_charger(struct mtk_extcon_info *extcon,
+							bool is_on)
+{
+	int ret;
+
+	if (!extcon_primary_chg) {
+		extcon_primary_chg = get_charger_by_name("primary_chg");
+		if (!extcon_primary_chg)
+			return -ENODEV;
+	}
+
+	dev_info(extcon->dev, "%s: is_on=%d\n", __func__, is_on);
+	if (is_on) {
+		ret = charger_dev_set_boost_current_limit(extcon_primary_chg,
+							  extcon->vbus_cur ?
+							  extcon->vbus_cur :
+							  OTG_BOOST_CURR_DEFAULT);
+		if (ret < 0)
+			dev_info(extcon->dev, "set boost current failed\n");
+		ret = charger_dev_enable_otg(extcon_primary_chg, true);
+	} else {
+		ret = charger_dev_enable_otg(extcon_primary_chg, false);
+	}
+	if (ret < 0) {
+		dev_info(extcon->dev, "charger otg %s failed, ret=%d\n",
+			 is_on ? "enable" : "disable", ret);
+		return ret;
+	}
+
+	extcon->vbus_on = is_on;
+	return 0;
+}
+
 static int mtk_usb_extcon_set_vbus(struct mtk_extcon_info *extcon,
 							bool is_on)
 {
@@ -211,8 +264,14 @@ static int mtk_usb_extcon_set_vbus(struct mtk_extcon_info *extcon,
 	struct device *dev = extcon->dev;
 	int ret;
 
-	/* vbus is optional */
-	if (!vbus || extcon->vbus_on == is_on)
+	/*
+	 * op6893 6.6: no regulator on this DTB -- drive the charger's boost
+	 * instead of silently doing nothing.
+	 */
+	if (!vbus)
+		return mtk_usb_extcon_set_vbus_charger(extcon, is_on);
+
+	if (extcon->vbus_on == is_on)
 		return 0;
 
 	dev_info(dev, "vbus turn %s\n", is_on ? "on" : "off");
@@ -420,7 +479,13 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		dev_info(dev, "source vbus = %dmv\n",
 				 noti->vbus_state.mv);
 #ifdef OPLUS_FEATURE_CHG_BASIC
-		if (extcon->oplus_vbus_set)
+		/*
+		 * op6893 6.6: this DTB has no oplus,vbus_set, so the guard below
+		 * swallowed the event and the charger boost was never told to
+		 * turn on.  Run it when there is no regulator either -- that is
+		 * exactly the case the charger fallback exists for.
+		 */
+		if (extcon->oplus_vbus_set || !extcon->vbus)
 			mtk_usb_extcon_set_vbus(extcon, (noti->vbus_state.mv) ? true : false);
 #else
 		vbus_on = (noti->vbus_state.mv) ? true : false;

@@ -1157,6 +1157,23 @@ get_phy:
 	}
 	ssusb->smc_req = of_property_read_bool(node, "mediatek,smc-req");
 
+	/*
+	 * op6893 6.6 bring-up: this board runs the stock 4.19 DTB, whose usb0
+	 * node carries mediatek,spm-mgr and none of the newer power properties
+	 * (smc-req / hwrscs-vers / hw-req-ctrl).  4.19 defined MTU3_USE_SPM_API
+	 * only for MT6779/MT6785, so on MT6893 its ssusb_set_power_resource()
+	 * fell through to ssusb_smc_request() with MTK_USB_SMC_INFRA_REQUEST=0 /
+	 * _RELEASE=1 -- the same op codes as this driver's
+	 * SSUSB_SMC_HWRECS_REQUEST/RELEASE.  The two properties therefore mean
+	 * the same thing, so honour the old one.
+	 *
+	 * Without this, ssusb_set_power_state() returns immediately on this DTB
+	 * and no USB power request ever reaches the SPM.
+	 */
+	if (!ssusb->smc_req && !ssusb->hwrscs_vers &&
+	    of_property_read_bool(node, "mediatek,spm-mgr"))
+		ssusb->smc_req = true;
+
 	/* check offload support for child node */
 	for_each_child_of_node(node, child) {
 		ssusb->offload_support = of_property_read_bool(child, "mediatek,usb-offload");
