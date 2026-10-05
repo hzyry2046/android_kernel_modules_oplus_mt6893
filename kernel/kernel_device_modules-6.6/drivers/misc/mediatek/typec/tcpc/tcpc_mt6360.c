@@ -584,11 +584,27 @@ static inline int mt6360_init_vend_mask(struct tcpc_device *tcpc)
 
 static inline int __mt6360_init_alert_mask(struct tcpc_device *tcpc)
 {
+	/*
+	 * op6893 6.6 OTG: last byte of "masks" lands on TCPC_V10_REG_EXT_STATUS_MASK
+	 * (0x16) and byte 2 on TCPC_V10_REG_POWER_STATUS_MASK (0x14), but the
+	 * block write below starts at TCPC_V10_REG_ALERT_MASK (0x12), so the
+	 * five bytes cover 0x12..0x16 in one shot.
+	 *
+	 * TCPC_V10_REG_ALERT_POWER_STATUS (bit1) must be in the alert mask and
+	 * VBUS_PRES in the power-status mask, otherwise the chip never raises
+	 * the "VBUS present" interrupt.  4.19's mask reads 0x867f here; this
+	 * one read 0x867d -- exactly this bit missing -- which is why OTG
+	 * stalled at wait_ps=SRC_VSafe5V and never reached Attached.SRC:
+	 * typec_handle_vbus_present() is only reachable from
+	 * tcpc_typec_handle_ps_change(), which only runs off this alert.
+	 */
 	u16 mask = TCPC_V10_REG_ALERT_CC_STATUS |
+		   TCPC_V10_REG_ALERT_POWER_STATUS |
 		   TCPC_V10_REG_ALERT_FAULT |
 		   TCPC_V10_REG_ALERT_VENDOR_DEFINED;
 	u8 masks[5] = {0x00, 0x00,
-		       0x00, TCPC_V10_REG_FAULT_STATUS_VCONN_OC, 0x00};
+		       TCPC_V10_REG_POWER_STATUS_VBUS_PRES,
+		       TCPC_V10_REG_FAULT_STATUS_VCONN_OC, 0x00};
 
 #if IS_ENABLED(CONFIG_USB_POWER_DELIVERY)
 	mask |= TCPC_V10_REG_ALERT_TX_SUCCESS |
