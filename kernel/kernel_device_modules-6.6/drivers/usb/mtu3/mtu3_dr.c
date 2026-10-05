@@ -319,7 +319,27 @@ static void ssusb_mode_sw_work_v2(struct work_struct *work)
 		mtu3_start(mtu);
 		break;
 	case USB_ROLE_NONE:
-		break;
+		/*
+		 * op6893 6.6: the teardown above already dropped the reference.
+		 *
+		 * switch_port_to_off() has a pm_runtime_put() inside it, paired
+		 * with the pm_runtime_get() in switch_port_to_on().  HOST and
+		 * DEVICE both call off-then-on, so their counts cancel; NONE
+		 * only tears down, so the reference taken at the top of this
+		 * function would be released twice -- once here and once by
+		 * switch_port_to_off().
+		 *
+		 * Leaking a negative count makes runtime PM autosuspend fire as
+		 * soon as the port is idle, on hardware this path has just
+		 * powered off, and the device hangs hard (no oops, no trace --
+		 * the watchdog has to reset it).  Reproduced by writing "none"
+		 * to /sys/class/usb_role/11201000.usb0-role-switch/role.
+		 *
+		 * Only reached now that otg19 wired the role switch up; before
+		 * that desired_role was never NONE.
+		 */
+		otg_sx->current_role = desired_role;
+		goto same_role;
 	default:
 		dev_info(ssusb->dev, "invalid role\n");
 	}
