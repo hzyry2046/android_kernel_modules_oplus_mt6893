@@ -33,36 +33,34 @@ EXPORT_SYMBOL_GPL(oplus_vooc_init_cp);
 /*
  * OTG VBUS control for the rest of the tree.
  *
- * Two halves, both needed before anything enumerates:
+ * The charge pump is the only thing this entry point has to touch.
+ * oplus_bq2597x_otg_en() writes the BQ2597x registers that put 5V on VBUS
+ * (0x0f = 0x20 then 0x22 to enable); without it the port is dead no matter
+ * what the Type-C state machine thinks.
  *
- *   1. The charge pump.  oplus_bq2597x_otg_en() writes the BQ2597x registers
- *      that put 5V on VBUS (0x0f = 0x20 then 0x22 to enable).  Without it the
- *      port is dead no matter what the Type-C state machine thinks.
+ * There used to be a tcpm_typec_change_role() here as well, because this
+ * board's DTB sets mt-tcpc,role_def = 1 (TYPEC_ROLE_SNK) and a sink-only port
+ * never presents Rp.  That is handled earlier now: tcpc_mt6360 promotes
+ * role_def SNK to DRP while parsing the property, so the port toggles on its
+ * own and walks AttachWait.SRC -> Attached.SRC without help.  Keeping the
+ * role change here actively broke it -- by the time this runs the state
+ * machine is already in Attached.SRC with wait_ps=Disable, and resetting the
+ * role mid-flight restarted it, which emitted a spurious "source vbus 0mV"
+ * and switched the pump straight back off:
  *
- *   2. The Type-C role.  This board's DTB sets mt-tcpc,role_def = 1
- *      (TYPEC_ROLE_SNK), so the tcpc starts in Unattached.SNK / AttachWait.SNK
- *      and only ever presents Rd on CC -- a connected device sees no Rp and
- *      never starts.  4.19 flipped this from userspace
- *      (oplus_set_otg_switch_status -> tcpm_typec_change_role(DRP|SNK)); the
- *      same call is what makes the port capable of being a source here.
+ *   193.041  ** Attached.SRC / wait_ps=SRC_VSafe5V
+ *   193.041  source vbus = 5000mv -> bq2597x on
+ *   193.045  wait_ps=Disable
+ *   193.046  otg on, typec role -> TRY_SNK        <-- restarts the machine
+ *   193.046  source vbus = 0mV -> bq2597x off     <-- pump killed 119us later
  *
- * Ordering follows the 4.19 log, which shows vbus_on before the plug-in event:
- * raise VBUS first, then let the state machine renegotiate.
+ * The 4.19 capture does call this from userspace, but there it happens before
+ * the plug event, not in the middle of the attach.
  */
 extern int oplus_bq2597x_otg_en(int en);
 
-static struct tcpc_device *otg_tcpc;
-
-static struct tcpc_device *otg_get_tcpc(void)
-{
-	if (!otg_tcpc)
-		otg_tcpc = tcpc_dev_get_by_name("type_c_port0");
-	return otg_tcpc;
-}
-
 int op6893_otg_boost_enable(bool en)
 {
-	struct tcpc_device *tcpc;
 	int ret;
 
 	ret = oplus_bq2597x_otg_en(en ? 1 : 0);
@@ -70,32 +68,7 @@ int op6893_otg_boost_enable(bool en)
 		pr_err("%s: bq2597x otg %s failed, ret=%d\n", __func__,
 		       en ? "enable" : "disable", ret);
 
-	tcpc = otg_get_tcpc();
-	if (!tcpc) {
-		pr_info("%s: tcpc not up yet, role left as-is\n", __func__);
-		return ret;
-	}
-
-	/*
-	 * TYPEC_ROLE_TRY_SNK, not DRP.
-	 *
-	 * The 4.19 capture shows its state machine going Try.SNK -> TryWait.SRC
-	 * on its own and only then raising VBUS:
-	 *
-	 *   389.948  TCPC-TYPEC:** Try.SNK
-	 *   390.051  TCPC-TYPEC:** TryWait.SRC
-	 *   390.066  mtk-extcon-usb: source vbus = 5000mv
-	 *   390.066  mtk_usb_extcon_set_vbus_v1: is_on=1
-	 *   390.066  oplus_bq2597x_otg_en ok
-	 *
-	 * Try.SNK is what lets a port that sees no partner give up on being a
-	 * sink and take the source role.  Plain DRP does not do that here: with
-	 * a PC attached it settles in AttachWait.SNK / Attached.SNK, sees the
-	 * PC's VBUS (vbus_valid = 1), and waits forever.
-	 */
-	tcpm_typec_change_role(tcpc, en ? TYPEC_ROLE_TRY_SNK : TYPEC_ROLE_SNK);
-	pr_info("%s: otg %s, typec role -> %s\n", __func__,
-		en ? "on" : "off", en ? "TRY_SNK" : "SNK");
+	pr_info("%s: otg %s\n", __func__, en ? "on" : "off");
 
 	return ret;
 }
