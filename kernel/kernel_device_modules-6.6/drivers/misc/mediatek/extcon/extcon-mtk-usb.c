@@ -18,6 +18,7 @@
 #include <linux/pinctrl/consumer.h>
 #include <linux/slab.h>
 #include <linux/usb/role.h>
+#include <linux/device.h>
 #include <linux/workqueue.h>
 #include <linux/proc_fs.h>
 
@@ -927,6 +928,7 @@ static int mtk_usb_extcon_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct mtk_extcon_info *extcon;
+	struct device_node *conn_np;
 #if IS_ENABLED(CONFIG_TCPC_CLASS)
 	const char *tcpc_name;
 #endif
@@ -951,12 +953,45 @@ static int mtk_usb_extcon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	/* usb role switch */
-	extcon->role_sw = usb_role_switch_get(extcon->dev);
+	/*
+	 * usb role switch
+	 *
+	 * op6893 6.6 OTG: this DTB does not use the generic usb-role-switch
+	 * binding between extcon_usb and mtu3; it points at the controller
+	 * with MTK's own "dev-conn" phandle.  usb_role_switch_get() walks
+	 * fwnode_connection_find_match(), which looks for a property *named*
+	 * "usb-role-switch" and finds nothing here, so it returns NULL -- and
+	 * mtk_usb_extcon_update_role() then skips usb_role_switch_set_role()
+	 * entirely, leaving mtu3 in whatever role it probed with.  That is why
+	 * the port stayed host after the dock was removed, why the UDC could
+	 * never bind (no adb over USB), and why no "set role" ever appeared in
+	 * mtu3's log.
+	 *
+	 * 4.19 solves this by building a device_connection by hand.  That API
+	 * is gone in 6.6 (struct device_connection and device_connection_add()
+	 * were removed once everything moved to fwnode), so resolve it the
+	 * modern way instead: follow dev-conn ourselves and ask the role-switch
+	 * class for the switch registered on that fwnode.  mtu3 registers its
+	 * switch with role_sx_desc.fwnode = dev_fwnode(dev), so this lands on
+	 * the right device.
+	 */
+	conn_np = of_parse_phandle(dev->of_node, "dev-conn", 0);
+	if (!conn_np) {
+		dev_info(dev, "failed to get dev-conn node\n");
+		return -EINVAL;
+	}
+
+	extcon->role_sw = usb_role_switch_find_by_fwnode(of_fwnode_handle(conn_np));
+	of_node_put(conn_np);
 	if (IS_ERR(extcon->role_sw)) {
 		dev_err(dev, "failed to get usb role\n");
 		return PTR_ERR(extcon->role_sw);
 	}
+
+	if (!extcon->role_sw)
+		dev_info(dev, "no usb role switch resolved\n");
+	else
+		dev_info(dev, "usb role switch resolved via dev-conn\n");
 
 	/* initial usb role */
 	if (extcon->role_sw)
