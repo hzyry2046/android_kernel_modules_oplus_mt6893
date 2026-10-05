@@ -3061,12 +3061,38 @@ static int mt6360_pmu_tcpc_notifier(struct notifier_block *nb,
 		attached = true;
 		break;
 	case TYPEC_ATTACHED_SRC:
-		/* we source VBUS: no charging, but still mark attach so
-		 * OTG paths can query it; BC1.2 stays off */
+		/*
+		 * op6893 6.6 OTG: we are sourcing VBUS here, so there is no
+		 * charge to account for.  tcpc_attach must stay clear.
+		 *
+		 * It reads like "the cable is attached" and it is tempting to
+		 * keep it set so OTG paths can see the plug, but every consumer
+		 * in this driver treats it as "power is arriving": it is the
+		 * ONLINE value (see the *_get_online implementation, which
+		 * returns it straight through), the gate on is_charging(), and
+		 * the attach input to BC1.2.  With it set on SRC attach, this
+		 * board -- which has no external supply in the dock -- reported
+		 * itself as charging off its own boost rail:
+		 *   mtk-master-charger online=1 status=Charging voltage=5031mV
+		 * while the battery was discharging (current_now = -611100).
+		 *
+		 * mt6360_chg_is_attached() (the is_charger_exist() fallback in
+		 * the HAL) reads the same flag, so the false "charger present"
+		 * propagated there too.  Clear it instead.
+		 *
+		 * This also matches 4.19, whose enable_otg() tells the charger
+		 * stack "OTG, not charging" via set_otg_online(false).  That
+		 * hook is inert on 6.6 (the v2 tree never registers
+		 * mtk_oplus_chg_intf, so g_oplus_chg_intf is NULL), so the
+		 * state has to be kept correct here.
+		 */
 		mutex_lock(&mci->chgdet_lock);
-		atomic_set(&mci->tcpc_attach, true);
+		if (atomic_read(&mci->tcpc_attach)) {
+			atomic_set(&mci->tcpc_attach, false);
+			mt6360_chgdet_post_process(mci);
+		}
 		mutex_unlock(&mci->chgdet_lock);
-		dev_info(mci->dev, "%s: SRC attached, tcpc_attach=1 (no bc12)\n",
+		dev_info(mci->dev, "%s: SRC attached, tcpc_attach=0 (we source VBUS)\n",
 			 __func__);
 		return NOTIFY_OK;
 	default:
