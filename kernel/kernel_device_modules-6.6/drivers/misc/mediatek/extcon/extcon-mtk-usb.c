@@ -239,23 +239,58 @@ fail:
  * NULL and the whole function used to return early -- OTG VBUS was never
  * driven.  Fall back to the real supply.
  *
- * The real supply is NOT the MT6360: it is a separate BQ2597x charge pump
- * (i2c-7 @0x65).  The 4.19 capture shows the order plainly --
- *   typec vbus_on -> oplus_bq2597x_otg_en ok -> OTG plug in -> role_sw_set 1
- * so op6893_otg_boost_enable() is what puts 5V on the port.  It comes from
- * vendor/op6893/bq2597x/ (see that Kbuild for why it is built out of tree).
+ * Two supplies have to come up, and they are not interchangeable:
  *
- * The MT6360 charger-device path is kept as a second fallback for boards
- * where the pump is absent or has not probed.
+ *   1. The BQ2597x charge pump (i2c-7 @0x65), which is what actually puts
+ *      5V on the port.  The 4.19 capture shows it plainly --
+ *        typec vbus_on -> oplus_bq2597x_otg_en ok -> OTG plug in
+ *      It comes from vendor/op6893/bq2597x/ (see that Kbuild for why it is
+ *      built out of tree).
+ *
+ *   2. The MT6360 PMU charger's own boost, via primary_chg.  4.19 does this
+ *      too, right beside the pump call:
+ *        vooc_enable_cp_for_otg(1) / charger_dev_enable_otg(primary_chg, 1)
+ *        charger_dev_set_boost_current_limit(primary_chg, 1100000)
+ *      This is the half that makes the port enumerate.  The MT6360 is its
+ *      own VBUS sensor -- TCPC_V10_REG_POWER_STATUS.VBUS_PRES and the
+ *      MT6360_M_VBUS_VALID vendor alert both come off this rail -- so with
+ *      only the pump running the chip never reports VBUS_PRES, the tcpc
+ *      stays at wait_ps=SRC_VSafe5V, TYPEC_ATTACHED_SRC is never assigned
+ *      and mtu3 never switches to host.  Measured on the live chip with the
+ *      pump on and this call missing:
+ *        reg0x1e (POWER_STATUS) = 0x08   <- bit2 VBUS_PRES clear
+ *        reg0x9b (MT_ST1)       = 0x02   <- bit5 VBUS_VALID clear
+ *
+ * Order matters: boost first, then the pump, matching 4.19.
  */
 static int mtk_usb_extcon_set_vbus_charger(struct mtk_extcon_info *extcon,
 							bool is_on)
 {
 	int (*otg_en)(bool);
 	struct charger_device *chg;
-	int ret;
+	int ret = 0;
 
 	dev_info(extcon->dev, "%s: is_on=%d\n", __func__, is_on);
+
+	chg = get_charger_by_name("primary_chg");
+	if (chg) {
+		if (is_on) {
+			ret = charger_dev_set_boost_current_limit(chg,
+								  extcon->vbus_cur ?
+								  extcon->vbus_cur :
+								  OTG_BOOST_CURR_DEFAULT);
+			if (ret < 0)
+				dev_info(extcon->dev, "set boost current failed\n");
+			ret = charger_dev_enable_otg(chg, true);
+		} else {
+			ret = charger_dev_enable_otg(chg, false);
+		}
+		if (ret < 0)
+			dev_info(extcon->dev, "charger otg %s failed, ret=%d\n",
+				 is_on ? "enable" : "disable", ret);
+	} else {
+		dev_info(extcon->dev, "no primary_chg; pump only\n");
+	}
 
 	/* Resolve at runtime; see the note on the declaration above for why
 	 * this must not be a direct call. */
@@ -263,32 +298,10 @@ static int mtk_usb_extcon_set_vbus_charger(struct mtk_extcon_info *extcon,
 	if (otg_en) {
 		ret = otg_en(is_on);
 		symbol_put(op6893_otg_boost_enable);
-		return ret;
-	}
-
-	chg = get_charger_by_name("primary_chg");
-	if (!chg)
-		return -ENODEV;
-
-	if (is_on) {
-		ret = charger_dev_set_boost_current_limit(chg,
-							  extcon->vbus_cur ?
-							  extcon->vbus_cur :
-							  OTG_BOOST_CURR_DEFAULT);
-		if (ret < 0)
-			dev_info(extcon->dev, "set boost current failed\n");
-		ret = charger_dev_enable_otg(chg, true);
-	} else {
-		ret = charger_dev_enable_otg(chg, false);
-	}
-	if (ret < 0) {
-		dev_info(extcon->dev, "charger otg %s failed, ret=%d\n",
-			 is_on ? "enable" : "disable", ret);
-		return ret;
 	}
 
 	extcon->vbus_on = is_on;
-	return 0;
+	return ret;
 }
 
 static int mtk_usb_extcon_set_vbus(struct mtk_extcon_info *extcon,
