@@ -542,25 +542,38 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		dev_info(dev, "source vbus = %dmv\n",
 				 noti->vbus_state.mv);
 		/*
-		 * op6893 6.6 OTG: do not let this event switch VBUS off while OTG
-		 * is deliberately on.
+		 * op6893 6.6 OTG: two independent mistakes were fixed here.
 		 *
-		 * The tcpc reports SOURCE_VBUS with 0 mV for its own reasons --
-		 * notably right after a role change, before the pump has ramped,
-		 * and the MT6360 reports pwr_rdy = 0 in the same window.  Acting
-		 * on that produced a self-defeating loop:
+		 * (a) The event used to only ever switch VBUS *on*: the 0 mV
+		 * case was swallowed by the `if (mv)` guard, so nothing ever
+		 * called set_vbus(false).  That left our own boost running
+		 * after the dock was unplugged -- the port still had 5V on it
+		 * and no Rp, which the tcpc duly read as a charger:
 		 *
-		 *   set_vbus(1) -> role DRP -> tcpc "source vbus 0mV"
-		 *     -> set_vbus(0) -> role SNK
+		 *   269.515  Attached-> NULL            <- dock removed
+		 *   269.518  detached, tcpc_attach=0
+		 *   269.518  source vbus = 0mv          <- but boost stayed on
+		 *   269.820  ** Attached-> NORP_SRC     <- 5V with no Rp
+		 *   269.820  Charger plug in
+		 *   269.825  SNK attached, tcpc_attach=1 <- false charging
 		 *
-		 * i.e. OTG switched itself off a few milliseconds after being
-		 * switched on.  When OTG was requested on purpose the pump and the
-		 * role are driven from that request, so ignore a 0 mV report and
-		 * only honour the event when it is asking for VBUS on.
+		 * 4.19 drives this both ways (`vbus_on = mv ? true : false`),
+		 * so do the same.
+		 *
+		 * (b) The `otg_requested` guard below exists because the tcpc
+		 * reports 0 mV in the window between a role change and the
+		 * supply ramping; acting on that used to switch OTG straight
+		 * back off (set_vbus(1) -> role DRP -> "0mV" -> set_vbus(0)).
+		 * That guard is still right for the *ramp* window, but it must
+		 * not outlive the attach: on a real detach the 0 mV means
+		 * VBUS should go away, so clear the flag and honour it.
 		 */
 		if (!noti->vbus_state.mv && extcon->otg_requested) {
-			dev_info(dev, "source vbus 0mV while OTG on -- ignored\n");
-			break;
+			if (extcon->c_role == USB_ROLE_HOST) {
+				dev_info(dev, "source vbus 0mV while host -- ignored\n");
+				break;
+			}
+			extcon->otg_requested = false;
 		}
 #ifdef OPLUS_FEATURE_CHG_BASIC
 		/*
@@ -569,8 +582,8 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 		 * turn on.  Run it when there is no regulator either -- that is
 		 * exactly the case the charger fallback exists for.
 		 */
-		if (noti->vbus_state.mv && (extcon->oplus_vbus_set || !extcon->vbus))
-			mtk_usb_extcon_set_vbus(extcon, true);
+		if (extcon->oplus_vbus_set || !extcon->vbus)
+			mtk_usb_extcon_set_vbus(extcon, !!noti->vbus_state.mv);
 #else
 		vbus_on = (noti->vbus_state.mv) ? true : false;
 		mtk_usb_extcon_set_vbus(extcon, vbus_on);
@@ -622,6 +635,18 @@ static int mtk_extcon_tcpc_notifier(struct notifier_block *nb,
 			noti->typec_state.old_state == TYPEC_ATTACHED_DBGACC_SNK) &&
 			noti->typec_state.new_state == TYPEC_UNATTACHED) {
 			dev_info(dev, "Type-C plug out\n");
+			/*
+			 * op6893 6.6 OTG: take VBUS down with the role.
+			 *
+			 * This is a real detach, so whatever we were sourcing has
+			 * to stop -- otherwise the port keeps 5V with no Rp and
+			 * the tcpc reads that as a charger on the next scan (see
+			 * the NORP_SRC note in TCP_NOTIFY_SOURCE_VBUS below).
+			 * 4.19 does this from the same place: it calls set_vbus()
+			 * right beside set_role(), so both go down together.
+			 */
+			mtk_usb_extcon_set_vbus(extcon, false);
+			extcon->otg_requested = false;
 			mtk_usb_extcon_set_role(extcon, USB_ROLE_NONE);
 		}
 		break;
