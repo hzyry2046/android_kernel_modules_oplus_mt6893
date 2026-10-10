@@ -386,6 +386,7 @@ struct ssusb_mtk {
 	/* op6893 6.6: mediatek,spm-mgr came from the 4.19 DTB -- use 4.19's
 	 * SMC mapping (suspend/resume only) instead of the newer one. */
 	bool legacy_spm;
+	bool legacy_none_clks_held;
 	bool host_dev;
 	bool is_suspended;
 	bool ls_slp_quirk;

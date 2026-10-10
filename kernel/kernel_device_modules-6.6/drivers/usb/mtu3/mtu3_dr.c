@@ -113,7 +113,11 @@ static void switch_port_to_on(struct ssusb_mtk *ssusb, enum phy_mode mode)
 
 	pm_runtime_get(ssusb->dev);
 
-	ssusb_clks_enable(ssusb);
+	if (ssusb->legacy_none_clks_held) {
+		ssusb->legacy_none_clks_held = false;
+	} else {
+		ssusb_clks_enable(ssusb);
+	}
 
 	/* reset USB MAC/PHY */
 	ssusb_reset(ssusb);
@@ -125,7 +129,7 @@ static void switch_port_to_on(struct ssusb_mtk *ssusb, enum phy_mode mode)
 	ssusb_ip_sw_reset(ssusb);
 }
 
-static void switch_port_to_off(struct ssusb_mtk *ssusb)
+static void switch_port_to_off(struct ssusb_mtk *ssusb, bool hold_clks)
 {
 	dev_info(ssusb->dev, "port off\n");
 
@@ -135,7 +139,18 @@ static void switch_port_to_off(struct ssusb_mtk *ssusb)
 	ssusb_phy_power_off(ssusb);
 	ssusb_vsvoter_clr(ssusb);
 	ssusb_set_power_state(ssusb, MTU3_STATE_POWER_OFF);
-	ssusb_clks_disable(ssusb);
+	/*
+	 * The legacy controller stays runtime-active even in NONE, and gadget
+	 * callbacks can still arrive after disconnect.  On op6893, removing
+	 * these clocks hangs the SoC shortly after the teardown has returned.
+	 * Keep the register interface clocked until the next role starts; reuse
+	 * this reference there instead of accumulating another enable/prepare.
+	 */
+	if (hold_clks) {
+		ssusb->legacy_none_clks_held = true;
+	} else {
+		ssusb_clks_disable(ssusb);
+	}
 
 	pm_runtime_put(ssusb->dev);
 }
@@ -265,7 +280,8 @@ static void ssusb_mode_sw_work_v2(struct work_struct *work)
 		ssusb_host_register(ssusb, false);
 		ssusb_wait_power_state(ssusb, MTU3_STATE_POWER_OFF);
 		ssusb_host_disable(ssusb);
-		switch_port_to_off(ssusb);
+		switch_port_to_off(ssusb, ssusb->legacy_spm &&
+				   desired_role == USB_ROLE_NONE);
 		/* wait for hw to complete host off */
 		mdelay(50);
 		break;
@@ -286,7 +302,8 @@ static void ssusb_mode_sw_work_v2(struct work_struct *work)
 		}
 		spin_unlock_irqrestore(&mtu->lock, flags);
 		mtu3_device_disable(mtu);
-		switch_port_to_off(ssusb);
+		switch_port_to_off(ssusb, ssusb->legacy_spm &&
+				   desired_role == USB_ROLE_NONE);
 		pm_relax(ssusb->dev);
 		break;
 	case USB_ROLE_NONE:
