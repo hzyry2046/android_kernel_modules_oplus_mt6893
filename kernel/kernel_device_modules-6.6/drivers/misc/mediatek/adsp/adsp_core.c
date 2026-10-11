@@ -29,13 +29,16 @@
 
 #define ADSP_MAGIC_PATTERN        (0xAD5BAD5B)
 
-#define adsp_smc_send(_opid, _val1, _val2)                   \
-({                                                           \
-	struct arm_smccc_res res;                            \
-	arm_smccc_smc(MTK_SIP_KERNEL_ADSP_CONTROL,           \
-		      _opid, _val1, _val2, 0, 0, 0, 0, &res);\
-	res.a0;                                              \
-})
+static long adsp_smc_send(u32 op, u32 val1, u32 val2)
+{
+	struct arm_smccc_res res;
+
+	if (adspsys && adspsys->legacy_mt6893)
+		return adsp_legacy_control(op, val1);
+	arm_smccc_smc(MTK_SIP_KERNEL_ADSP_CONTROL,
+		      op, val1, val2, 0, 0, 0, 0, &res);
+	return (long)res.a0;
+}
 
 static int (*ipi_queue_send_msg_handler)(
 		uint32_t core_id, /* enum adsp_core_id */
@@ -46,6 +49,38 @@ static int (*ipi_queue_send_msg_handler)(
 
 struct adsp_priv *adsp_cores[ADSP_CORE_TOTAL];
 struct adspsys_priv *adspsys;
+
+/* Diagnostic vote for validating legacy IPC before exercising MTCMOS-off.
+ * Runtime release uses the normal feature accounting, without fake READY.
+ */
+static bool legacy_keep_awake;
+static bool legacy_awake_vote;
+
+static int set_legacy_keep_awake(const char *val, const struct kernel_param *kp)
+{
+	bool keep;
+	int ret = kstrtobool(val, &keep);
+
+	if (ret)
+		return ret;
+	if (adspsys && adspsys->legacy_mt6893 && is_adsp_system_running() &&
+	    keep != legacy_awake_vote) {
+		ret = keep ? adsp_register_feature(SYSTEM_FEATURE_ID) :
+			adsp_deregister_feature(SYSTEM_FEATURE_ID);
+		if (ret)
+			return ret;
+		legacy_awake_vote = keep;
+	}
+	legacy_keep_awake = keep;
+	return 0;
+}
+
+static const struct kernel_param_ops legacy_keep_awake_ops = {
+	.set = set_legacy_keep_awake,
+	.get = param_get_bool,
+};
+module_param_cb(legacy_keep_awake, &legacy_keep_awake_ops, &legacy_keep_awake, 0600);
+MODULE_PARM_DESC(legacy_keep_awake, "Hold legacy MT6893 SYSTEM vote until runtime release");
 
 const struct attribute_group *adspsys_attr_groups[] = {
 	&adsp_excep_attr_group,
@@ -593,11 +628,14 @@ void adsp_latch_dump_region(bool en)
 	}
 }
 
-void adsp_core_start(u32 cid)
+int adsp_core_start(u32 cid)
 {
+	int ret;
+
 	mutex_lock(&access_lock);
-	adsp_smc_send(MTK_ADSP_KERNEL_OP_CORE_START, cid, 0);
+	ret = adsp_smc_send(MTK_ADSP_KERNEL_OP_CORE_START, cid, 0);
 	mutex_unlock(&access_lock);
+	return ret;
 }
 
 void adsp_core_stop(u32 cid)
@@ -640,7 +678,9 @@ int adsp_reset(void)
 			adsp_update_mpu_memory_info(pdata);
 
 		reinit_completion(&pdata->done);
-		adsp_core_start(cid);
+		ret = adsp_core_start(cid);
+		if (ret < 0)
+			return ret;
 		ret = wait_for_completion_timeout(&pdata->done, HZ);
 
 		if (unlikely(ret == 0)) {
@@ -800,11 +840,24 @@ int adsp_system_bootup(void)
 	unsigned int cid = 0;
 	struct adsp_priv *pdata;
 
+	if (!get_adsp_core_total())
+		return -ENODEV;
+	for (cid = 0; cid < get_adsp_core_total(); cid++)
+		if (!adsp_cores[cid])
+			return -ENODEV;
+
 	ret = adsp_system_init();
 	if (ret)
 		goto ERROR;
 
-	adsp_smc_send(MTK_ADSP_KERNEL_OP_SYS_CLEAR, ADSP_MAGIC_PATTERN, 0);
+	if (adspsys->legacy_mt6893) {
+		ret = adsp_legacy_remap();
+		if (ret)
+			goto ERROR;
+	}
+	ret = adsp_smc_send(MTK_ADSP_KERNEL_OP_SYS_CLEAR, ADSP_MAGIC_PATTERN, 0);
+	if (ret < 0)
+		goto ERROR;
 
 	for (cid = 0; cid < get_adsp_core_total(); cid++) {
 		pdata = adsp_cores[cid];
@@ -813,14 +866,28 @@ int adsp_system_bootup(void)
 			goto ERROR;
 		}
 
+		if (adspsys->legacy_mt6893)
+			adsp_legacy_sw_reset(cid);
 		ret = pdata->ops->initialize(pdata);
 		if (unlikely(ret)) {
 			pr_warn("%s, initialize %d is fail\n", __func__, cid);
 			goto ERROR;
 		}
+		if (adspsys->legacy_mt6893) {
+			pdata->itcm_snapshot = devm_kmalloc(pdata->dev, pdata->itcm_size, GFP_KERNEL);
+			pdata->dtcm_snapshot = devm_kmalloc(pdata->dev, pdata->dtcm_size, GFP_KERNEL);
+			if (!pdata->itcm_snapshot || !pdata->dtcm_snapshot) {
+				ret = -ENOMEM;
+				goto ERROR;
+			}
+			memcpy_fromio(pdata->itcm_snapshot, pdata->itcm, pdata->itcm_size);
+			memcpy_fromio(pdata->dtcm_snapshot, pdata->dtcm, pdata->dtcm_size);
+		}
 
 		reinit_completion(&pdata->done);
-		adsp_core_start(cid);
+		ret = adsp_core_start(cid);
+		if (ret < 0)
+			goto ERROR;
 		ret = wait_for_completion_timeout(&pdata->done, 2 * HZ);
 
 		if (unlikely(ret == 0)) {
@@ -829,6 +896,7 @@ int adsp_system_bootup(void)
 			ret = -ETIME;
 			goto ERROR;
 		}
+		pr_info("ADSP core %u READY (legacy=%d)\n", cid, adspsys->legacy_mt6893);
 	}
 
 	adsp_register_feature(SYSTEM_FEATURE_ID); /* regi for trigger suspend */
@@ -840,7 +908,10 @@ int adsp_system_bootup(void)
 			pdata->ops->after_bootup(pdata);
 	}
 
-	adsp_deregister_feature(SYSTEM_FEATURE_ID);
+	if (adspsys->legacy_mt6893 && legacy_keep_awake)
+		legacy_awake_vote = true;
+	else
+		adsp_deregister_feature(SYSTEM_FEATURE_ID);
 
 #if IS_ENABLED(CONFIG_DEVICE_MODULES_MTK_DEVAPC)
 	register_devapc_power_callback(&devapc_power_handle);

@@ -1596,6 +1596,8 @@ int adsp_task_init(int task_id, struct mtk_base_dsp *dsp)
 		return -EINVAL;
 
 	task_scene = get_dspscene_by_dspdaiid(task_id);
+	if (IS_ENABLED(CONFIG_ADSP_SCENE_LEGACY) && task_scene >= TASK_SCENE_SIZE)
+		return -EOPNOTSUPP;
 
 	/* send share message to adsp side */
 	ret = audio_send_ipi_msg(&ipi_msg, task_scene,

@@ -186,7 +186,11 @@ int adsp_core0_resume(void)
 	if (get_adsp_state(pdata) == ADSP_SUSPEND) {
 		switch_adsp_power(true);
 		reinit_completion(&pdata->done);
-		adsp_core_start(pdata->id);
+		ret = adsp_core_start(pdata->id);
+		if (ret) {
+			pr_warn("%s, core start failed: %d\n", __func__, ret);
+			return ret;
+		}
 		ret = wait_for_completion_timeout(&pdata->done, 2 * HZ);
 
 		if (get_adsp_state(pdata) != ADSP_RUNNING) {
@@ -268,7 +272,12 @@ int adsp_core1_resume(void)
 		adsp_awake_lock(ADSP_A_ID);
 
 		reinit_completion(&pdata->done);
-		adsp_core_start(pdata->id);
+		ret = adsp_core_start(pdata->id);
+		if (ret) {
+			adsp_awake_unlock(ADSP_A_ID);
+			pr_warn("%s, core start failed: %d\n", __func__, ret);
+			return ret;
+		}
 		ret = wait_for_completion_timeout(&pdata->done, 2 * HZ);
 
 		if (get_adsp_state(pdata) != ADSP_RUNNING) {
@@ -447,6 +456,12 @@ int adsp_core_common_init(struct adsp_priv *pdata)
 	pdata->mdev.fops = &adsp_core_file_ops;
 #if IS_ENABLED(CONFIG_MTK_AUDIODSP_DEBUG_SUPPORT)
 	pdata->mdev.groups = adsp_core_attr_groups;
+#else
+	/* 4.19 exposed per-core logger controls on the legacy misc devices.
+	 * Keep that interface available for the original MT6893 firmware.
+	 */
+	if (adspsys->legacy_mt6893)
+		pdata->mdev.groups = adsp_core_attr_groups;
 #endif
 
 	/* pre-wakelock */
@@ -512,6 +527,8 @@ int get_adsp_type(void)
 
 	adsp_type = ADSP_TYPE_NONE;
 	dsp_node = of_find_node_by_name(NULL, "snd-audio-dsp");
+	if (!dsp_node)
+		dsp_node = of_find_compatible_node(NULL, NULL, "mediatek,snd_audio_dsp");
 	if (dsp_node) {
 		ret = of_property_read_string(dsp_node, "mtk-dsp-type", &type_str);
 		if (ret < 0) {
@@ -526,6 +543,7 @@ int get_adsp_type(void)
 	}
 
 EXIT:
+	of_node_put(dsp_node);
 	pr_info("%s, adsp_type: %d\n", __func__, adsp_type);
 	return adsp_type;
 }

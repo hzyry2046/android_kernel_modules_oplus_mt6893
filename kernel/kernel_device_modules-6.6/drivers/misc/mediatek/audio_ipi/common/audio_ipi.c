@@ -703,7 +703,11 @@ static void __exit audio_ipi_exit(void)
 	misc_deregister(&audio_ipi_device);
 }
 
+#if IS_ENABLED(CONFIG_ADSP_SCENE_LEGACY)
+MODULE_SOFTDEP("pre: adsp-v1");
+#else
 MODULE_SOFTDEP("pre: adsp-v2");
+#endif
 
 module_init(audio_ipi_init);
 module_exit(audio_ipi_exit);

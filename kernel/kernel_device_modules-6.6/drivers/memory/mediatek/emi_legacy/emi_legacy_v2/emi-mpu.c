@@ -689,6 +689,7 @@ static int emimpu_probe(struct platform_device *pdev)
 	unsigned int *ap_apc;
 	unsigned int ap_region;
 	unsigned int slverr;
+	const char *clear_md_name = "clear-md";
 
 	dev_info(&pdev->dev, "driver probed\n");
 
@@ -739,6 +740,8 @@ static int emimpu_probe(struct platform_device *pdev)
 
 	ret = of_property_read_u32(emimpu_node,
 		"ctrl-intf", &(mpu->ctrl_intf));
+	if (ret && of_device_is_compatible(emimpu_node, "mediatek,mt6885-emimpu"))
+		ret = of_property_read_u32(emimpu_node, "ctrl_intf", &mpu->ctrl_intf);
 	if (ret) {
 		dev_info(&pdev->dev, "No ctrl_intf\n");
 		return -ENXIO;
@@ -790,8 +793,11 @@ static int emimpu_probe(struct platform_device *pdev)
 		return -ENXIO;
 	}
 
+	if (!of_find_property(emimpu_node, clear_md_name, NULL) &&
+	    of_device_is_compatible(emimpu_node, "mediatek,mt6885-emimpu"))
+		clear_md_name = "clear_md";
 	size = of_property_count_elems_of_size(emimpu_node,
-		"clear-md", sizeof(char));
+		clear_md_name, sizeof(char));
 	if (size <= 0) {
 		dev_info(&pdev->dev, "No clear_md\n");
 		return -ENXIO;
@@ -802,7 +808,7 @@ static int emimpu_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	mpu->clear_md_reg_cnt = size / sizeof(struct reg_info_t);
 	size >>= 2;
-	ret = of_property_read_u32_array(emimpu_node, "clear-md",
+	ret = of_property_read_u32_array(emimpu_node, clear_md_name,
 		(unsigned int *)(mpu->clear_md_reg), size);
 	if (ret) {
 		dev_info(&pdev->dev, "No clear_md\n");

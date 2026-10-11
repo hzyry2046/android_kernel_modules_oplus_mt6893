@@ -34,6 +34,9 @@ uint32_t audio_get_dsp_id(const uint8_t task)
 {
 	uint32_t dsp_id = AUDIO_OPENDSP_ID_INVALID;
 
+	if (IS_ENABLED(CONFIG_ADSP_SCENE_LEGACY) && task >= TASK_SCENE_SIZE)
+		return dsp_id;
+
 	switch (task) {
 	case TASK_SCENE_VOICE_ULTRASOUND:
 	case TASK_SCENE_SPEAKER_PROTECTION:

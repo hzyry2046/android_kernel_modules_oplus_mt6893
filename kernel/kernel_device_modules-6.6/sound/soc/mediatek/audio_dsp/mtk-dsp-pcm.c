@@ -114,6 +114,24 @@ static char *dsp_task_dsp_name[AUDIO_TASK_DAI_NUM] = {
 #endif
 };
 
+static int dsp_read_property(struct device_node *np, const char *name,
+			     u32 *values, size_t count)
+{
+	char legacy[64];
+	int i;
+
+	if (!of_find_property(np, name, NULL) &&
+	    of_device_is_compatible(np, "mediatek,snd_audio_dsp")) {
+		if (strscpy(legacy, name, sizeof(legacy)) < 0)
+			return -EINVAL;
+		for (i = 0; legacy[i]; i++)
+			if (legacy[i] == '-')
+				legacy[i] = '_';
+		name = legacy;
+	}
+	return of_property_read_u32_array(np, name, values, count);
+}
+
 static int dsp_pcm_taskattr_init(struct platform_device *pdev)
 {
 	struct mtk_adsp_task_attr task_attr;
@@ -130,7 +148,7 @@ static int dsp_pcm_taskattr_init(struct platform_device *pdev)
 
 	if (pdev->dev.of_node) {
 		for (dsp_id = 0; dsp_id < AUDIO_TASK_DAI_NUM; dsp_id++) {
-			ret = of_property_read_u32_array(pdev->dev.of_node,
+			ret = dsp_read_property(pdev->dev.of_node,
 						 dsp_task_dsp_name[dsp_id],
 						 (unsigned int *)&task_attr,
 						 SND_DSP_DTS_SIZE);
@@ -155,15 +173,15 @@ static int dsp_pcm_taskattr_init(struct platform_device *pdev)
 		dump_all_task_attr();
 
 		/* get dsp version */
-		ret = of_property_read_u32(pdev->dev.of_node,
+		ret = dsp_read_property(pdev->dev.of_node,
 					   "mtk-dsp-ver",
-					   &dsp->dsp_ver);
+					   &dsp->dsp_ver, 1);
 		if (ret != 0)
 			pr_info("%s mtk-dsp-ver error\n", __func__);
 
-		ret = of_property_read_u32(pdev->dev.of_node,
+		ret = dsp_read_property(pdev->dev.of_node,
 			"swdsp-smartpa-process-enable",
-			&(task_attr.task_property));
+			&(task_attr.task_property), 1);
 		if (ret)
 			task_attr.task_property = 0;
 		set_task_attr(AUDIO_TASK_PLAYBACK_ID, ADSP_TASK_ATTR_PROPERTY,

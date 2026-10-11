@@ -63,6 +63,8 @@ struct adsp_priv {
 	void __iomem *dtcm;
 	void __iomem *sysram;
 	void __iomem *l2sram;
+	void *itcm_snapshot;
+	void *dtcm_snapshot;
 	size_t itcm_size;
 	size_t dtcm_size;
 	size_t sysram_size;
@@ -95,6 +97,7 @@ struct adsp_priv {
 
 struct adspsys_priv {
 	u32 num_cores;
+	bool legacy_mt6893;
 	u32 slp_prot_ctrl;
 	u32 sram_sleep_mode_ctrl;
 	u32 system_l2sram;

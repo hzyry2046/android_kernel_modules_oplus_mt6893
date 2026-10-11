@@ -43,6 +43,9 @@ bool is_adsp_axibus_idle(u32 *backup);
 bool is_infrabus_timeout(void);
 
 void adsp_hardware_init(struct adspsys_priv *adspsys);
+long adsp_legacy_control(u32 op, u32 val);
+int adsp_legacy_remap(void);
+void adsp_legacy_sw_reset(u32 cid);
 
 bool adsp_is_pre_lock_support(void);
 bool check_core_active(u32 cid);

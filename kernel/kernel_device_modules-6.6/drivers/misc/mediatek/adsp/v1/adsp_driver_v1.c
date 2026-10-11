@@ -5,6 +5,7 @@
 
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/io.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
@@ -20,6 +21,8 @@
 #define SEMA_TIMEOUT        5000
 #define SEMA_WAY_BITS       3
 #define SEMA_CTRL_BIT       2
+
+static struct adspsys_priv *v1_adspsys;
 
 const struct adspsys_description mt6893_adspsys_desc = {
 	.platform_name = "mt6893",
@@ -122,6 +125,9 @@ static int adspsys_drv_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	const struct of_device_id *match;
 	struct adspsys_priv *adspsys;
+	struct device_node *core;
+	struct resource cfg;
+	u32 loaded;
 
 	/* create private data */
 	adspsys = devm_kzalloc(dev, sizeof(*adspsys), GFP_KERNEL);
@@ -135,16 +141,39 @@ static int adspsys_drv_probe(struct platform_device *pdev)
 	adspsys->desc = (struct adspsys_description *)match->data;
 	adspsys->dev = dev;
 
-	/* get resource from platform_device */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	/* The original MT6893 DT puts shared CFG in each core node. */
+	adspsys->legacy_mt6893 = !strcmp(adspsys->desc->platform_name, "mt6893") &&
+		!of_find_property(dev->of_node, "core-num", NULL) &&
+		of_property_match_string(dev->of_node, "reg-names", "cfg_secure") == 0;
+	if (adspsys->legacy_mt6893) {
+		ret = of_property_read_u32(dev->of_node, "load", &loaded);
+		if (ret || !loaded)
+			return -ENODEV;
+		core = of_find_compatible_node(NULL, NULL, "mediatek,adsp_core_0");
+		if (!core)
+			return -ENODEV;
+		ret = of_address_to_resource(core, 0, &cfg);
+		of_node_put(core);
+		if (ret)
+			return ret;
+		res = &cfg;
+		adspsys->num_cores = 2;
+	} else {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cfg");
+		ret = of_property_read_u32(dev->of_node, "core-num", &adspsys->num_cores);
+		if (ret || !adspsys->num_cores || adspsys->num_cores > ADSP_CORE_TOTAL)
+			return -EINVAL;
+	}
 	adspsys->cfg = devm_ioremap_resource(dev, res);
+	if (IS_ERR(adspsys->cfg))
+		return PTR_ERR(adspsys->cfg);
 	adspsys->cfg_size = resource_size(res);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "cfg_secure");
 	adspsys->cfg_secure = devm_ioremap_resource(dev, res);
+	if (IS_ERR(adspsys->cfg_secure))
+		return PTR_ERR(adspsys->cfg_secure);
 	adspsys->cfg_secure_size = resource_size(res);
-
-	of_property_read_u32(dev->of_node, "core-num", &adspsys->num_cores);
 
 	ret = adsp_clk_probe(pdev, &adspsys->clk_ops);
 	if (ret) {
@@ -175,9 +204,11 @@ static int adspsys_drv_probe(struct platform_device *pdev)
 	//register_syscore_ops(&adsp_syscore_ops);
 
 	register_adspsys(adspsys);
+	v1_adspsys = adspsys;
 	switch_adsp_power(true);
 
-	pr_info("%s, success\n", __func__);
+	pr_info("%s, success cores=%u legacy=%d\n", __func__,
+		adspsys->num_cores, adspsys->legacy_mt6893);
 ERROR:
 	return ret;
 }
@@ -198,6 +229,13 @@ static int adsp_core_drv_probe(struct platform_device *pdev)
 	const struct of_device_id *match;
 	struct of_phandle_args spec;
 	u64 system_info[2];
+	u32 legacy_features;
+	int tcm_index;
+	int irq;
+	struct adspsys_priv *adspsys = v1_adspsys;
+
+	if (!adspsys)
+		return -EPROBE_DEFER;
 
 	/* create private data */
 	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
@@ -219,31 +257,56 @@ static int adsp_core_drv_probe(struct platform_device *pdev)
 	init_completion(&pdata->done);
 
 	/* get resource from platform_device */
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	tcm_index = adspsys->legacy_mt6893 ? 1 : 0;
+	res = platform_get_resource(pdev, IORESOURCE_MEM, tcm_index);
 	pdata->itcm = devm_ioremap_resource(dev, res);
+	if (IS_ERR(pdata->itcm))
+		return PTR_ERR(pdata->itcm);
 	pdata->itcm_size = resource_size(res);
 
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, tcm_index + 1);
 	pdata->dtcm = devm_ioremap_resource(dev, res);
+	if (IS_ERR(pdata->dtcm))
+		return PTR_ERR(pdata->dtcm);
 	pdata->dtcm_size = resource_size(res);
 
-	pdata->irq[ADSP_IRQ_IPC_ID].seq = platform_get_irq(pdev, 0);
+	irq = platform_get_irq(pdev, 0);
+	if (irq < 0)
+		return irq;
+	pdata->irq[ADSP_IRQ_IPC_ID].seq = irq;
 	pdata->irq[ADSP_IRQ_IPC_ID].clear_irq = adsp_mt_clr_sysirq;
-	pdata->irq[ADSP_IRQ_WDT_ID].seq = platform_get_irq(pdev, 1);
+	irq = platform_get_irq(pdev, 1);
+	if (irq < 0)
+		return irq;
+	pdata->irq[ADSP_IRQ_WDT_ID].seq = irq;
 	pdata->irq[ADSP_IRQ_WDT_ID].clear_irq = adsp_mt_disable_wdt;
-	pdata->irq[ADSP_IRQ_AUDIO_ID].seq = platform_get_irq(pdev, 2);
+	irq = platform_get_irq(pdev, 2);
+	if (irq < 0)
+		return irq;
+	pdata->irq[ADSP_IRQ_AUDIO_ID].seq = irq;
 	pdata->irq[ADSP_IRQ_AUDIO_ID].clear_irq = adsp_mt_clr_auidoirq;
 
-	of_property_read_u64_array(dev->of_node, "system", system_info, 2);
+	ret = of_property_read_u64_array(dev->of_node, "system", system_info, 2);
+	if (ret)
+		return ret;
 	pdata->sysram_phys = (phys_addr_t)system_info[0];
 	pdata->sysram_size = (size_t)system_info[1];
 
 	if (pdata->sysram_phys == 0 || pdata->sysram_size == 0)
 		return -ENODEV;
-	pdata->sysram = ioremap_wc(pdata->sysram_phys, pdata->sysram_size);
+	pdata->sysram = devm_ioremap_wc(dev, pdata->sysram_phys, pdata->sysram_size);
+	if (!pdata->sysram)
+		return -ENOMEM;
 
-	of_property_read_u64(dev->of_node, "feature-control-bits",
+	ret = of_property_read_u64(dev->of_node, "feature-control-bits",
 			     &pdata->feature_set);
+	if (ret && adspsys->legacy_mt6893) {
+		ret = of_property_read_u32(dev->of_node, "feature_control_bits", &legacy_features);
+		if (!ret)
+			pdata->feature_set = legacy_features;
+	}
+	if (ret || !pdata->feature_set)
+		return -EINVAL;
 
 	/* mailbox channel parsing */
 	if (of_parse_phandle_with_args(dev->of_node, "mboxes",
@@ -252,6 +315,9 @@ static int adsp_core_drv_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 	pdata->send_mbox = get_adsp_mbox_pin_send(spec.args[0]);
+	of_node_put(spec.np);
+	if (!pdata->send_mbox)
+		return -EINVAL;
 
 	if (of_parse_phandle_with_args(dev->of_node, "mboxes",
 				       "#mbox-cells", 1, &spec)) {
@@ -259,6 +325,9 @@ static int adsp_core_drv_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 	pdata->recv_mbox = get_adsp_mbox_pin_recv(spec.args[0]);
+	of_node_put(spec.np);
+	if (!pdata->recv_mbox)
+		return -EINVAL;
 
 	/* add to adsp_core list */
 	register_adsp_core(pdata);
@@ -347,7 +416,16 @@ static int __init platform_adsp_init(void)
 
 	register_3way_semaphore_notifier(&adsp_semaphore_init_notifier);
 
-	return adsp_system_bootup();
+	ret = adsp_system_bootup();
+	if (ret && v1_adspsys && v1_adspsys->legacy_mt6893) {
+		/* Keep callbacks and mappings alive for diagnostics after a failed
+		 * legacy boot. Returning an init error here unloads this module
+		 * while its registered platform drivers and IRQs still exist.
+		 */
+		pr_err("ADSP legacy boot failed (%d); driver remains registered, DSP offline\n", ret);
+		return 0;
+	}
+	return ret;
 }
 
 static void __exit platform_adsp_exit(void)

@@ -8,6 +8,15 @@ config MTK_AUDIO_IPI
 	  This option depends on MediaTek in-house audio DSP support
 	  or audio feature support on MediaTek in-house DSP.
 
+config ADSP_SCENE_LEGACY
+	bool "Use MT6893 legacy audio HAL and DSP scene numbers"
+	depends on MTK_ADSP_V1 && !SND_SOC_MTK_AUTO_AUDIO_DSP
+	default n
+	help
+	  Preserve the scene numbers and 33-entry task-info ioctl ABI used by
+	  the original MT6893 HAL and DSP firmware. Newer DSP tasks remain
+	  unavailable with this option. Enable only with that legacy firmware.
+
 config DEVICE_MODULES_VHOST_ADSP
 	tristate "Host kernel accelerator for virtio blk (EXPERIMENTAL)"
 	depends on BLOCK

@@ -66,7 +66,7 @@ bool has_system_l2sram(void);
 
 void switch_adsp_power(bool on);
 int adsp_reset(void);
-void adsp_core_start(u32 cid);
+int adsp_core_start(u32 cid);
 void adsp_core_stop(u32 cid);
 void adsp_latch_dump_region(bool en);
 
