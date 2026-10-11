@@ -27,6 +27,7 @@
 
 #include "mtk_battery.h"
 #include "mtk_gauge.h"
+#include "mtk-battery-charge-status.h"
 #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
 #include <mt-plat/aee.h>
 #endif
@@ -1393,11 +1394,13 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 	struct battery_data *bs_data;
 	union power_supply_propval online = {0}, status = {0}, vbat0 = {0};
 	union power_supply_propval prop_type = {0};
+	union power_supply_propval dv2_online = {0};
 	int cur_chr_type = 0, old_vbat0 = 0;
 
 	struct power_supply *chg_psy = NULL;
 	struct power_supply *dv2_chg_psy = NULL;
 	int ret = 0;
+	int vbat0_ret;
 
 	bm = psy->drv_data;
 	bs_data = &bm->bs_data;
@@ -1433,30 +1436,28 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 			pr_err("%s retry to get chg_psy\n", __func__);
 	}
 	if (!IS_ERR_OR_NULL(chg_psy)) {
-		ret |= power_supply_get_property(chg_psy,
+		ret = power_supply_get_property(chg_psy,
 			POWER_SUPPLY_PROP_ONLINE, &online);
+		if (ret < 0)
+			return;
 
-		ret |= power_supply_get_property(chg_psy,
+		ret = power_supply_get_property(chg_psy,
 			POWER_SUPPLY_PROP_STATUS, &status);
+		if (ret < 0)
+			return;
 
-		ret |= power_supply_get_property(chg_psy,
+		vbat0_ret = power_supply_get_property(chg_psy,
 			POWER_SUPPLY_PROP_ENERGY_EMPTY, &vbat0);
 
-		if (ret < 0)
-			pr_debug("%s ret: %d\n", __func__, ret);
-
-		if (!online.intval) {
-			bs_data->bat_status = POWER_SUPPLY_STATUS_DISCHARGING;
-		} else {
+		bs_data->bat_status = mtk_battery_charge_status(!!online.intval,
+							     status.intval);
+		if (online.intval) {
 			if (status.intval == POWER_SUPPLY_STATUS_NOT_CHARGING) {
-				bs_data->bat_status =
-					POWER_SUPPLY_STATUS_NOT_CHARGING;
-
 				dv2_chg_psy = power_supply_get_by_name("mtk-mst-div-chg");
 				if (!IS_ERR_OR_NULL(dv2_chg_psy)) {
 					ret = power_supply_get_property(dv2_chg_psy,
-						POWER_SUPPLY_PROP_ONLINE, &online);
-					if (online.intval) {
+						POWER_SUPPLY_PROP_ONLINE, &dv2_online);
+					if (!ret && dv2_online.intval) {
 						bs_data->bat_status =
 							POWER_SUPPLY_STATUS_CHARGING;
 						status.intval =
@@ -1464,22 +1465,19 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 					}
 					power_supply_put(dv2_chg_psy);
 				}
-			} else {
-				bs_data->bat_status =
-					POWER_SUPPLY_STATUS_CHARGING;
 			}
 			bm_send_cmd(bm, MANAGER_SW_BAT_CYCLE_ACCU, 0);
 		}
 
-		if (status.intval == POWER_SUPPLY_STATUS_FULL
-			&& bm->b_EOC != true) {
+		/* Latch before notifying. Repeated Full notifications belong to
+		 * one EOC episode; unplug or a valid non-Full status rearms it.
+		 */
+		if (mtk_battery_eoc_update(bs_data->bat_status, &bm->b_EOC)) {
 			pr_err("POWER_SUPPLY_STATUS_FULL, EOC\n");
 			gauge_get_int_property(bm->gm1, GAUGE_PROP_BAT_EOC);
 			bm_send_cmd(bm, MANAGER_NOTIFY_CHR_FULL, 0);
 			pr_err("GAUGE_PROP_BAT_EOC done\n");
-			bm->b_EOC = true;
-		} else
-			bm->b_EOC = false;
+		}
 
 		battery_update(bm);
 
@@ -1488,7 +1486,7 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 			POWER_SUPPLY_PROP_USB_TYPE, &prop_type);
 
 		/* plug in out */
-		cur_chr_type = prop_type.intval;
+		cur_chr_type = ret < 0 ? bm->chr_type : prop_type.intval;
 
 		if (cur_chr_type == POWER_SUPPLY_TYPE_UNKNOWN) {
 			if (bm->chr_type != POWER_SUPPLY_TYPE_UNKNOWN)
@@ -1498,7 +1496,7 @@ static void mtk_battery_external_power_changed(struct power_supply *psy)
 				bm_send_cmd(bm, MANAGER_WAKE_UP_ALGO, FG_INTR_CHARGER_IN);
 		}
 
-		if (bm->gm1->vbat0_flag != vbat0.intval) {
+		if (!vbat0_ret && bm->gm1->vbat0_flag != vbat0.intval) {
 			old_vbat0 = bm->gm1->vbat0_flag;
 			bm->gm1->vbat0_flag = vbat0.intval;
 			if (bm->gm_no == 2)
