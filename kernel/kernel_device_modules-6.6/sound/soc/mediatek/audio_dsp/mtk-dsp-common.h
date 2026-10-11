@@ -17,6 +17,8 @@
 
 #include "mtk-dsp-common_define.h"
 
+bool mtk_dsp_legacy_capture_diag_enabled(void);
+
 #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
 #include <mt-plat/aee.h>
 #endif

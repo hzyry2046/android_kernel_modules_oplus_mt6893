@@ -36,6 +36,15 @@
 static int adsp_standby_flag;
 static struct wait_queue_head waitq;
 
+static bool legacy_capture_diag;
+module_param(legacy_capture_diag, bool, 0600);
+MODULE_PARM_DESC(legacy_capture_diag, "Log legacy capture configuration and UL notifications");
+
+bool mtk_dsp_legacy_capture_diag_enabled(void)
+{
+	return IS_ENABLED(CONFIG_ADSP_SCENE_LEGACY) && legacy_capture_diag;
+}
+
 #if IS_ENABLED(CONFIG_MTK_SLBC) && !IS_ENABLED(CONFIG_ADSP_SLB_LEGACY)
 static int slc_counter;
 #endif
@@ -43,6 +52,48 @@ static int slc_counter;
 /* don't use this directly if not necessary */
 static struct mtk_base_dsp *local_base_dsp;
 static struct mtk_base_afe *local_dsp_afe;
+
+/* Metadata only; the message buffers live for the lifetime of the DSP device.
+ * Concurrent DSP updates can make this diagnostic snapshot approximate.
+ */
+static int legacy_capture_status_get(char *buffer, const struct kernel_param *kp)
+{
+	struct mtk_base_dsp *dsp = READ_ONCE(local_base_dsp);
+	const int ids[] = { AUDIO_TASK_CAPTURE_UL1_ID, AUDIO_TASK_CAPTURE_RAW_ID };
+	int i, n = 0;
+
+	if (!mtk_dsp_legacy_capture_diag_enabled())
+		return -EACCES;
+	if (!dsp)
+		return -ENODEV;
+
+	for (i = 0; i < ARRAY_SIZE(ids); i++) {
+		struct mtk_base_dsp_mem *mem = &dsp->dsp_mem[ids[i]];
+		struct audio_hw_buffer snapshot;
+		struct ringbuf_bridge *ring = &snapshot.aud_buffer.buf_bridge;
+
+		if (!mem->msg_dtoa_share_buf.vir_addr)
+			continue;
+		/* Read firmware metadata without dereferencing any firmware pointer. */
+		memcpy(&snapshot, mem->msg_dtoa_share_buf.vir_addr, sizeof(snapshot));
+		n += scnprintf(buffer + n, PAGE_SIZE - n,
+			"scene=%d d2a=%llx base=%llx end=%llx read=%llx write=%llx len=%llu count=%llu fmt=%u rate=%u ch=%u dir=%u counter=%d ignore_irq=%u ap_count=%d ap_counter=%d\n",
+			get_dspscene_by_dspdaiid(ids[i]), mem->msg_dtoa_share_buf.phy_addr,
+			ring->pBufBase, ring->pBufEnd, ring->pRead, ring->pWrite,
+			ring->bufLen, ring->datacount, snapshot.aud_buffer.buffer_attr.format,
+			snapshot.aud_buffer.buffer_attr.rate, snapshot.aud_buffer.buffer_attr.channel,
+			snapshot.aud_buffer.buffer_attr.direction, snapshot.counter,
+			snapshot.ignore_irq, READ_ONCE(mem->ring_buf.datacount),
+			READ_ONCE(mem->adsp_buf.counter));
+	}
+	return n;
+}
+
+static const struct kernel_param_ops legacy_capture_status_ops = {
+	.get = legacy_capture_status_get,
+};
+module_param_cb(legacy_capture_status, &legacy_capture_status_ops, NULL, 0400);
+MODULE_PARM_DESC(legacy_capture_status, "Read legacy capture D2A metadata while capture diagnostics are enabled");
 
 static char *dsp_task_name[AUDIO_TASK_DAI_NUM] = {
 	[AUDIO_TASK_VOIP_ID]         = "voip",
@@ -345,6 +396,11 @@ int mtk_scp_ipi_send(int task_scene, int data_type, int ack_type,
 		AUDIO_IPI_LAYER_TO_DSP, data_type,
 		ack_type, msg_id, param1, param2,
 		(char *)payload);
+	if (mtk_dsp_legacy_capture_diag_enabled() &&
+	    (task_scene == TASK_SCENE_CAPTURE_UL1 || task_scene == TASK_SCENE_CAPTURE_RAW) &&
+	    msg_id != AUDIO_DSP_TASK_ULCOPY)
+		pr_info("ADSP capture tx scene=%d msg=%x ack=%d ret=%d reply=%u/%u\n",
+			task_scene, msg_id, ack_type, send_result, ipi_msg.param1, ipi_msg.param2);
 	if (send_result)
 		pr_info("%s(),scp_ipi send fail\n", __func__);
 
@@ -572,6 +628,17 @@ int afe_pcm_ipi_to_dsp(int command, struct snd_pcm_substream *substream,
 				 params,
 				 memif->irq_usage,
 				 dai);
+		if (mtk_dsp_legacy_capture_diag_enabled() &&
+		    task_id == AUDIO_TASK_CAPTURE_UL1_ID) {
+			struct audio_hw_buffer *b = &dsp_memif->audio_afepcm_buf;
+
+			pr_info("ADSP capture AFE cmd=%x memif=%d dir=%u rate=%u ch=%u fmt=%u irq=%d bytes=%llu ref=%d\n",
+				command, dai->id, b->aud_buffer.buffer_attr.direction,
+				b->aud_buffer.buffer_attr.rate, b->aud_buffer.buffer_attr.channel,
+				b->aud_buffer.buffer_attr.format, memif->irq_usage,
+				(unsigned long long)b->aud_buffer.buf_bridge.bufLen,
+				get_task_attr(task_id, ADSP_TASK_ATTR_REF_RUNTIME));
+		}
 
 		/* send audio_afepcm_buf to SCP side */
 		ipi_audio_buf =

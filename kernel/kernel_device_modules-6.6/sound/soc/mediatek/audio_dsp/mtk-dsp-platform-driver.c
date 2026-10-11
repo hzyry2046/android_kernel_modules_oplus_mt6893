@@ -1160,6 +1160,11 @@ void mtk_dsp_handler(struct mtk_base_dsp *dsp,
 		mtk_dsp_dl_handler(dsp, ipi_msg, id);
 		break;
 	case AUDIO_DSP_TASK_IRQUL:
+		if (mtk_dsp_legacy_capture_diag_enabled())
+			pr_info_ratelimited("ADSP capture rx scene=%u p1=%u p2=%u state=%d\n",
+				ipi_msg->task_scene, ipi_msg->param1, ipi_msg->param2,
+				dsp->dsp_mem[id].substream ?
+				dsp->dsp_mem[id].substream->runtime->status->state : -1);
 		mtk_dsp_ul_handler(dsp, ipi_msg, id);
 		break;
 	case AUDIO_DSP_TASK_DL_CONSUME_DATA:
