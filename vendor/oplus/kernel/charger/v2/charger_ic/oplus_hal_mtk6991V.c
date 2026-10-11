@@ -25,6 +25,7 @@
 #include <linux/power_supply.h>
 #include <linux/pm_wakeup.h>
 #include <linux/time.h>
+#include <linux/timekeeping.h>
 #include <linux/mutex.h>
 #include <linux/kthread.h>
 #include <linux/proc_fs.h>
@@ -43,6 +44,10 @@
 #include <asm/setup.h>
 
 #include "oplus_hal_mtk6991V.h"
+#include <mt6893-legacy-ntc.h>
+#include <mt6893-charge-guard.h>
+#include <mt6893-charge-limits.h>
+#include <mt6893-full-observer.h>
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 #include <linux/gpio.h>
@@ -115,6 +120,644 @@ static uint32_t private_key2[4] = { 0 };
 #endif /* OPLUS_FEATURE_CHG_BASIC */
 
 static struct mtk_charger *pinfo;
+static bool legacy_charger_ntc;
+static char *legacy_charger_supplied_to[] = { "battery" };
+static u32 legacy_subboard_pull_up_r = 200000;
+
+static int legacy_ntc_voltage(struct iio_channel *chan, int *voltage)
+{
+	int rc, mv;
+
+	if (IS_ERR_OR_NULL(chan))
+		return -ENODEV;
+	rc = iio_read_channel_processed(chan, &mv);
+	if (rc < 0)
+		return rc;
+	if (mv <= 0 || mv >= 1800)
+		return -ERANGE;
+	*voltage = mv;
+	return 0;
+}
+
+static int legacy_subboard_read(int *voltage, int *temp_decic)
+{
+	int rc;
+
+	if (!pinfo)
+		return -ENODEV;
+	rc = legacy_ntc_voltage(pinfo->subboard_temp_chan, voltage);
+	if (rc < 0)
+		return rc;
+	return mt6893_legacy_ntc_temperature(*voltage,
+		legacy_subboard_pull_up_r, temp_decic);
+}
+
+/* Own only the missing legacy disable election; common/UI SOC stays separate. */
+static struct {
+	bool required;
+	bool active;
+	bool stopping;
+	bool blocked;
+	bool stopped_by_guard;
+	bool enable_pending;
+	int cold_decic;
+	int hot_decic;
+	int adc_rc;
+	int read_rc;
+	int temp_decic;
+	int voltage_mv;
+	int apply_rc;
+	unsigned int test_mask;
+	struct mt6893_guard_temp_state temp;
+	struct votable *disable;
+	struct delayed_work work;
+} legacy_guard;
+static DEFINE_MUTEX(legacy_guard_lock);
+static DEFINE_MUTEX(legacy_guard_sample_lock);
+
+enum legacy_limit_id { LEGACY_ICL, LEGACY_FCC, LEGACY_FV, LEGACY_LIMIT_COUNT };
+static struct {
+	bool active;
+	struct mt6893_charge_limits config;
+	struct votable *vote[LEGACY_LIMIT_COUNT];
+	int zone;
+	int usb_type;
+	int contract_mv, contract_ma;
+	int cap[LEGACY_LIMIT_COUNT];
+	int target[LEGACY_LIMIT_COUNT];
+	int test[LEGACY_LIMIT_COUNT];
+	int apply_rc;
+} legacy_limits;
+static DEFINE_MUTEX(legacy_limits_lock);
+static int legacy_iterm_ma;
+static int legacy_iterm_request_ma;
+static struct {
+	bool active;
+	int sw_mv[MT6893_LIMIT_ZONES];
+	int hw_inc_mv[MT6893_LIMIT_ZONES];
+	int recharge_drop_mv[MT6893_LIMIT_ZONES];
+	struct mt6893_full_observer state;
+	struct mt6893_full_input input;
+	int voltage_rc, current_rc, done_rc, enabled_rc;
+} legacy_full;
+static DEFINE_MUTEX(legacy_full_lock);
+static int legacy_limits_refresh(void);
+static int legacy_limits_request(enum legacy_limit_id id, int value);
+static int legacy_limits_init(struct device *dev);
+static void legacy_full_sample(void);
+
+static struct charger_device *legacy_guard_charger(void)
+{
+	struct charger_device *chg = pinfo->chg1_dev;
+
+	if (!chg) {
+		chg = get_charger_by_name("primary_chg");
+		if (chg)
+			pinfo->chg1_dev = chg;
+	}
+	return chg;
+}
+
+static bool legacy_guard_is_sink(void)
+{
+	int attach;
+
+	if (!pinfo->tcpc)
+		return false;
+	attach = tcpm_inquire_typec_attach_state(pinfo->tcpc);
+	return attach == TYPEC_ATTACHED_SNK || attach == TYPEC_ATTACHED_NORP_SRC;
+}
+
+static void legacy_guard_notify(void)
+{
+	if (!IS_ERR_OR_NULL(pinfo->psy1))
+		power_supply_changed(pinfo->psy1);
+}
+
+/* Avoid repeatedly running MT6360's ICHG ramp-down for an already-off buck. */
+static int legacy_guard_disable_hw(struct charger_device *chg)
+{
+	bool enabled;
+	int rc;
+
+	if (!chg)
+		return -EAGAIN;
+	rc = charger_dev_is_enabled(chg, &enabled);
+	if (rc < 0)
+		return charger_dev_enable(chg, false);
+	if (!enabled)
+		return 0;
+	rc = charger_dev_enable(chg, false);
+	if (!rc)
+		legacy_guard.stopped_by_guard = true;
+	return rc;
+}
+
+static int legacy_guard_disable_vote(struct votable *votable, void *data,
+				    int disable, const char *client, bool step)
+{
+	struct charger_device *chg;
+	int rc = 0;
+
+	mutex_lock(&legacy_guard_lock);
+	legacy_guard.blocked = disable > 0;
+	if (legacy_guard.blocked) {
+		chg = legacy_guard_charger();
+		rc = legacy_guard_disable_hw(chg);
+		legacy_guard.apply_rc = rc;
+	}
+	/* Clearing one vote never enables hardware from the election callback. */
+	if (!legacy_guard.stopping)
+		mod_delayed_work(system_freezable_wq, &legacy_guard.work, 0);
+	mutex_unlock(&legacy_guard_lock);
+	legacy_guard_notify();
+	chg_info("legacy guard vote %s: disable=%d rc=%d\n", client, disable, rc);
+	return rc;
+}
+
+static void legacy_guard_sample(void)
+{
+	int mv = 0, temp = 0, adc_rc, rc;
+	bool fault, cold, hot;
+	unsigned int mask;
+
+	mutex_lock(&legacy_guard_sample_lock);
+	adc_rc = legacy_subboard_read(&mv, &temp);
+	mutex_lock(&legacy_guard_lock);
+	mask = legacy_guard.test_mask;
+	rc = (mask & 1) ? -EIO : adc_rc;
+	mt6893_guard_temp_update(&legacy_guard.temp, rc, temp,
+		legacy_guard.cold_decic, legacy_guard.hot_decic);
+	legacy_guard.adc_rc = adc_rc;
+	legacy_guard.read_rc = rc;
+	legacy_guard.voltage_mv = mv;
+	legacy_guard.temp_decic = temp;
+	fault = legacy_guard.temp.ntc_fault;
+	cold = legacy_guard.temp.cold || (mask & 2);
+	hot = legacy_guard.temp.hot || (mask & 4);
+	mutex_unlock(&legacy_guard_lock);
+	/* Assert new reasons before withdrawing old ones: no unblocked gap. */
+	if (fault)
+		vote(legacy_guard.disable, "LEGACY_NTC_FAULT", true, 1, false);
+	if (cold)
+		vote(legacy_guard.disable, "LEGACY_COLD", true, 1, false);
+	if (hot)
+		vote(legacy_guard.disable, "LEGACY_HOT", true, 1, false);
+	if (!fault)
+		vote(legacy_guard.disable, "LEGACY_NTC_FAULT", false, 0, false);
+	if (!cold)
+		vote(legacy_guard.disable, "LEGACY_COLD", false, 0, false);
+	if (!hot)
+		vote(legacy_guard.disable, "LEGACY_HOT", false, 0, false);
+	mutex_unlock(&legacy_guard_sample_lock);
+}
+
+/* Caller holds legacy_guard_lock; local ADC state remains authoritative. */
+static bool legacy_guard_denied(void)
+{
+	return legacy_guard.blocked || legacy_guard.temp.ntc_fault ||
+		legacy_guard.temp.cold || legacy_guard.temp.hot || legacy_guard.test_mask ||
+		!READ_ONCE(legacy_limits.active) || READ_ONCE(legacy_limits.apply_rc) < 0 ||
+		pinfo->cmd_discharging || pinfo->wls_charging_disable;
+}
+
+static int legacy_guard_enable(struct charger_device *chg)
+{
+	int rc;
+
+	if (!legacy_guard.active)
+		return legacy_guard.required ? -EACCES : charger_dev_enable(chg, true);
+	if (READ_ONCE(legacy_guard.stopping))
+		return -ESHUTDOWN;
+	legacy_guard_sample();
+	rc = legacy_limits_refresh();
+	mutex_lock(&legacy_guard_lock);
+	legacy_guard.enable_pending = true;
+	if (legacy_guard.stopping || legacy_guard_denied() || !legacy_guard_is_sink()) {
+		rc = -EACCES;
+	} else {
+		rc = charger_dev_enable(chg, true);
+		if (!rc) {
+			legacy_guard.stopped_by_guard = false;
+			legacy_guard.enable_pending = false;
+		}
+		legacy_guard.apply_rc = rc;
+	}
+	mutex_unlock(&legacy_guard_lock);
+	legacy_guard_notify();
+	return rc;
+}
+
+static void legacy_guard_work(struct work_struct *work)
+{
+	struct charger_device *chg;
+	bool changed = false;
+	int rc;
+
+	legacy_guard_sample();
+	legacy_limits_refresh();
+	mutex_lock(&legacy_guard_lock);
+	chg = legacy_guard_charger();
+	if (chg && !legacy_guard.stopping) {
+		if (legacy_guard_denied()) {
+			rc = legacy_guard_disable_hw(chg);
+			legacy_guard.apply_rc = rc;
+		} else if ((legacy_guard.stopped_by_guard || legacy_guard.enable_pending) &&
+			   legacy_guard_is_sink() &&
+			   !pinfo->cmd_discharging && !pinfo->wls_charging_disable) {
+			rc = charger_dev_enable(chg, true);
+			if (!rc) {
+				legacy_guard.stopped_by_guard = false;
+				legacy_guard.enable_pending = false;
+				changed = true;
+			}
+			legacy_guard.apply_rc = rc;
+		}
+	}
+	if (!legacy_guard.stopping)
+		mod_delayed_work(system_freezable_wq, &legacy_guard.work, msecs_to_jiffies(5000));
+	mutex_unlock(&legacy_guard_lock);
+	legacy_full_sample();
+	if (changed)
+		legacy_guard_notify();
+}
+
+static int legacy_guard_init(struct device *dev)
+{
+	struct device_node *node;
+	u32 cold, hot;
+
+	if (!legacy_charger_ntc)
+		return 0;
+	node = of_find_compatible_node(NULL, NULL, "oplus,wired");
+	if (node) {
+		of_node_put(node);
+		return 0;
+	}
+	legacy_guard.required = true;
+	if (find_votable("WIRED_CHARGING_DISABLE"))
+		return -EEXIST;
+	if (of_property_read_u32(dev->of_node, "qcom,cold_bat_decidegc", &cold) ||
+	    of_property_read_u32(dev->of_node, "qcom,hot_bat_decidegc", &hot) ||
+	    cold > 400 || hot < 200 || hot > 600)
+		return -EINVAL;
+	legacy_guard.cold_decic = -(int)cold;
+	legacy_guard.hot_decic = hot;
+	legacy_guard.temp.ntc_fault = true;
+	legacy_guard.blocked = true;
+	INIT_DELAYED_WORK(&legacy_guard.work, legacy_guard_work);
+	legacy_guard.disable = create_votable("WIRED_CHARGING_DISABLE", VOTE_SET_ANY,
+		legacy_guard_disable_vote, NULL);
+	if (IS_ERR(legacy_guard.disable))
+		return PTR_ERR(legacy_guard.disable);
+	if (legacy_limits_init(dev)) {
+		destroy_votable(legacy_guard.disable);
+		legacy_guard.disable = NULL;
+		return -EINVAL;
+	}
+	legacy_guard.active = true;
+	vote(legacy_guard.disable, "LEGACY_NTC_FAULT", true, 1, false);
+	mod_delayed_work(system_freezable_wq, &legacy_guard.work, msecs_to_jiffies(1000));
+	chg_info("legacy guard enabled: cold=%d hot=%d hysteresis=20\n",
+		legacy_guard.cold_decic, legacy_guard.hot_decic);
+	return 0;
+}
+
+static void legacy_guard_stop(void)
+{
+	if (!legacy_guard.active)
+		return;
+	mutex_lock(&legacy_guard_lock);
+	legacy_guard.stopping = true;
+	mutex_unlock(&legacy_guard_lock);
+	cancel_delayed_work_sync(&legacy_guard.work);
+}
+
+static int legacy_limits_changed(struct votable *v, void *data, int value,
+				 const char *client, bool step)
+{
+	/* The voter lock must never nest with hardware/guard locks. */
+	if (READ_ONCE(legacy_guard.active) && !READ_ONCE(legacy_guard.stopping))
+		mod_delayed_work(system_freezable_wq, &legacy_guard.work, 0);
+	return 0;
+}
+
+static int legacy_limit_property(struct device_node *node, const char *name,
+				 int *value, int minimum, int maximum)
+{
+	u32 val;
+	int rc = of_property_read_u32(node, name, &val);
+
+	if (rc || val < minimum || val > maximum)
+		return -EINVAL;
+	*value = val;
+	return 0;
+}
+
+static int legacy_limits_init(struct device *dev)
+{
+	static const char * const names[] = { "WIRED_ICL", "WIRED_FCC", "WIRED_FV" };
+	static const char * const zones[] = {
+		"cold", "little_cold", "cool", "little_cool", "normal", "warm"
+	};
+	static const char * const boundaries[] = {
+		"qcom,cold_bat_decidegc", "qcom,little_cold_bat_decidegc",
+		"qcom,cool_bat_decidegc", "qcom,little_cool_bat_decidegc",
+		"qcom,normal_bat_decidegc", "qcom,warm_bat_decidegc"
+	};
+	struct mt6893_charge_limits *c = &legacy_limits.config;
+	struct device_node *node = dev->of_node;
+	char key[96];
+	int i, pd, high, low, rc, recharge, normal_inc, other_inc;
+
+	for (i = 0; i < LEGACY_LIMIT_COUNT; i++)
+		if (find_votable(names[i]))
+			return -EEXIST;
+	for (i = 0; i < MT6893_LIMIT_ZONES; i++) {
+		rc = legacy_limit_property(node, boundaries[i], &c->low[i], 0, 600);
+		if (rc)
+			return rc;
+		if (!i)
+			c->low[i] = -c->low[i];
+		if (i && c->low[i] <= c->low[i - 1])
+			return -EINVAL;
+		snprintf(key, sizeof(key), "qcom,temp_%s_vfloat_mv", zones[i]);
+		rc = legacy_limit_property(node, key, &c->fv[i], 3900, 4450);
+		if (rc)
+			return rc;
+		for (pd = 0; pd < 2; pd++) {
+			if (i == 1 || i == 2) {
+				snprintf(key, sizeof(key), "qcom,%stemp_%s_fastchg_current_ma_high",
+					 pd ? "pd_" : "", zones[i]);
+				rc = legacy_limit_property(node, key, &high, 100, 5000);
+				if (!rc) {
+					snprintf(key, sizeof(key), "qcom,%stemp_%s_fastchg_current_ma_low",
+						 pd ? "pd_" : "", zones[i]);
+					rc = legacy_limit_property(node, key, &low, 100, 5000);
+				}
+				if (rc)
+					return rc;
+				/* Until voltage tracking is ported, keep the stricter branch. */
+				c->fcc[pd][i] = min(high, low);
+			} else {
+				snprintf(key, sizeof(key), "qcom,%stemp_%s_fastchg_current_ma",
+					 pd && i ? "pd_" : "", zones[i]);
+				rc = legacy_limit_property(node, key, &c->fcc[pd][i], 100, 5000);
+				if (rc)
+					return rc;
+			}
+		}
+	}
+	if (legacy_limit_property(node, "qcom,input_current_usb_ma", &c->usb_icl, 100, 500) ||
+	    legacy_limit_property(node, "qcom,input_current_cdp_ma", &c->cdp_icl, 100, 1500) ||
+	    legacy_limit_property(node, "qcom,input_current_charger_ma", &c->dcp_icl, 100, 3250) ||
+	    legacy_limit_property(node, "qcom,pd_input_current_charger_ma", &c->pd_icl, 100, 3250))
+		return -EINVAL;
+	if (legacy_limit_property(node, "qcom,iterm_ma", &legacy_iterm_ma, 100, 850))
+		return -EINVAL;
+	legacy_iterm_request_ma = legacy_iterm_ma;
+	if (of_property_read_bool(node, "qcom,check_batt_full_by_sw")) {
+		if (legacy_limit_property(node, "qcom,recharge-mv", &recharge, 50, 400) ||
+		    legacy_limit_property(node, "qcom,normal_vterm_hw_inc", &normal_inc, 0, 100) ||
+		    legacy_limit_property(node, "qcom,non_normal_vterm_hw_inc", &other_inc, 0, 100))
+			return -EINVAL;
+		for (i = 0; i < MT6893_LIMIT_ZONES; i++) {
+			snprintf(key, sizeof(key), "qcom,%s_vfloat_sw_limit", zones[i]);
+			if (legacy_limit_property(node, key, &legacy_full.sw_mv[i], 3800, 4450) ||
+			    legacy_full.sw_mv[i] > c->fv[i])
+				return -EINVAL;
+			legacy_full.hw_inc_mv[i] = i == 4 ? normal_inc : other_inc;
+			legacy_full.recharge_drop_mv[i] = i == 0 ? 300 : i == 1 ? 200 : recharge;
+		}
+		legacy_full.active = true;
+	}
+	legacy_limits.zone = -1;
+	legacy_limits.apply_rc = -EAGAIN;
+	for (i = 0; i < LEGACY_LIMIT_COUNT; i++) {
+		legacy_limits.vote[i] = create_votable(names[i], VOTE_MIN,
+			legacy_limits_changed, NULL);
+		if (IS_ERR(legacy_limits.vote[i])) {
+			rc = PTR_ERR(legacy_limits.vote[i]);
+			while (i-- > 0)
+				destroy_votable(legacy_limits.vote[i]);
+			return rc;
+		}
+	}
+	legacy_limits.active = true;
+	return 0;
+}
+
+/* MT6360 quantizes down; read back the setting, never synthesize telemetry. */
+static int legacy_limits_program(struct charger_device *chg, int id, int value)
+{
+	u32 actual;
+	int rc, expected;
+
+	switch (id) {
+	case LEGACY_ICL:
+		expected = 100 + (value - 100) / 50 * 50;
+		rc = charger_dev_get_input_current(chg, &actual);
+		break;
+	case LEGACY_FCC:
+		expected = 100 + (value - 100) / 100 * 100;
+		rc = charger_dev_get_charging_current(chg, &actual);
+		break;
+	default:
+		expected = 3900 + (value - 3900) / 10 * 10;
+		rc = charger_dev_get_constant_voltage(chg, &actual);
+	}
+	/* A disabled MT6360 can expose its temporary 500mA ramp setting while
+	 * retaining the old ICHG to restore at enable. Refresh that cache too. */
+	if (rc < 0 || (actual == expected * 1000 &&
+		!(id == LEGACY_FCC && (legacy_guard.stopped_by_guard || legacy_guard.enable_pending))))
+		return rc;
+	switch (id) {
+	case LEGACY_ICL: rc = charger_dev_set_input_current(chg, value * 1000); break;
+	case LEGACY_FCC: rc = charger_dev_set_charging_current(chg, value * 1000); break;
+	default: rc = charger_dev_set_constant_voltage(chg, value * 1000);
+	}
+	if (rc < 0)
+		return rc;
+	switch (id) {
+	case LEGACY_ICL: rc = charger_dev_get_input_current(chg, &actual); break;
+	case LEGACY_FCC: rc = charger_dev_get_charging_current(chg, &actual); break;
+	default: rc = charger_dev_get_constant_voltage(chg, &actual);
+	}
+	return rc < 0 ? rc : actual == expected * 1000 ? 0 : -EIO;
+}
+
+static int legacy_limits_program_iterm(struct charger_device *chg)
+{
+	u32 actual;
+	int requested = min(legacy_iterm_ma, legacy_iterm_request_ma);
+	int expected = (100 + (requested - 100) / 50 * 50) * 1000;
+	int rc = charger_dev_get_eoc_current(chg, &actual);
+
+	if (rc < 0 || actual == expected)
+		return rc;
+	rc = charger_dev_set_eoc_current(chg, requested * 1000);
+	if (rc < 0)
+		return rc;
+	rc = charger_dev_get_eoc_current(chg, &actual);
+	return rc < 0 ? rc : actual == expected ? 0 : -EIO;
+}
+
+static int legacy_limits_refresh(void)
+{
+	struct power_supply *psy;
+	struct charger_device *chg;
+	union power_supply_propval type = {0};
+	u32 mivr;
+	int rc = 0, kind = 0, mv = 0, ma = 0, temp, i;
+	bool sink, healthy;
+
+	if (!legacy_limits.active)
+		return legacy_guard.required ? -EACCES : 0;
+	mutex_lock(&legacy_limits_lock);
+	mutex_lock(&legacy_guard_lock);
+	chg = legacy_guard_charger();
+	healthy = !legacy_guard.read_rc && !legacy_guard.temp.ntc_fault;
+	temp = legacy_guard.temp_decic;
+	mutex_unlock(&legacy_guard_lock);
+	sink = legacy_guard_is_sink();
+	if (!sink || !healthy)
+		goto out;
+	if (!chg) {
+		rc = -EAGAIN;
+		goto out;
+	}
+	psy = power_supply_get_by_name("primary_chg");
+	if (psy) {
+		if (!power_supply_get_property(psy, POWER_SUPPLY_PROP_USB_TYPE, &type)) {
+			switch (type.intval) {
+			case POWER_SUPPLY_USB_TYPE_SDP: kind = 1; break;
+			case POWER_SUPPLY_USB_TYPE_CDP: kind = 2; break;
+			case POWER_SUPPLY_USB_TYPE_DCP: kind = 3; break;
+			}
+		}
+		power_supply_put(psy);
+	}
+	if (tcpm_inquire_pd_contract(pinfo->tcpc, &mv, &ma) || mv < 4500 || ma <= 0) {
+		mv = 0;
+		ma = 0;
+	}
+	legacy_limits.usb_type = type.intval;
+	legacy_limits.contract_mv = mv;
+	legacy_limits.contract_ma = ma;
+	legacy_limits.zone = mt6893_limits_zone(&legacy_limits.config,
+		legacy_limits.zone, temp, ma > 0);
+	legacy_limits.cap[LEGACY_ICL] = mt6893_limits_source(&legacy_limits.config, kind, ma);
+	legacy_limits.cap[LEGACY_FCC] = legacy_limits.config.fcc[ma > 0][legacy_limits.zone];
+	legacy_limits.cap[LEGACY_FV] = legacy_limits.config.fv[legacy_limits.zone];
+	for (i = 0; i < LEGACY_LIMIT_COUNT; i++) {
+		rc = vote(legacy_limits.vote[i], "LEGACY_POLICY", true, legacy_limits.cap[i], false);
+		if (rc < 0)
+			goto out;
+		/* Root election overrides must not bypass the source/NTC ceiling. */
+		legacy_limits.target[i] = min(legacy_limits.cap[i], get_effective_result(legacy_limits.vote[i]));
+		if (legacy_limits.target[i] < (i == LEGACY_FV ? 3900 : 100)) {
+			rc = -ERANGE;
+			goto out;
+		}
+	}
+	mutex_lock(&legacy_guard_lock);
+	if (legacy_guard.stopping) {
+		rc = -ESHUTDOWN;
+	} else if (legacy_guard_is_sink() && !legacy_guard.temp.cold &&
+		   !legacy_guard.temp.hot && !legacy_guard.test_mask && !legacy_guard.temp.ntc_fault) {
+		/* Restrict input first, then voltage, then battery current. */
+		rc = legacy_limits_program(chg, LEGACY_ICL, legacy_limits.target[LEGACY_ICL]);
+		if (!rc) {
+			int required_mivr = mv > OPLUS_CHG_PULL_UP_VOLT_THR ?
+				AICL_POINT_VOL_9V * 1000 : SW_AICL_POINT_VOL_5V_PHASE1 * 1000;
+
+			rc = charger_dev_get_mivr(chg, &mivr);
+			if (!rc && mivr != required_mivr)
+				rc = charger_dev_set_mivr(chg, required_mivr);
+		}
+		if (!rc)
+			rc = legacy_limits_program(chg, LEGACY_FV, legacy_limits.target[LEGACY_FV]);
+		if (!rc)
+			rc = legacy_limits_program(chg, LEGACY_FCC, legacy_limits.target[LEGACY_FCC]);
+		if (!rc)
+			rc = legacy_limits_program_iterm(chg);
+	}
+	mutex_unlock(&legacy_guard_lock);
+out:
+	legacy_limits.apply_rc = rc;
+	mutex_unlock(&legacy_limits_lock);
+	/* Fail closed until all three hardware settings can be verified. */
+	vote(legacy_guard.disable, "LEGACY_LIMITS_FAULT", rc < 0, 1, false);
+	return rc;
+}
+
+static int legacy_limits_request(enum legacy_limit_id id, int value)
+{
+	int rc;
+
+	if (!legacy_limits.active)
+		return -EACCES;
+	if (value < (id == LEGACY_FV ? 3900 : 100) || value > (id == LEGACY_FV ? 4450 : 5000))
+		return -EINVAL;
+	rc = vote(legacy_limits.vote[id], "LEGACY_HAL", true, value, false);
+	if (rc < 0)
+		return rc;
+	return legacy_limits_refresh();
+}
+
+static void legacy_full_sample(void)
+{
+	struct mt6893_full_input in = {0};
+	struct power_supply *battery;
+	struct charger_device *chg;
+	union power_supply_propval voltage = {0}, charge_current = {0};
+	int vrc = -ENODEV, crc = -ENODEV, drc = -ENODEV, erc = -ENODEV;
+	int zone;
+
+	if (!legacy_full.active)
+		return;
+	in.now_ms = div_u64(ktime_get_boottime_ns(), NSEC_PER_MSEC);
+	mutex_lock(&legacy_limits_lock);
+	zone = legacy_limits.zone;
+	in.zone = zone;
+	if (zone >= 0 && zone < MT6893_LIMIT_ZONES) {
+		in.sw_mv = legacy_full.sw_mv[zone];
+		in.hw_mv = legacy_limits.config.fv[zone] + legacy_full.hw_inc_mv[zone];
+		in.recharge_mv = legacy_limits.config.fv[zone] - legacy_full.recharge_drop_mv[zone];
+		in.iterm_ua = min(legacy_iterm_ma, legacy_iterm_request_ma) * 1000;
+	}
+	mutex_lock(&legacy_guard_lock);
+	chg = legacy_guard_charger();
+	in.attached = legacy_guard_is_sink();
+	in.allowed = !legacy_guard_denied() && zone >= 0 && zone < MT6893_LIMIT_ZONES &&
+		legacy_limits.target[LEGACY_FV] == legacy_limits.cap[LEGACY_FV] &&
+		!legacy_limits.test[0] && !legacy_limits.test[1] && !legacy_limits.test[2];
+	if (chg) {
+		drc = charger_dev_is_charging_done(chg, &in.hw_done);
+		erc = charger_dev_is_enabled(chg, &in.enabled);
+	}
+	mutex_unlock(&legacy_guard_lock);
+	mutex_unlock(&legacy_limits_lock);
+	battery = power_supply_get_by_name("battery");
+	if (battery) {
+		vrc = power_supply_get_property(battery, POWER_SUPPLY_PROP_VOLTAGE_NOW, &voltage);
+		crc = power_supply_get_property(battery, POWER_SUPPLY_PROP_CURRENT_NOW, &charge_current);
+		power_supply_put(battery);
+	}
+	in.vbat_mv = voltage.intval / 1000;
+	in.current_ua = charge_current.intval;
+	in.valid = !vrc && !crc && !drc && !erc &&
+		in.vbat_mv >= 2500 && in.vbat_mv <= 5000;
+	mutex_lock(&legacy_full_lock);
+	legacy_full.input = in;
+	legacy_full.voltage_rc = vrc;
+	legacy_full.current_rc = crc;
+	legacy_full.done_rc = drc;
+	legacy_full.enabled_rc = erc;
+	mt6893_full_observe(&legacy_full.state, &in);
+	mutex_unlock(&legacy_full_lock);
+}
+
 
 static int oplus_get_chargeric_temp(void);
 static int oplus_get_subboard_temp(void);
@@ -1914,6 +2557,8 @@ static ssize_t charger_ic_ntc_show(struct device *dev,
 {
 	int temp = 0;
 
+	if (legacy_charger_ntc && !pinfo->chargeric_temp_chan)
+		return -ENODATA;
 	temp = oplus_get_chargeric_temp();
 	return sprintf(buf, "%d\n", temp);
 }
@@ -1925,11 +2570,208 @@ static ssize_t charger_subboard_ntc_show(struct device *dev,
 {
 	int temp = 0;
 
+	if (legacy_charger_ntc) {
+		int mv, rc;
+
+		rc = legacy_subboard_read(&mv, &temp);
+		if (rc < 0)
+			return rc;
+		return sysfs_emit(buf, "%d\n", temp / 10);
+	}
 	temp = oplus_get_subboard_temp();
 	return sprintf(buf, "%d\n", temp);
 }
 
 static DEVICE_ATTR_RO(charger_subboard_ntc);
+
+static ssize_t legacy_ntc_status_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	int mv = 0, temp = 0, l = 0, r = 0;
+	int board_rc, l_rc, r_rc;
+
+	board_rc = legacy_subboard_read(&mv, &temp);
+	l_rc = legacy_ntc_voltage(pinfo->usb_temp_v_l_chan, &l);
+	r_rc = legacy_ntc_voltage(pinfo->usb_temp_v_r_chan, &r);
+	return sysfs_emit(buf,
+		"subboard rc=%d mv=%d temp_decic=%d pull_up_ohm=%u\n"
+		"usb_l rc=%d mv=%d\nusb_r rc=%d mv=%d\n",
+		board_rc, mv, temp, legacy_subboard_pull_up_r, l_rc, l, r_rc, r);
+}
+static DEVICE_ATTR_RO(legacy_ntc_status);
+
+static struct attribute *legacy_ntc_attrs[] = {
+	&dev_attr_legacy_ntc_status.attr,
+	NULL,
+};
+static const struct attribute_group legacy_ntc_group = {
+	.attrs = legacy_ntc_attrs,
+};
+
+static ssize_t legacy_charge_guard_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct charger_device *chg;
+	bool enabled = false;
+	int hw_rc;
+	ssize_t len;
+
+	mutex_lock(&legacy_guard_lock);
+	chg = legacy_guard_charger();
+	hw_rc = chg ? charger_dev_is_enabled(chg, &enabled) : -ENODEV;
+	len = sysfs_emit(buf,
+		"active=%d blocked=%d cold=%d hot=%d ntc_fault=%d good_reads=%u test_mask=%u\n"
+		"adc_rc=%d read_rc=%d mv=%d temp_decic=%d cold_decic=%d hot_decic=%d\n"
+		"hw_rc=%d hw_enabled=%d apply_rc=%d stopped_by_guard=%d\n",
+		legacy_guard.active, legacy_guard.blocked, legacy_guard.temp.cold,
+		legacy_guard.temp.hot, legacy_guard.temp.ntc_fault, legacy_guard.temp.good_reads,
+		legacy_guard.test_mask, legacy_guard.adc_rc, legacy_guard.read_rc,
+		legacy_guard.voltage_mv, legacy_guard.temp_decic, legacy_guard.cold_decic,
+		legacy_guard.hot_decic, hw_rc, enabled, legacy_guard.apply_rc,
+		legacy_guard.stopped_by_guard);
+	mutex_unlock(&legacy_guard_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(legacy_charge_guard);
+
+static ssize_t legacy_guard_test_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n", READ_ONCE(legacy_guard.test_mask));
+}
+
+static ssize_t legacy_guard_test_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	unsigned int mask;
+	int rc;
+
+	rc = kstrtouint(buf, 0, &mask);
+	if (rc || mask > 7)
+		return -EINVAL;
+	mutex_lock(&legacy_guard_lock);
+	if (!legacy_guard.active || legacy_guard.stopping) {
+		mutex_unlock(&legacy_guard_lock);
+		return -ENODEV;
+	}
+	legacy_guard.test_mask = mask;
+	mutex_unlock(&legacy_guard_lock);
+	legacy_guard_sample();
+	mod_delayed_work(system_freezable_wq, &legacy_guard.work, 0);
+	return count;
+}
+static DEVICE_ATTR(legacy_guard_test, 0600, legacy_guard_test_show, legacy_guard_test_store);
+
+static ssize_t legacy_charge_limits_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct charger_device *chg;
+	u32 icl = 0, fcc = 0, fv = 0, ieoc = 0, mivr = 0;
+	int icl_rc, fcc_rc, fv_rc, ieoc_rc, mivr_rc;
+	ssize_t len;
+
+	mutex_lock(&legacy_limits_lock);
+	mutex_lock(&legacy_guard_lock);
+	chg = legacy_guard_charger();
+	icl_rc = chg ? charger_dev_get_input_current(chg, &icl) : -ENODEV;
+	fcc_rc = chg ? charger_dev_get_charging_current(chg, &fcc) : -ENODEV;
+	fv_rc = chg ? charger_dev_get_constant_voltage(chg, &fv) : -ENODEV;
+	ieoc_rc = chg ? charger_dev_get_eoc_current(chg, &ieoc) : -ENODEV;
+	mivr_rc = chg ? charger_dev_get_mivr(chg, &mivr) : -ENODEV;
+	mutex_unlock(&legacy_guard_lock);
+	len = sysfs_emit(buf,
+		"active=%d zone=%d usb_type=%d contract_mv=%d contract_ma=%d apply_rc=%d\n"
+		"cap_icl_ma=%d cap_fcc_ma=%d cap_fv_mv=%d target_icl_ma=%d target_fcc_ma=%d target_fv_mv=%d\n"
+		"icl_rc=%d icl_ua=%u fcc_rc=%d fcc_ua=%u fv_rc=%d fv_uv=%u ieoc_rc=%d ieoc_ua=%u mivr_rc=%d mivr_uv=%u\n",
+		legacy_limits.active, legacy_limits.zone, legacy_limits.usb_type,
+		legacy_limits.contract_mv, legacy_limits.contract_ma, legacy_limits.apply_rc,
+		legacy_limits.cap[0], legacy_limits.cap[1], legacy_limits.cap[2],
+		legacy_limits.target[0], legacy_limits.target[1], legacy_limits.target[2],
+		icl_rc, icl, fcc_rc, fcc, fv_rc, fv, ieoc_rc, ieoc, mivr_rc, mivr);
+	mutex_unlock(&legacy_limits_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(legacy_charge_limits);
+
+/* Add reductions only; zero withdraws this diagnostic client's vote. */
+static ssize_t legacy_limit_test_show(struct device *dev,
+				     struct device_attribute *attr, char *buf)
+{
+	ssize_t len;
+
+	mutex_lock(&legacy_limits_lock);
+	len = sysfs_emit(buf, "%d %d %d\n", legacy_limits.test[0],
+		legacy_limits.test[1], legacy_limits.test[2]);
+	mutex_unlock(&legacy_limits_lock);
+	return len;
+}
+
+static ssize_t legacy_limit_test_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	int value[LEGACY_LIMIT_COUNT], i, rc;
+	char extra;
+
+	if (sscanf(buf, "%d %d %d %c", &value[0], &value[1], &value[2], &extra) != 3)
+		return -EINVAL;
+	for (i = 0; i < LEGACY_LIMIT_COUNT; i++)
+		if (value[i] && (value[i] < (i == LEGACY_FV ? 3900 : 100) ||
+				value[i] > (i == LEGACY_FV ? 4450 : 5000)))
+			return -EINVAL;
+	mutex_lock(&legacy_limits_lock);
+	if (!legacy_limits.active || READ_ONCE(legacy_guard.stopping)) {
+		mutex_unlock(&legacy_limits_lock);
+		return -ENODEV;
+	}
+	for (i = 0; i < LEGACY_LIMIT_COUNT; i++) {
+		rc = vote(legacy_limits.vote[i], "LEGACY_TEST", value[i] > 0, value[i], false);
+		if (rc < 0) {
+			mutex_unlock(&legacy_limits_lock);
+			return rc;
+		}
+		legacy_limits.test[i] = value[i];
+	}
+	mutex_unlock(&legacy_limits_lock);
+	rc = legacy_limits_refresh();
+	return rc < 0 ? rc : count;
+}
+static DEVICE_ATTR(legacy_limit_test, 0600, legacy_limit_test_show, legacy_limit_test_store);
+
+static ssize_t legacy_full_monitor_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct mt6893_full_observer *s = &legacy_full.state;
+	struct mt6893_full_input *in = &legacy_full.input;
+	ssize_t len;
+
+	mutex_lock(&legacy_full_lock);
+	len = sysfs_emit(buf,
+		"active=%d observe_only=1 full_observed=%d reason=%d full_events=%u recharge_events=%u samples=%u\n"
+		"attached=%d valid=%d allowed=%d enabled=%d hw_done=%d zone=%d vbat_mv=%d current_ua=%d\n"
+		"voltage_rc=%d current_rc=%d done_rc=%d enabled_rc=%d sw_mv=%d hw_mv=%d recharge_mv=%d iterm_ua=%d\n"
+		"sw_count=%u hw_count=%u done_count=%u recharge_count=%u sample_ms=%llu input_ms=%llu\n",
+		legacy_full.active, s->full, s->reason, s->full_events, s->recharge_events, s->samples,
+		in->attached, in->valid, in->allowed, in->enabled, in->hw_done, in->zone,
+		in->vbat_mv, in->current_ua, legacy_full.voltage_rc, legacy_full.current_rc,
+		legacy_full.done_rc, legacy_full.enabled_rc, in->sw_mv, in->hw_mv,
+		in->recharge_mv, in->iterm_ua, s->sw_count, s->hw_count,
+		s->done_count, s->recharge_count, s->last_ms, in->now_ms);
+	mutex_unlock(&legacy_full_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(legacy_full_monitor);
+
+static struct attribute *legacy_guard_attrs[] = {
+	&dev_attr_legacy_charge_guard.attr,
+	&dev_attr_legacy_guard_test.attr,
+	&dev_attr_legacy_charge_limits.attr,
+	&dev_attr_legacy_limit_test.attr,
+	&dev_attr_legacy_full_monitor.attr,
+	NULL,
+};
+static const struct attribute_group legacy_guard_group = { .attrs = legacy_guard_attrs };
 
 static ssize_t charger_log_level_show(struct device *dev,
 				      struct device_attribute *attr, char *buf)
@@ -2031,6 +2873,13 @@ static ssize_t mtk_chg_set_cv_write(struct file *file,
 	desc[len] = '\0';
 
 	ret = kstrtou32(desc, 10, &cv);
+	if (!ret && legacy_guard.required) {
+		ret = legacy_limits_request(LEGACY_FV, cv / 1000);
+		if (ret)
+			return ret;
+		info->data.battery_cv = cv;
+		return count;
+	}
 	if (ret == 0) {
 		if (cv >= BATTERY_CV) {
 			info->data.battery_cv = BATTERY_CV;
@@ -2100,12 +2949,22 @@ static ssize_t mtk_chg_current_cmd_write(struct file *file,
 		info->usb_unlimited = current_unlimited;
 		if (cmd_discharging == 1) {
 			info->cmd_discharging = true;
-			charger_dev_enable(info->chg1_dev, false);
+			if (legacy_guard.active)
+				vote(legacy_guard.disable, "LEGACY_USER", true, 1, false);
+			else
+				charger_dev_enable(info->chg1_dev, false);
 			charger_dev_do_event(info->chg1_dev,
 					EVENT_DISCHARGE, 0);
 		} else if (cmd_discharging == 0) {
+			int rc;
+
 			info->cmd_discharging = false;
-			charger_dev_enable(info->chg1_dev, true);
+
+			if (legacy_guard.active)
+				vote(legacy_guard.disable, "LEGACY_USER", false, 0, false);
+			rc = legacy_guard_enable(info->chg1_dev);
+			if (rc < 0)
+				return rc;
 			charger_dev_do_event(info->chg1_dev,
 					EVENT_RECHARGE, 0);
 		}
@@ -3977,7 +4836,8 @@ static int psy_charger_get_property(struct power_supply *psy,
 		 * regmap, so ask it. */
 		val->intval = mt6360_chg_is_charging() ?
 			POWER_SUPPLY_STATUS_CHARGING :
-			POWER_SUPPLY_STATUS_DISCHARGING;
+			(legacy_guard.active && READ_ONCE(legacy_guard.blocked) ?
+			 POWER_SUPPLY_STATUS_NOT_CHARGING : POWER_SUPPLY_STATUS_DISCHARGING);
 		break;
 	case POWER_SUPPLY_PROP_TYPE:
 		/* op6893 6.6: the health HAL's BatteryMonitor maps the psy
@@ -4504,13 +5364,17 @@ static void oplus_pd_9v_try_work(struct work_struct *work)
 	ret = charger_dev_set_mivr(chg, AICL_POINT_VOL_9V * 1000);
 	if (ret < 0)
 		chg_err("pd_9v_try: set mivr 9V fail ret=%d\n", ret);
-	ret = charger_dev_set_input_current(chg, IBUS_2A * 1000);
-	if (ret < 0)
-		chg_err("pd_9v_try: set aicr 2A fail ret=%d\n", ret);
+	/* Legacy source/temperature elections own current, including PD limits. */
+	ret = legacy_guard.required ? legacy_limits_refresh() :
+		charger_dev_set_input_current(chg, IBUS_2A * 1000);
+	if (ret < 0) {
+		chg_err("pd_9v_try: current policy fail ret=%d\n", ret);
+		return;
+	}
 	ret = charger_dev_plug_in(chg);
 	if (ret < 0)
 		chg_err("pd_9v_try: plug_in fail ret=%d\n", ret);
-	ret = charger_dev_enable(chg, true);
+	ret = legacy_guard_enable(chg);
 	if (ret < 0)
 		chg_err("pd_9v_try: enable fail ret=%d\n", ret);
 
@@ -4717,6 +5581,8 @@ static int pd_tcp_notifier_call(struct notifier_block *pnb,
 	default:
 		break;
 	}
+	if (legacy_guard.active && !READ_ONCE(legacy_guard.stopping))
+		mod_delayed_work(system_freezable_wq, &legacy_guard.work, 0);
 	return ret;
 }
 
@@ -4883,7 +5749,9 @@ static int oplus_mt6379_enable_charging(struct mtk_charger *info)
 {
 	int rc = 0;
 
-	rc = charger_dev_enable(info->chg1_dev, true);
+	if (legacy_guard.active)
+		vote(legacy_guard.disable, "LEGACY_HAL", false, 0, false);
+	rc = legacy_guard_enable(info->chg1_dev);
 	if (rc < 0)
 		chg_info("enable charging fail\n");
 
@@ -4894,7 +5762,10 @@ static int oplus_mt6379_disable_charging(struct mtk_charger *info)
 {
 	int rc = 0;
 
-	rc = charger_dev_enable(info->chg1_dev, false);
+	if (legacy_guard.active)
+		rc = vote(legacy_guard.disable, "LEGACY_HAL", true, 1, false);
+	else
+		rc = charger_dev_enable(info->chg1_dev, false);
 	if (rc < 0)
 		chg_info("enable charging fail\n");
 
@@ -4983,6 +5854,9 @@ static int oplus_mt6379_input_current_limit_write_without_aicl(struct mtk_charge
 	struct charger_device *chg = NULL;
 	int rc = 0;
 
+	if (legacy_guard.required)
+		return legacy_limits_request(LEGACY_ICL, value);
+
 	if (!info || !info->chg1_dev) {
 		chg_debug("info or chg1_dev is NULL, return!\n");
 		return rc;
@@ -5007,6 +5881,9 @@ static int oplus_mt6379_input_current_limit_write(struct mtk_charger *info, int 
 	int batt_volt;
 	union mms_msg_data data = {0};
 	int max_pdo_current;
+
+	if (legacy_guard.required)
+		return legacy_limits_request(LEGACY_ICL, value);
 
 	for (i = ARRAY_SIZE(usb_icl) - 1; i >= 0; i--) {
 		if (usb_icl[i] <= value)
@@ -5176,6 +6053,9 @@ static int oplus_mt6379_charging_current_write_fast(struct mtk_charger *info, in
 	int rc = 0;
 	u32 ret_chg_curr = 0;
 
+	if (legacy_guard.required)
+		return legacy_limits_request(LEGACY_FCC, chg_curr);
+
 	rc = charger_dev_set_charging_current(info->chg1_dev, chg_curr * 1000);
 	if (rc < 0) {
 		chg_info("set fast charge current:%d fail\n", chg_curr);
@@ -5190,6 +6070,9 @@ static int oplus_mt6379_charging_current_write_fast(struct mtk_charger *info, in
 static int oplus_mt6379_float_voltage_write(struct mtk_charger *info, int vfloat_mv)
 {
 	int rc = 0;
+
+	if (legacy_guard.required)
+		return legacy_limits_request(LEGACY_FV, vfloat_mv);
 
 	rc = charger_dev_set_constant_voltage(info->chg1_dev, vfloat_mv * 1000);
 	if (rc < 0)
@@ -5222,6 +6105,17 @@ static int oplus_mt6379_float_voltage_read(struct mtk_charger *info)
 static int oplus_mt6379_set_termchg_current(struct mtk_charger *info, int term_curr)
 {
 	int rc = 0;
+
+	if (legacy_guard.required) {
+		if (!legacy_limits.active)
+			return -EACCES;
+		if (term_curr < 100 || term_curr > 850)
+			return -EINVAL;
+		mutex_lock(&legacy_limits_lock);
+		legacy_iterm_request_ma = term_curr;
+		mutex_unlock(&legacy_limits_lock);
+		return legacy_limits_refresh();
+	}
 
 	rc = charger_dev_set_eoc_current(info->chg1_dev, term_curr * 1000);
 	if (rc < 0)
@@ -5383,6 +6277,19 @@ static int mtk_chg_set_icl(struct oplus_chg_ic_dev *ic_dev, bool vooc_mode,
 
 static int mtk_chg_get_icl(struct oplus_chg_ic_dev *ic_dev, int *icl_ma)
 {
+	struct charger_device *chg;
+	u32 value;
+	int rc;
+
+	if (legacy_guard.required) {
+		chg = legacy_guard_charger();
+		if (!chg)
+			return -ENODEV;
+		rc = charger_dev_get_input_current(chg, &value);
+		if (!rc)
+			*icl_ma = value / 1000;
+		return rc;
+	}
 	/* TODO */
 	return 0;
 }
@@ -6372,6 +7279,28 @@ static int mtk_chg_get_usbtemp_dischg_status(struct oplus_chg_ic_dev *ic_dev, bo
 }
 
 static int oplus_chg_get_usb_btb_temp_cal(void);
+static int mtk_chg_get_usb_temp_volt(struct oplus_chg_ic_dev *ic_dev,
+				     int *vol_l, int *vol_r)
+{
+	struct mtk_charger *chip;
+	int l, r, rc;
+
+	if (!ic_dev || !vol_l || !vol_r)
+		return -EINVAL;
+	chip = oplus_chg_ic_get_drvdata(ic_dev);
+	if (!chip)
+		return -ENODEV;
+	rc = legacy_ntc_voltage(chip->usb_temp_v_l_chan, &l);
+	if (rc < 0)
+		return rc;
+	rc = legacy_ntc_voltage(chip->usb_temp_v_r_chan, &r);
+	if (rc < 0)
+		return rc;
+	*vol_l = l;
+	*vol_r = r;
+	return 0;
+}
+
 static int mtk_chg_get_usb_btb_temp(struct oplus_chg_ic_dev *ic_dev, int *usb_btb_temp)
 {
 	if (ic_dev == NULL) {
@@ -6379,6 +7308,8 @@ static int mtk_chg_get_usb_btb_temp(struct oplus_chg_ic_dev *ic_dev, int *usb_bt
 		return -ENODEV;
 	}
 
+	if (legacy_charger_ntc)
+		return -ENOTSUPP;
 	*usb_btb_temp = oplus_chg_get_usb_btb_temp_cal();
 
 	return 0;
@@ -6394,6 +7325,8 @@ static int mtk_chg_get_batt_btb_temp(struct oplus_chg_ic_dev *ic_dev, int *batt_
 		chg_err("oplus_chg_ic_dev is NULL");
 		return -ENODEV;
 	}
+	if (legacy_charger_ntc)
+		return -ENOTSUPP;
 	batt_temp = oplus_chg_get_battery_btb_temp_cal() / 10;
 
 	if (pinfo->sub_batt_btb_temp_chan) {
@@ -6413,6 +7346,12 @@ static int oplus_chg_get_subboard_temp(struct oplus_chg_ic_dev *ic_dev, int *tem
 		return -ENODEV;
 	}
 
+	if (legacy_charger_ntc) {
+		int mv;
+
+		/* The gauge IC API uses tenths of a degree. */
+		return legacy_subboard_read(&mv, temp);
+	}
 	*temp = oplus_get_subboard_temp();
 	return 0;
 }
@@ -6487,7 +7426,8 @@ static int oplus_chg_set_wls_icl(struct oplus_chg_ic_dev *ic_dev, int icl_ma)
 		return -ENODEV;
 	}
 
-	rc = charger_dev_set_input_current(info->chg1_dev, icl_ma * 1000);
+	rc = legacy_guard.required ? legacy_limits_request(LEGACY_ICL, icl_ma) :
+		charger_dev_set_input_current(info->chg1_dev, icl_ma * 1000);
 	if (rc < 0)
 		chg_err("set input current fail, rc=%d\n", rc);
 
@@ -6741,6 +7681,11 @@ static void *oplus_chg_get_func(struct oplus_chg_ic_dev *ic_dev,
 	case OPLUS_IC_FUNC_IS_OPLUS_SVID:
 		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_IS_OPLUS_SVID,
 					       mtk_chg_is_oplus_svid);
+		break;
+	case OPLUS_IC_FUNC_GET_USB_TEMP_VOLT:
+		if (legacy_charger_ntc)
+			func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GET_USB_TEMP_VOLT,
+						       mtk_chg_get_usb_temp_volt);
 		break;
 	case OPLUS_IC_FUNC_BUCK_GET_USB_BTB_TEMP:
 		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_BUCK_GET_USB_BTB_TEMP,
@@ -7156,6 +8101,15 @@ static int oplus_get_subboard_temp(void)
 	static bool is_param_init = false;
 	static struct ntc_temp ntc_param = {0};
 
+	if (legacy_charger_ntc) {
+		int mv, rc;
+
+		rc = legacy_subboard_read(&mv, &temp);
+		if (rc < 0)
+			return rc;
+		return pinfo->support_ntc_01c_precision ? temp : temp / 10;
+	}
+
 	if (!pinfo) {
 		chg_err("null pinfo\n");
 		return TEMP_25C;
@@ -7320,6 +8274,8 @@ static int oplus_get_chargeric_temp(void)
 
 int oplus_mt6379_get_tchg(int *tchg_min,	int *tchg_max)
 {
+	if (legacy_charger_ntc && pinfo && !pinfo->chargeric_temp_chan)
+		return -ENODATA;
 	if (pinfo != NULL) {
 		oplus_get_chargeric_temp();
 		*tchg_min = pinfo->chargeric_temp;
@@ -8037,6 +8993,9 @@ static int mtk_charger_probe(struct platform_device *pdev)
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	pinfo = info;
+	legacy_charger_ntc = of_machine_is_compatible("mediatek,MT6893") &&
+		of_property_match_string(pdev->dev.of_node, "io-channel-names",
+					 "auxadc3-bat_id_temp") >= 0;
 
 	info->chg1_dev = get_charger_by_name("primary_chg");
 	if (info->chg1_dev) {
@@ -8085,6 +9044,11 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	info->psy_desc1.external_power_changed =
 		mtk_charger_external_power_changed;
 	info->psy_cfg1.drv_data = info;
+	if (legacy_charger_ntc) {
+		/* Old DT lacks the supplier link needed for battery status refresh. */
+		info->psy_cfg1.supplied_to = legacy_charger_supplied_to;
+		info->psy_cfg1.num_supplicants = ARRAY_SIZE(legacy_charger_supplied_to);
+	}
 	info->psy1 = power_supply_register(&pdev->dev, &info->psy_desc1,
 			&info->psy_cfg1);
 
@@ -8197,46 +9161,74 @@ static int mtk_charger_probe(struct platform_device *pdev)
 		}
 	}
 
-	pinfo->batt_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc5_batt_btb_temp");
-	if (IS_ERR(pinfo->batt_btb_temp_chan)) {
-		chg_err("Couldn't get batt_btb_temp_chan...\n");
-		pinfo->batt_btb_temp_chan = NULL;
-	}
+	if (legacy_charger_ntc) {
+		pinfo->subboard_temp_chan = devm_iio_channel_get(&pdev->dev,
+			"auxadc3-bat_id_temp");
+		if (IS_ERR(pinfo->subboard_temp_chan)) {
+			dev_warn(&pdev->dev, "legacy board NTC unavailable: %ld\n",
+				 PTR_ERR(pinfo->subboard_temp_chan));
+			pinfo->subboard_temp_chan = NULL;
+		}
+		pinfo->usb_temp_v_l_chan = devm_iio_channel_get(&pdev->dev,
+			"auxadc4-usb_temp_v_l");
+		if (IS_ERR(pinfo->usb_temp_v_l_chan))
+			pinfo->usb_temp_v_l_chan = NULL;
+		pinfo->usb_temp_v_r_chan = devm_iio_channel_get(&pdev->dev,
+			"auxadc5-usb_temp_v_r");
+		if (IS_ERR(pinfo->usb_temp_v_r_chan))
+			pinfo->usb_temp_v_r_chan = NULL;
+		if (of_property_read_bool(pdev->dev.of_node,
+			"qcom,sub_board_pull_up_r_support"))
+			of_property_read_u32(pdev->dev.of_node,
+				"qcom,sub_board_pull_up_r", &legacy_subboard_pull_up_r);
+		rc = devm_device_add_group(&pdev->dev, &legacy_ntc_group);
+		if (rc)
+			dev_warn(&pdev->dev, "legacy NTC diagnostics failed: %d\n", rc);
+		chg_info("legacy NTC: board=%d usb_l=%d usb_r=%d pull_up=%u\n",
+			 !!pinfo->subboard_temp_chan, !!pinfo->usb_temp_v_l_chan,
+			 !!pinfo->usb_temp_v_r_chan, legacy_subboard_pull_up_r);
+	} else {
+		pinfo->batt_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc5_batt_btb_temp");
+		if (IS_ERR(pinfo->batt_btb_temp_chan)) {
+			chg_err("Couldn't get batt_btb_temp_chan...\n");
+			pinfo->batt_btb_temp_chan = NULL;
+		}
 
-	pinfo->sub_batt_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "sub_bat_btb_temp");
-	if (IS_ERR(pinfo->sub_batt_btb_temp_chan)) {
-		chg_err("Couldn't get sub_batt_btb_temp_chan...\n");
-		pinfo->sub_batt_btb_temp_chan = NULL;
-	}
+		pinfo->sub_batt_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "sub_bat_btb_temp");
+		if (IS_ERR(pinfo->sub_batt_btb_temp_chan)) {
+			chg_err("Couldn't get sub_batt_btb_temp_chan...\n");
+			pinfo->sub_batt_btb_temp_chan = NULL;
+		}
 
-	pinfo->usb_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc6_usb_btb_temp");
-	if (IS_ERR(pinfo->usb_btb_temp_chan)) {
-		chg_err("Couldn't get usb_btb_temp_chan...\n");
-		pinfo->usb_btb_temp_chan = NULL;
-	}
+		pinfo->usb_btb_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc6_usb_btb_temp");
+		if (IS_ERR(pinfo->usb_btb_temp_chan)) {
+			chg_err("Couldn't get usb_btb_temp_chan...\n");
+			pinfo->usb_btb_temp_chan = NULL;
+		}
 
-	pinfo->subboard_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc1-ntc_sub_bat_tem");
-	if (IS_ERR(pinfo->subboard_temp_chan)) {
-		chg_err("Couldn't get subboard_temp_chan...\n");
-		pinfo->subboard_temp_chan = NULL;
-	}
+		pinfo->subboard_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc1-ntc_sub_bat_tem");
+		if (IS_ERR(pinfo->subboard_temp_chan)) {
+			chg_err("Couldn't get subboard_temp_chan...\n");
+			pinfo->subboard_temp_chan = NULL;
+		}
 
-	pinfo->chargeric_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc5-chargeric_temp");
-	if (IS_ERR(pinfo->chargeric_temp_chan)) {
-		chg_err("Couldn't get chargeric_temp_chan...\n");
-		pinfo->chargeric_temp_chan = NULL;
-	}
+		pinfo->chargeric_temp_chan = devm_iio_channel_get(&pdev->dev, "auxadc5-chargeric_temp");
+		if (IS_ERR(pinfo->chargeric_temp_chan)) {
+			chg_err("Couldn't get chargeric_temp_chan...\n");
+			pinfo->chargeric_temp_chan = NULL;
+		}
 
-	pinfo->master_cp_chan = devm_iio_channel_get(&pdev->dev, "master_cp_temp");
-	if (IS_ERR(pinfo->master_cp_chan)) {
-		chg_err("Couldn't get master_cp_chan...\n");
-		pinfo->master_cp_chan = NULL;
-	}
+		pinfo->master_cp_chan = devm_iio_channel_get(&pdev->dev, "master_cp_temp");
+		if (IS_ERR(pinfo->master_cp_chan)) {
+			chg_err("Couldn't get master_cp_chan...\n");
+			pinfo->master_cp_chan = NULL;
+		}
 
-	pinfo->slave_cp_chan = devm_iio_channel_get(&pdev->dev, "slave_cp_temp");
-	if (IS_ERR(pinfo->slave_cp_chan)) {
-		chg_err("Couldn't get slave_cp_chan...\n");
-		pinfo->slave_cp_chan = NULL;
+		pinfo->slave_cp_chan = devm_iio_channel_get(&pdev->dev, "slave_cp_temp");
+		if (IS_ERR(pinfo->slave_cp_chan)) {
+			chg_err("Couldn't get slave_cp_chan...\n");
+			pinfo->slave_cp_chan = NULL;
+		}
 	}
 
 	pinfo->hvdcp_disable = false;
@@ -8254,11 +9246,25 @@ static int mtk_charger_probe(struct platform_device *pdev)
 	if (oplus_mtk_ic_register(&pdev->dev, pinfo) != 0)
 		goto reg_ic_err;
 
+	rc = legacy_guard_init(&pdev->dev);
+	if (rc) {
+		struct charger_device *chg = legacy_guard_charger();
+
+		if (chg)
+			charger_dev_enable(chg, false);
+		chg_err("legacy guard init failed: %d\n", rc);
+	} else if (legacy_guard.active) {
+		rc = devm_device_add_group(&pdev->dev, &legacy_guard_group);
+		if (rc)
+			chg_err("legacy guard diagnostics failed: %d\n", rc);
+	}
 	init_pps_key();
 #ifdef CONFIG_THERMAL
-	rc = register_tz_thermal(pinfo);
-	if (rc)
-		chg_err("register thermal fail");
+	if (!legacy_charger_ntc) {
+		rc = register_tz_thermal(pinfo);
+		if (rc)
+			chg_err("register thermal fail");
+	}
 #endif
 	oplus_mt6379_set_chging_term_disable(info);
 	oplus_mms_wait_topic("wireless", oplus_mt6379_subscribe_wls_topic, info);
@@ -8278,6 +9284,8 @@ static void mtk_charger_shutdown(struct platform_device *dev)
 {
 	struct mtk_charger *info = platform_get_drvdata(dev);
 	int i;
+
+	legacy_guard_stop();
 
 	for (i = 0; i < MAX_ALG_NO; i++) {
 		if (info->alg[i] == NULL)

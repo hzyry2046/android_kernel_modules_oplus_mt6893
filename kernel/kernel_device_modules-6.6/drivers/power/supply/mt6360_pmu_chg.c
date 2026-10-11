@@ -878,7 +878,7 @@ static inline int mt6360_get_ieoc(struct mt6360_chg_info *mci, u32 *uA)
 				     regval, &value);
 	if (!ret)
 		*uA = value;
-	return 0;
+	return ret;
 }
 
 static inline int mt6360_get_charging_status(
@@ -1912,6 +1912,11 @@ static int mt6360_set_ieoc(struct charger_device *chg_dev, u32 uA)
 				  data << MT6360_IEOC_SHFT);
 }
 
+static int mt6360_get_eoc_current(struct charger_device *chg_dev, u32 *uA)
+{
+	return mt6360_get_ieoc(charger_get_data(chg_dev), uA);
+}
+
 static int mt6360_set_mivr(struct charger_device *chg_dev, u32 uV)
 {
 	struct mt6360_chg_info *mci = charger_get_data(chg_dev);
@@ -2744,6 +2749,7 @@ static const struct charger_ops mt6360_chg_ops = {
 	.get_min_input_current = mt6360_get_min_aicr,
 	/* set termination current */
 	.set_eoc_current = mt6360_set_ieoc,
+	.get_eoc_current = mt6360_get_eoc_current,
 	/* charging mivr */
 	.set_mivr = mt6360_set_mivr,
 	.get_mivr = mt6360_get_mivr,
@@ -3829,6 +3835,34 @@ static ssize_t shipping_mode_store(struct device *dev,
 }
 static const DEVICE_ATTR_WO(shipping_mode);
 
+/* Read ordinary control/status registers only; no IRQ acknowledge or writes. */
+static ssize_t charging_state_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct mt6360_chg_info *mci = dev_get_drvdata(dev);
+	enum mt6360_charging_status status = 0;
+	unsigned int ctrl2 = 0;
+	u32 ieoc = 0;
+	int control_rc, status_rc, ieoc_rc;
+
+	control_rc = regmap_read(mci->regmap, MT6360_PMU_CHG_CTRL2, &ctrl2);
+	status_rc = mt6360_get_charging_status(mci, &status);
+	ieoc_rc = mt6360_get_ieoc(mci, &ieoc);
+	return sysfs_emit(buf,
+		"control_rc=%d control2=0x%02x chg_en=%d te_en=%d status_rc=%d status=%d ieoc_rc=%d ieoc_ua=%u\n",
+		control_rc, ctrl2, !!(ctrl2 & MT6360_CHG_EN_MASK),
+		!!(ctrl2 & MT6360_TE_EN_MASK), status_rc, status, ieoc_rc, ieoc);
+}
+static DEVICE_ATTR_RO(charging_state);
+
+static struct attribute *mt6360_charge_state_attrs[] = {
+	&dev_attr_charging_state.attr,
+	NULL,
+};
+static const struct attribute_group mt6360_charge_state_group = {
+	.attrs = mt6360_charge_state_attrs,
+};
+
 #ifdef OPLUS_FEATURE_CHG_BASIC
 bool mt6360_get_vbus_status(void)
 {
@@ -4588,6 +4622,9 @@ static int mt6360_pmu_chg_probe(struct platform_device *pdev)
 		dev_notice(&pdev->dev, "create shipping attr fail\n");
 		goto err_create_mivr_thread_run;
 	}
+	ret = devm_device_add_group(mci->dev, &mt6360_charge_state_group);
+	if (ret < 0)
+		dev_notice(mci->dev, "create charge state diagnostics failed: %d\n", ret);
 
 	mci->pe_wq = create_singlethread_workqueue("pe_pattern");
 	if (!mci->pe_wq) {
