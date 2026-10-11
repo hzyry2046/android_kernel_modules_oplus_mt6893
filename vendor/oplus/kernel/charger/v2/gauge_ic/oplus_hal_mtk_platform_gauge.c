@@ -55,6 +55,7 @@
 #include <linux/random.h>
 #endif
 #include <oplus_chg_module.h>
+#include <oplus_mtk_legacy_gauge.h>
 #include <oplus_chg_comm.h>
 #include <oplus_chg_vooc.h>
 #include <oplus_mms.h>
@@ -69,6 +70,7 @@
 
 extern struct oplus_gauge_chip *g_gauge_chip;
 static struct chip_mt6375_gauge *g_mt6375_chip;
+static struct platform_device *legacy_gauge_pdev;
 
 enum oplus_track_item_idx {
 	TRACK_ITEM_START = 0,
@@ -483,14 +485,14 @@ static int oplus_mt6375_guage_init(struct oplus_chg_ic_dev *ic_dev)
 
 	ic_dev->online = false;
 
-	if (g_gauge_chip == NULL) {
+	if (g_gauge_chip == NULL || g_gauge_chip->gauge_ops == NULL) {
 		ic_dev->online = false;
 		chg_err("ic_dev->online = %d\n", ic_dev->online);
 		return -EAGAIN;
 	}
 
 	if(g_gauge_chip->gauge_ops->get_battery_soc() < 0) {
-		chg_err("soc abnormal");
+		chg_debug("native gauge is not ready\n");
 		return -EAGAIN;
 	}
 
@@ -581,10 +583,46 @@ static int oplus_mt6375_guage_get_batt_fcc(struct oplus_chg_ic_dev *ic_dev, int 
 	return 0;
 }
 
+static int oplus_mt6375_guage_get_psy_property(enum power_supply_property prop,
+					     int *value)
+{
+	struct power_supply *psy;
+	union power_supply_propval val;
+	int rc;
+
+	psy = power_supply_get_by_name("battery");
+	if (!psy)
+		return -EAGAIN;
+	rc = power_supply_get_property(psy, prop, &val);
+	power_supply_put(psy);
+	if (!rc)
+		*value = val.intval;
+	return rc;
+}
+
+static int oplus_mt6375_guage_get_batt_cap(struct oplus_chg_ic_dev *ic_dev, int *cap)
+{
+	int rc;
+
+	rc = oplus_mt6375_guage_get_psy_property(POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN, cap);
+	if (!rc)
+		*cap /= 1000; /* Standard uAh -> IC mAh. */
+	return rc;
+}
+
+static int oplus_mt6375_guage_get_device_type(struct oplus_chg_ic_dev *ic_dev, int *type)
+{
+	struct chip_mt6375_gauge *chip = oplus_chg_ic_get_drvdata(ic_dev);
+
+	*type = chip->device_type;
+	return 0;
+}
+
 static int oplus_mt6375_guage_get_batt_cc(struct oplus_chg_ic_dev *ic_dev, int *cc)
 {
 	*cc = g_gauge_chip->gauge_ops->get_battery_cc();
-
+	if (*cc < 0 && !ic_dev->dev->of_node)
+		return oplus_mt6375_guage_get_psy_property(POWER_SUPPLY_PROP_CYCLE_COUNT, cc);
 	return 0;
 }
 
@@ -704,7 +742,7 @@ static int oplus_mt6375_gauge_get_gauge_car_c(struct oplus_chg_ic_dev *ic_dev, i
 	}
 
 	if (g_gauge_chip->gauge_ops->get_gauge_car_c == NULL)
-		return -EINVAL;
+		return -ENOTSUPP;
 
 	rc = g_gauge_chip->gauge_ops->get_gauge_car_c(car_c);
 	if (rc < 0) {
@@ -730,7 +768,7 @@ static int oplus_mt6375_gauge_get_qmax(struct oplus_chg_ic_dev *ic_dev, int batt
 	}
 
 	if (g_gauge_chip->gauge_ops->get_batt_qmax == NULL)
-		return -EINVAL;
+		return -ENOTSUPP;
 
 	/*single cell battery, qmax1 == qmax2*/
 	rc = g_gauge_chip->gauge_ops->get_batt_qmax(qmax, qmax);
@@ -778,6 +816,11 @@ static int oplus_mt6375_gauge_set_power_sel(struct oplus_chg_ic_dev *ic_dev, int
 	return 0;
 }
 
+static int oplus_mt6375_guage_update(struct oplus_chg_ic_dev *ic_dev)
+{
+	return 0;
+}
+
 static void *oplus_chg_get_func(struct oplus_chg_ic_dev *ic_dev,
 				enum oplus_chg_ic_func func_id)
 {
@@ -797,6 +840,26 @@ static void *oplus_chg_get_func(struct oplus_chg_ic_dev *ic_dev,
 	case OPLUS_IC_FUNC_EXIT:
 		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_EXIT,
 					       oplus_mt6375_guage_exit);
+		break;
+	case OPLUS_IC_FUNC_GAUGE_UPDATE:
+		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_UPDATE,
+					       oplus_mt6375_guage_update);
+		break;
+	case OPLUS_IC_FUNC_GAUGE_GET_BATT_CAP:
+		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_GET_BATT_CAP,
+					       oplus_mt6375_guage_get_batt_cap);
+		break;
+	case OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE:
+		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE,
+					       oplus_mt6375_guage_get_device_type);
+		break;
+	case OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE_FOR_VOOC:
+		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE_FOR_VOOC,
+					       oplus_mt6375_guage_get_device_type);
+		break;
+	case OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE_FOR_BCC:
+		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_GET_DEVICE_TYPE_FOR_BCC,
+					       oplus_mt6375_guage_get_device_type);
 		break;
 	case OPLUS_IC_FUNC_GAUGE_GET_BATT_VOL:
 		func = OPLUS_CHG_IC_FUNC_CHECK(OPLUS_IC_FUNC_GAUGE_GET_BATT_VOL,
@@ -978,19 +1041,25 @@ static int mt6375_guage_driver_probe(struct platform_device *pdev)
 	chip->protect_check_done = true;
 
 	atomic_set(&chip->locked, 0);
-	rc = of_property_read_u32(chip->dev->of_node, "oplus,ic_type",
-				  &ic_type);
-	if (rc < 0) {
-		chg_err("can't get ic type, rc=%d\n", rc);
-		goto error;
+	if (!chip->dev->of_node) {
+		ic_type = OPLUS_CHG_IC_GAUGE;
+		ic_index = 0;
+		ic_cfg.name = OPLUS_MTK_LEGACY_GAUGE_NAME;
+	} else {
+		rc = of_property_read_u32(chip->dev->of_node, "oplus,ic_type",
+					  &ic_type);
+		if (rc < 0) {
+			chg_err("can't get ic type, rc=%d\n", rc);
+			goto error;
+		}
+		rc = of_property_read_u32(chip->dev->of_node, "oplus,ic_index",
+					  &ic_index);
+		if (rc < 0) {
+			chg_err("can't get ic index, rc=%d\n", rc);
+			goto error;
+		}
+		ic_cfg.name = chip->dev->of_node->name;
 	}
-	rc = of_property_read_u32(chip->dev->of_node, "oplus,ic_index",
-				  &ic_index);
-	if (rc < 0) {
-		chg_err("can't get ic index, rc=%d\n", rc);
-		goto error;
-	}
-	ic_cfg.name = chip->dev->of_node->name;
 	ic_cfg.index = ic_index;
 	chip->device_type = 0;
 
@@ -1004,10 +1073,10 @@ static int mt6375_guage_driver_probe(struct platform_device *pdev)
 	chip->ic_dev = devm_oplus_chg_ic_register(chip->dev, &ic_cfg);
 	if (!chip->ic_dev) {
 		rc = -ENODEV;
-		chg_err("register %s error\n", chip->dev->of_node->name);
+		chg_err("register %s error\n", ic_cfg.name);
 		goto error;
 	}
-	chg_info("register %s\n", chip->dev->of_node->name);
+	chg_info("register %s\n", ic_cfg.name);
 
 #ifndef CONFIG_OPLUS_CHARGER_MTK
 	oplus_vooc_get_fastchg_started_pfunc(&oplus_vooc_get_fastchg_started);
@@ -1057,13 +1126,24 @@ static __init int oplus_mt6375_gauge_driver_init(void)
 
 	rc = platform_driver_register(&mt6375_gauge_driver);
 	if (rc < 0)
-		chg_err("failed to register mt6375 debug driver, rc = %d\n", rc);
-
-	return rc;
+		return rc;
+	if (oplus_mtk_legacy_gauge_needed()) {
+		legacy_gauge_pdev = platform_device_register_simple(
+			"oplus_mt6375_gauge", PLATFORM_DEVID_NONE, NULL, 0);
+		if (IS_ERR(legacy_gauge_pdev)) {
+			rc = PTR_ERR(legacy_gauge_pdev);
+			legacy_gauge_pdev = NULL;
+			platform_driver_unregister(&mt6375_gauge_driver);
+			return rc;
+		}
+	}
+	return 0;
 }
 
 static __exit void oplus_mt6375_gauge_driver_exit(void)
 {
+	if (legacy_gauge_pdev)
+		platform_device_unregister(legacy_gauge_pdev);
 	platform_driver_unregister(&mt6375_gauge_driver);
 }
 

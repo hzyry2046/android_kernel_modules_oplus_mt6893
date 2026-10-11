@@ -295,94 +295,103 @@ static int reg_to_current(struct mtk_gauge *gauge,
 /* ============================================================ */
 /* pmic control end*/
 /* ============================================================ */
-u8 get_rtc_spare0_fg_value(struct mtk_gauge *gauge)
+static int gauge_rtc_match(struct device *dev, const void *data)
 {
-	struct nvmem_cell *cell;
-	u8 *buf, data;
-
-	cell = nvmem_cell_get(&gauge->pdev->dev, "initialization");
-	if (IS_ERR(cell)) {
-		bm_err(gauge->gm, "[%s]get rtc cell fail\n", __func__);
-		return 0;
-	}
-
-	buf = nvmem_cell_read(cell, NULL);
-	nvmem_cell_put(cell);
-	if (IS_ERR(buf)) {
-		bm_err(gauge->gm, "[%s]read rtc cell fail\n", __func__);
-		return 0;
-	}
-	bm_debug(gauge->gm, "[%s] val=0x%x, %d\n", __func__, *buf, *buf);
-
-	data = *buf;
-	kfree(buf);
-
-	return data;
+	return dev->parent && dev->parent->parent == data &&
+		!strncmp(dev_name(dev), "mtk_rtc_nvmem", strlen("mtk_rtc_nvmem"));
 }
 
-void set_rtc_spare0_fg_value(struct mtk_gauge *gauge, u8 val)
+static int gauge_rtc_read(struct mtk_gauge *gauge, const char *name,
+	unsigned int offset, u8 *value)
 {
 	struct nvmem_cell *cell;
-	u32 length = 1;
+	struct nvmem_device *nvmem;
+	size_t length;
+	u8 *buf;
 	int ret;
 
-	cell = nvmem_cell_get(&gauge->pdev->dev, "initialization");
-	if (IS_ERR(cell)) {
-		bm_err(gauge->gm, "[%s]get rtc cell fail\n", __func__);
-		return;
+	cell = nvmem_cell_get(&gauge->pdev->dev, name);
+	if (!IS_ERR(cell)) {
+		buf = nvmem_cell_read(cell, &length);
+		nvmem_cell_put(cell);
+		if (IS_ERR(buf))
+			return PTR_ERR(buf);
+		ret = length == 1 ? 0 : -EINVAL;
+		if (!ret)
+			*value = *buf;
+		kfree(buf);
+		return ret;
 	}
+	if (gauge->pdev->dev.of_node)
+		return PTR_ERR(cell);
 
-	ret = nvmem_cell_write(cell, &val, length);
-	nvmem_cell_put(cell);
-	if (ret != length)
-		bm_err(gauge->gm, "[%s] write rtc cell fail\n", __func__);
+	nvmem = nvmem_device_find(gauge->pdev->dev.parent, gauge_rtc_match);
+	if (IS_ERR(nvmem))
+		return PTR_ERR(nvmem);
+	ret = nvmem_device_read(nvmem, offset, 1, value);
+	nvmem_device_put(nvmem);
+	return ret == 1 ? 0 : ret < 0 ? ret : -EIO;
+}
+
+static int gauge_rtc_write(struct mtk_gauge *gauge, const char *name,
+	unsigned int offset, u8 value)
+{
+	struct nvmem_cell *cell;
+	struct nvmem_device *nvmem;
+	int ret;
+
+	cell = nvmem_cell_get(&gauge->pdev->dev, name);
+	if (!IS_ERR(cell)) {
+		ret = nvmem_cell_write(cell, &value, 1);
+		nvmem_cell_put(cell);
+	} else {
+		if (gauge->pdev->dev.of_node)
+			return PTR_ERR(cell);
+		nvmem = nvmem_device_find(gauge->pdev->dev.parent, gauge_rtc_match);
+		if (IS_ERR(nvmem))
+			return PTR_ERR(nvmem);
+		ret = nvmem_device_write(nvmem, offset, 1, &value);
+		nvmem_device_put(nvmem);
+	}
+	return ret == 1 ? 0 : ret < 0 ? ret : -EIO;
+}
+
+u8 get_rtc_spare0_fg_value(struct mtk_gauge *gauge)
+{
+	u8 value = 0;
+	int ret = gauge_rtc_read(gauge, "initialization", 0, &value);
+
+	if (ret)
+		bm_err(gauge->gm, "%s: RTC initialization read failed: %d\n",
+			__func__, ret);
+	return value;
+}
+
+void set_rtc_spare0_fg_value(struct mtk_gauge *gauge, u8 value)
+{
+	int ret = gauge_rtc_write(gauge, "initialization", 0, value);
+
+	if (ret)
+		bm_err(gauge->gm, "%s: RTC initialization write failed: %d\n",
+			__func__, ret);
 }
 
 u8 get_rtc_spare_fg_value(struct mtk_gauge *gauge)
 {
-	struct nvmem_cell *cell;
-	u8 *buf, data;
+	u8 value = 0;
+	int ret = gauge_rtc_read(gauge, "state-of-charge", 1, &value);
 
-	cell = nvmem_cell_get(&gauge->pdev->dev, "state-of-charge");
-	if (IS_ERR(cell)) {
-		bm_err(gauge->gm, "[%s]get rtc cell fail\n", __func__);
-		return 0;
-	}
-
-	buf = nvmem_cell_read(cell, NULL);
-	nvmem_cell_put(cell);
-
-	if (IS_ERR(buf)) {
-		bm_err(gauge->gm, "[%s]read rtc cell fail\n", __func__);
-		return 0;
-	}
-
-	bm_debug(gauge->gm, "[%s] val=%d\n", __func__, *buf);
-	data = *buf;
-	kfree(buf);
-
-	return data;
+	if (ret)
+		bm_err(gauge->gm, "%s: RTC SOC read failed: %d\n", __func__, ret);
+	return value;
 }
 
-void set_rtc_spare_fg_value(struct mtk_gauge *gauge, u8 val)
+void set_rtc_spare_fg_value(struct mtk_gauge *gauge, u8 value)
 {
-	struct nvmem_cell *cell;
-	u32 length = 1;
-	int ret;
+	int ret = gauge_rtc_write(gauge, "state-of-charge", 1, value);
 
-	cell = nvmem_cell_get(&gauge->pdev->dev, "state-of-charge");
-	if (IS_ERR(cell)) {
-		bm_err(gauge->gm, "[%s]get rtc cell fail\n", __func__);
-		return;
-	}
-
-	ret = nvmem_cell_write(cell, &val, length);
-	nvmem_cell_put(cell);
-
-	if (ret != length)
-		bm_err(gauge->gm, "[%s] write rtc cell fail\n", __func__);
-
-	bm_debug(gauge->gm, "[%s] val=%d\n", __func__, val);
+	if (ret)
+		bm_err(gauge->gm, "%s: RTC SOC write failed: %d\n", __func__, ret);
 }
 
 static int fgauge_set_info(struct mtk_gauge *gauge,

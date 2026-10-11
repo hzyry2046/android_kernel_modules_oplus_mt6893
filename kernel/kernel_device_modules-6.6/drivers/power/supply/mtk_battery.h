@@ -1494,6 +1494,8 @@ extern void disable_gauge_irq(struct mtk_gauge *gauge,
 extern int bat_get_debug_level(struct mtk_battery *gm);
 extern char *bat_get_gauge_name(struct mtk_battery *gm);
 extern int force_get_tbat(struct mtk_battery *gm, bool update);
+int mtk_battery_get_charge_full(struct mtk_battery *gm);
+int mtk_battery_get_design_capacity(struct mtk_battery *gm);
 extern int force_get_tbat_internal(struct mtk_battery *gm);
 extern int wakeup_fg_algo_cmd(struct mtk_battery *gm,
 	unsigned int flow_state, int cmd, int para1);

@@ -109,7 +109,9 @@ oplus_chg_v2-$(CONFIG_OPLUS_ADSP_SM8450_CHARGER) += charger_ic/oplus_hal_sm8450.
 oplus_chg_v2-$(CONFIG_OPLUS_TPS6128XD_CHARGER) += charger_ic/oplus_hal_tps6128xd.o
 oplus_chg_v2-$(CONFIG_OPLUS_SY6603_BATT_BAL) += batt_bal_ic/oplus_hal_sy6603.o
 oplus_chg_v2-$(CONFIG_OPLUS_SC7637_LEVEL_SHIFT) += level_shift_ic/oplus_hal_sc7637.o
-oplus_chg_v2-$(CONFIG_OPLUS_MT6375_CHARGER) += gauge_ic/oplus_hal_mtk_platform_gauge.o
+ifneq ($(filter y,$(CONFIG_OPLUS_MT6375_CHARGER) $(CONFIG_OPLUS_MT6379_CHARGER)),)
+oplus_chg_v2-y += gauge_ic/oplus_hal_mtk_platform_gauge.o
+endif
 oplus_chg_v2-$(CONFIG_OPLUS_CHARGER_OPTIGA) += gauge_ic/oplus_optiga/ECC/Optiga_Ecc.o
 oplus_chg_v2-$(CONFIG_OPLUS_CHARGER_OPTIGA) += gauge_ic/oplus_optiga/ECC/Optiga_Math.o
 oplus_chg_v2-$(CONFIG_OPLUS_CHARGER_OPTIGA) += gauge_ic/oplus_optiga/Platform/board.o

@@ -22,6 +22,7 @@
 #include <soc/oplus/system/oplus_project.h>
 #endif
 #include <oplus_chg_module.h>
+#include <oplus_mtk_legacy_gauge.h>
 #include <oplus_chg_ic.h>
 #include <oplus_chg_comm.h>
 #include <oplus_chg_voter.h>
@@ -50,6 +51,7 @@
 
 
 static struct oplus_mms_gauge *g_mms_gauge;
+static struct platform_device *legacy_mms_gauge_pdev;
 static void oplus_mms_gauge_get_reserve_calib_info(struct oplus_mms_gauge *chip);
 static int oplus_mms_gauge_push_auth(struct oplus_mms_gauge *chip);
 static int oplus_mms_gauge_push_hmac(struct oplus_mms_gauge *chip);
@@ -1881,7 +1883,7 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 	if (rc < 0)
 		chip->connect_type = 0;
 
-	level_shift_node = of_find_node_by_name(node, "oplus,level_shift_ic");
+	level_shift_node = node ? of_find_node_by_name(node, "oplus,level_shift_ic") : NULL;
 	if (level_shift_node) {
 		chip->level_shift_ic = of_get_oplus_chg_ic(node, "oplus,level_shift_ic", 0);
 		if (chip->level_shift_ic == NULL) {
@@ -1900,9 +1902,9 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 		chip->level_shift_ic = NULL;
 	}
 
-	rc = of_property_count_elems_of_size(node, "oplus,gauge_ic",
-					     sizeof(u32));
-	if (rc < 0) {
+	rc = node ? of_property_count_elems_of_size(node, "oplus,gauge_ic",
+						    sizeof(u32)) : 1;
+	if (rc <= 0 || rc > GAUGE_IC_NUM_MAX) {
 		chg_err("can't get gauge ic number, rc=%d\n", rc);
 		goto init_try_again;
 	}
@@ -1917,7 +1919,9 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 		goto init_try_again;
 	}
 	for (i = 0; i < chip->child_num; i++) {
-		chip->child_list[i].ic_dev = of_get_oplus_chg_ic(node, "oplus,gauge_ic", i);
+		chip->child_list[i].ic_dev = node ?
+			of_get_oplus_chg_ic(node, "oplus,gauge_ic", i) :
+			oplus_chg_ic_find_by_name(OPLUS_MTK_LEGACY_GAUGE_NAME);
 		if (chip->child_list[i].ic_dev == NULL) {
 			chg_err("not find gauge ic %d\n", i);
 			goto init_try_again;
@@ -1935,7 +1939,7 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 
 		rc = oplus_chg_ic_func(chip->child_list[i].ic_dev, OPLUS_IC_FUNC_INIT);
 		if (rc == -EAGAIN) {
-			chg_err("gauge_ic init timeout\n");
+			chg_debug("gauge_ic is not ready\n");
 			goto init_try_again;
 		} else if (rc < 0) {
 			chg_err("gauge_ic init error, rc=%d\n", rc);
@@ -1946,8 +1950,14 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 	retry = 0;
 	rc = of_property_read_u32(node, "oplus,main_gauge", &chip->main_gauge);
 	if (rc < 0) {
-		chg_err("can't get main charger index, rc=%d\n", rc);
+		if (node)
+			chg_err("can't get main charger index, rc=%d\n", rc);
 		chip->main_gauge = 0;
+	}
+	if (chip->main_gauge >= chip->child_num) {
+		chg_err("main gauge index %u exceeds %d children\n",
+			chip->main_gauge, chip->child_num);
+		goto init_error;
 	}
 	chip->gauge_ic = chip->child_list[chip->main_gauge].ic_dev;
 	chip->gauge_ic_comb[chip->main_gauge] = chip->child_list[chip->main_gauge].ic_dev;
@@ -1986,7 +1996,8 @@ static void oplus_mms_gauge_init_work(struct work_struct *work)
 
 	chip->check_subboard_ntc_err = false;
 
-	oplus_gauge_parse_deep_spec(chip);
+	if (node)
+		oplus_gauge_parse_deep_spec(chip);
 
 	oplus_mms_gauge_virq_register(chip);
 	g_mms_gauge = chip;
@@ -2004,9 +2015,8 @@ init_try_again:
 	}
 init_error:
 	if (chip->child_list) {
-		for (; i >=0; i--)
-			chip->child_list[i].ic_dev = NULL;
 		devm_kfree(chip->dev, chip->child_list);
+		chip->child_list = NULL;
 	}
 	return;
 }
@@ -4936,7 +4946,8 @@ static int oplus_mms_gauge_probe(struct platform_device *pdev)
 	chip->dev = &pdev->dev;
 	platform_set_drvdata(pdev, chip);
 
-	of_platform_populate(chip->dev->of_node, NULL, NULL, chip->dev);
+	if (chip->dev->of_node)
+		of_platform_populate(chip->dev->of_node, NULL, NULL, chip->dev);
 
 	mutex_init(&chip->deep_spec.lock);
 
@@ -5065,11 +5076,28 @@ static struct platform_driver oplus_mms_gauge_driver = {
 
 static __init int oplus_mms_gauge_init(void)
 {
-	return platform_driver_register(&oplus_mms_gauge_driver);
+	int rc;
+
+	rc = platform_driver_register(&oplus_mms_gauge_driver);
+	if (rc < 0)
+		return rc;
+	if (oplus_mtk_legacy_gauge_needed()) {
+		legacy_mms_gauge_pdev = platform_device_register_simple(
+			"oplus-mms_gauge", PLATFORM_DEVID_NONE, NULL, 0);
+		if (IS_ERR(legacy_mms_gauge_pdev)) {
+			rc = PTR_ERR(legacy_mms_gauge_pdev);
+			legacy_mms_gauge_pdev = NULL;
+			platform_driver_unregister(&oplus_mms_gauge_driver);
+			return rc;
+		}
+	}
+	return 0;
 }
 
 static __exit void oplus_mms_gauge_exit(void)
 {
+	if (legacy_mms_gauge_pdev)
+		platform_device_unregister(legacy_mms_gauge_pdev);
 	platform_driver_unregister(&oplus_mms_gauge_driver);
 }
 

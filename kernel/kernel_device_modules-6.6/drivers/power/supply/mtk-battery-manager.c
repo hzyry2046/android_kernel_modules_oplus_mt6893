@@ -1105,13 +1105,12 @@ static int bm_update_psy_property(struct mtk_battery *gm, enum bm_psy_prop prop)
 		ret_val = battery_get_int_property(gm, BAT_PROP_TEMPERATURE);
 		break;
 	case QMAX_DESIGN:
-		if (gm->battery_id < 0 || gm->battery_id >= TOTAL_BATTERY_NUMBER)
-			ret_val = gm->fg_table_cust_data.fg_profile[0].q_max * 10;
-		else
-			ret_val = gm->fg_table_cust_data.fg_profile[gm->battery_id].q_max * 10;
+		ret_val = mtk_battery_get_design_capacity(gm);
 		break;
 	case QMAX:
-		ret_val = gm->daemon_data.qmxa_t_0ma;
+		ret_val = mtk_battery_get_charge_full(gm);
+		if (ret_val <= 0)
+			ret_val = mtk_battery_get_design_capacity(gm);
 		break;
 	default:
 		break;
@@ -1221,10 +1220,10 @@ static int bs_psy_get_property(struct power_supply *psy,
 
 		if (bm->gm1 != NULL)
 			if(!bm->gm1->bat_plug_out)
-				qmax += bm_update_psy_property(bm->gm1, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm1, QMAX);
 		if (bm->gm2 != NULL)
 			if(!bm->gm2->bat_plug_out)
-				qmax += bm_update_psy_property(bm->gm2, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm2, QMAX);
 
 		val->intval = qmax * 100;
 		ret = 0;
@@ -1233,10 +1232,10 @@ static int bs_psy_get_property(struct power_supply *psy,
 
 		if (bm->gm1 != NULL)
 			if(!bm->gm1->bat_plug_out)
-				qmax += bm_update_psy_property(bm->gm1, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm1, QMAX);
 		if (bm->gm2 != NULL)
 			if(!bm->gm2->bat_plug_out)
-				qmax += bm_update_psy_property(bm->gm2, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm2, QMAX);
 
 		val->intval = bs_data->bat_capacity * qmax;
 		break;
@@ -1290,12 +1289,12 @@ static int bs_psy_get_property(struct power_supply *psy,
 		if (bm->gm1 != NULL)
 			if(!bm->gm1->bat_plug_out) {
 				curr_avg += bm_update_psy_property(bm->gm1, CURRENT_AVG);
-				qmax += bm_update_psy_property(bm->gm1, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm1, QMAX);
 			}
 		if (bm->gm2 != NULL)
 			if(!bm->gm2->bat_plug_out) {
 				curr_avg += bm_update_psy_property(bm->gm2, CURRENT_AVG);
-				qmax += bm_update_psy_property(bm->gm2, QMAX_DESIGN);
+				qmax += bm_update_psy_property(bm->gm2, QMAX);
 			}
 
 		remain_mah = remain_ui * qmax / 10;

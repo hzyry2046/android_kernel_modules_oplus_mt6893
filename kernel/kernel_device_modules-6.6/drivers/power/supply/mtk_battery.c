@@ -38,10 +38,14 @@ struct mtk_battery *gmb;
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 #include <linux/iio/consumer.h>
+#include "mt6893-legacy-ntc.h"
 
 #define PMIC_RG_FGADC_RST_SRC_SEL 0xc2c
 
 static int bat_temperature_high_precision_val = 0;
+static struct iio_channel *legacy_battery_temp_chan;
+static u32 legacy_battery_temp_pull_up_r;
+static u32 legacy_battery_design_capacity;
 #if (defined(CONFIG_OPLUS_CHARGER_MTK6877) || defined(CONFIG_OPLUS_CHARGER_MTK6769R) || defined(CONFIG_OPLUS_CHARGER_MTK6833))
 extern void register_mtk_oplus_batt_interfaces(struct mtk_oplus_batt_interface *intf);
 bool oplus_set_charge_power_sel(int select);
@@ -243,6 +247,11 @@ int oplus_battery_get_bat_temperature(void)
 		return batt_temp/10;
 	}
 	if (prj_for_mtk_60w_support() == true && prj_is_subboard_temp_support()) {
+		if (legacy_battery_temp_chan && is_battery_init_done()) {
+			force_get_tbat(gmb, true);
+			return gmb->fixed_bat_tmp == 0xffff ?
+				gmb->tbat_precise : gmb->fixed_bat_tmp * 10;
+		}
 		return oplus_chg_get_subboard_temp_cal();  // TO DO
 	}
 	/* TODO */
@@ -342,20 +351,12 @@ int meter_fg_30_get_bat_charging_current(void)
 
 static int meter_fg_30_get_prev_battery_fcc(void)
 {
-        pr_err("%s: prev_batt_fcc value is %d", __func__, gmb->prev_batt_fcc);
-        if (gmb->prev_batt_fcc == 0)
-                return 5042;
-        else
-                return gmb->prev_batt_fcc/10;
+	return mtk_battery_get_charge_full(gmb) / 10;
 }
 
 static int meter_fg_30_get_battery_fcc(void)
 {
-        pr_err("%s: prev_batt_fcc value is %d", __func__, gmb->prev_batt_fcc);
-        if (gmb->prev_batt_fcc == 0)
-                return 5042;
-        else
-                return gmb->prev_batt_fcc/10;
+	return mtk_battery_get_charge_full(gmb) / 10;
 }
 
 static int meter_fg_30_get_battery_cc(void)
@@ -382,20 +383,15 @@ static int meter_fg_30_get_battery_soh(void)
 #define BATT_CAPACITY	4000
 static int meter_fg_30_get_batt_remaining_capacity(void)
 {
-	pr_err("%s: batt_remaining_capacity value is %d", __func__, gmb->prev_batt_remaining_capacity);
-	if (gmb->prev_batt_remaining_capacity == 0)
-		return 5042;
-	else
-		return gmb->prev_batt_remaining_capacity;
+	if (gmb->algo.active && gmb->init_flag)
+		return div_s64((s64)mtk_battery_get_charge_full(gmb) *
+			clamp(gmb->algo.soc, 0, 10000), 100000);
+	return gmb->prev_batt_remaining_capacity;
 }
 
 static int meter_fg_30_get_prev_batt_remaining_capacity(void)
 {
-	pr_err("%s: prev_batt_remaining_capacity value is %d", __func__, gmb->prev_batt_remaining_capacity);
-	if (gmb->prev_batt_remaining_capacity == 0)
-		return 5042;
-	else
-		return gmb->prev_batt_remaining_capacity;
+	return meter_fg_30_get_batt_remaining_capacity();
 }
 
 static int meter_fg_30_modify_dod0(void)
@@ -1441,6 +1437,45 @@ int force_get_tbat_internal(struct mtk_battery *gm)
 #endif
 }
 
+int mtk_battery_get_charge_full(struct mtk_battery *gm)
+{
+	if (gm->algo.active)
+		return max(READ_ONCE(gm->algo.quse_tb1), 0);
+	if (gm->daemon_data.quse > 0)
+		return gm->daemon_data.quse;
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	return max(gm->prev_batt_fcc, 0);
+#else
+	return 0;
+#endif
+}
+EXPORT_SYMBOL_GPL(mtk_battery_get_charge_full);
+
+int mtk_battery_get_design_capacity(struct mtk_battery *gm)
+{
+	int index = gm->battery_id;
+
+#ifdef OPLUS_FEATURE_CHG_BASIC
+	if (gm == gmb && legacy_battery_design_capacity)
+		return legacy_battery_design_capacity * 10;
+#endif
+	if (index < 0 || index >= TOTAL_BATTERY_NUMBER)
+		index = 0;
+	return gm->fg_table_cust_data.fg_profile[index].q_max * 10;
+}
+EXPORT_SYMBOL_GPL(mtk_battery_get_design_capacity);
+
+static int legacy_battery_temperature(int *temperature)
+{
+	int voltage, ret;
+
+	ret = iio_read_channel_processed(legacy_battery_temp_chan, &voltage);
+	if (ret < 0)
+		return ret;
+	return mt6893_legacy_ntc_temperature(voltage,
+		legacy_battery_temp_pull_up_r, temperature);
+}
+
 int force_get_tbat(struct mtk_battery *gm, bool update)
 {
 	struct property_control *prop_control;
@@ -1451,6 +1486,20 @@ int force_get_tbat(struct mtk_battery *gm, bool update)
 #ifdef OPLUS_FEATURE_CHG_BASIC
 	int board_temp = 0;
 	if (prj_is_subboard_temp_support()){
+		if (legacy_battery_temp_chan && gm == gmb) {
+			int ret;
+
+			if (gm->fixed_bat_tmp != 0xffff)
+				return gm->fixed_bat_tmp;
+			ret = legacy_battery_temperature(&board_temp);
+			if (ret < 0) {
+				bm_err(gm, "legacy battery NTC read failed: %d\n", ret);
+				return gm->cur_bat_temp;
+			}
+			gm->tbat_precise = board_temp;
+			gm->cur_bat_temp = board_temp / 10;
+			return gm->cur_bat_temp;
+		}
 		if (oplus_chg_get_voocphy_support()) {
 			board_temp = oplus_chg_get_subboard_temp_cal()/10;
 			if (prj_for_mtk_60w_support() == true) {
@@ -2787,8 +2836,12 @@ void fg_custom_init_from_dts(struct platform_device *dev,
 	if (fg_table_cust_data->active_table_number == 0)
 		fg_table_cust_data->active_table_number = 5;
 #else
-	if (fg_table_cust_data->active_table_number == 0)
-		fg_table_cust_data->active_table_number = 4;
+	if (fg_table_cust_data->active_table_number == 0) {
+		ret = snprintf(node_name, sizeof(node_name),
+			"battery%d_profile_t4", bat_id);
+		fg_table_cust_data->active_table_number =
+			ret > 0 && of_find_property(np, node_name, NULL) ? 5 : 4;
+	}
 #endif
 
 	bm_err(gm, "fg active table:%d\n",
@@ -4633,6 +4686,37 @@ int battery_init(struct platform_device *pdev)
 	printk("%s, enable_is_force_full:%d\n", __func__, enable_is_force_full);
 	fg_read_dts_val(gauge->gm, opl_dtnode, "IS_SUBBOARD_TEMP_SUPPORT", &(is_subboard_temp_support), 1);
 	printk("%s, is_subboard_temp_support:%d\n", __func__, is_subboard_temp_support);
+	if (is_subboard_temp_support && for_mtk_60w_support) {
+		struct device_node *charger_node = of_find_node_by_path("/charger");
+		struct iio_channel *legacy_chan;
+
+		if (charger_node && of_property_match_string(charger_node,
+			"io-channel-names", "auxadc3-bat_id_temp") >= 0) {
+			u32 design_capacity;
+
+			if (!of_property_read_u32(charger_node, "qcom,batt_capacity_mah",
+				&design_capacity) && design_capacity > 0 &&
+				design_capacity <= INT_MAX / 10)
+				legacy_battery_design_capacity = design_capacity;
+			legacy_chan = devm_fwnode_iio_channel_get_by_name(&pdev->dev,
+				of_fwnode_handle(charger_node), "auxadc3-bat_id_temp");
+			if (!IS_ERR(legacy_chan)) {
+				legacy_battery_temp_chan = legacy_chan;
+				legacy_battery_temp_pull_up_r = 200000;
+				if (of_property_read_bool(charger_node,
+					"qcom,sub_board_pull_up_r_support"))
+					of_property_read_u32(charger_node,
+						"qcom,sub_board_pull_up_r",
+						&legacy_battery_temp_pull_up_r);
+				bm_err(gm, "legacy battery NTC enabled, pull-up=%u\n",
+					legacy_battery_temp_pull_up_r);
+			} else {
+				bm_err(gm, "legacy battery NTC channel failed: %ld\n",
+					PTR_ERR(legacy_chan));
+			}
+		}
+		of_node_put(charger_node);
+	}
 	fg_read_dts_val(gauge->gm, opl_dtnode, "USE_MT6360", &(use_mt6360), 1);
 	printk("%s, use_mt6360:%d\n", __func__, use_mt6360);
 	fg_read_dts_val(gauge->gm, opl_dtnode, "USE_MT6370", &(use_mt6370), 1);
