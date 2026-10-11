@@ -5,6 +5,7 @@
 #include "audio_task_manager.h"
 
 #include <linux/string.h>
+#include <linux/errno.h>
 
 #include <linux/kthread.h>
 #include <linux/wait.h>
@@ -34,7 +35,12 @@ int audio_task_register_callback(
 	const uint8_t task_scene,
 	recv_message_t  recv_message)
 {
-	struct audio_task_t *task = &g_audio_task_array[task_scene];
+	struct audio_task_t *task;
+
+	/* Validate before indexing: legacy firmware has fewer task scenes. */
+	if (task_scene >= TASK_SCENE_SIZE)
+		return -EINVAL;
+	task = &g_audio_task_array[task_scene];
 
 	/* create hanlder when registering */
 	task->ipi_queue_handler = create_ipi_queue_handler(task_scene);

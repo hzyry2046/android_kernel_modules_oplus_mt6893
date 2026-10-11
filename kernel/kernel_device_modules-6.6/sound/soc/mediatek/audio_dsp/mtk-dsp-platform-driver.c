@@ -1924,7 +1924,7 @@ static int mtk_dsp_probe(struct snd_soc_component *component)
 		spin_lock_init(&dsp->dsp_mem[id].ringbuf_lock);
 
 		dspscene = get_dspscene_by_dspdaiid(id);
-		if (dspscene < 0)
+		if (dspscene < 0 || dspscene >= TASK_SCENE_SIZE)
 			continue;
 
 		ret = audio_task_register_callback(dspscene, mtk_dsp_pcm_ipi_recv);
