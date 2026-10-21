@@ -5126,9 +5126,16 @@ struct mtk_power_gate scp_clks[] = {
 	 */
 	//PGATE(SCP_SYS_DP_TX, "PG_DP_TX", "PG_DIS", NULL, SYS_DP_TX),
 	/* Gary Wang: no need to turn of disp mtcmos*/
-	//PGATE3(SCP_SYS_VPU, "PG_VPU", NULL, "ipu_if_sel", "dsp_sel",
-			//				"dsp7_sel", SYS_VPU),
+	PGATE3(SCP_SYS_VPU, "PG_VPU", NULL, "ipu_if_sel", "dsp_sel",
+		"dsp7_sel", SYS_VPU),
 };
+
+/* The legacy APU experiment must opt in before this provider is probed.
+ * Default registration preserves the camera/display/modem bring-up baseline.
+ */
+static bool enable_apu;
+module_param(enable_apu, bool, 0444);
+MODULE_PARM_DESC(enable_apu, "Register experimental MT6893 PG_VPU gate");
 
 static int  init_clk_scpsys(struct platform_device *pdev,
 					struct clk_onecell_data *clk_data)
@@ -5140,6 +5147,8 @@ static int  init_clk_scpsys(struct platform_device *pdev,
 	for (i = 0; i < ARRAY_SIZE(scp_clks); i++) {
 		struct mtk_power_gate *pg = &scp_clks[i];
 
+		if (pg->id == SCP_SYS_VPU && !enable_apu)
+			continue;
 		pre_clk = pg->pre_clk_name ? mt6893_get_pre_clk(pg->pre_clk_name) : NULL;
 
 		pre_clk2 = pg->pre_clk2_name ? mt6893_get_pre_clk(pg->pre_clk2_name) : NULL;
