@@ -44,6 +44,7 @@
 #endif
 
 #include "mtk_iommu.h"
+#include "mt6893_legacy_apu_ports.h"
 
 #define REG_MMU_PT_BASE_ADDR			0x000
 
@@ -2099,6 +2100,9 @@ static struct iommu_group *mtk_iommu_device_group(struct device *dev)
 static int mtk_iommu_of_xlate(struct device *dev, struct of_phandle_args *args)
 {
 	struct platform_device *m4updev;
+	struct mtk_iommu_data *data;
+	u32 cell, id;
+	int ret;
 
 	if (args->args_count != 1) {
 		dev_err(dev, "invalid #iommu-cells(%d) property for IOMMU\n",
@@ -2109,12 +2113,27 @@ static int mtk_iommu_of_xlate(struct device *dev, struct of_phandle_args *args)
 	if (!dev_iommu_priv_get(dev)) {
 		/* Get the m4u device */
 		m4updev = of_find_device_by_node(args->np);
-		if (WARN_ON(!m4updev))
-			return -EINVAL;
+		if (!m4updev)
+			return -EPROBE_DEFER;
 
 		dev_iommu_priv_set(dev, platform_get_drvdata(m4updev));
+		put_device(&m4updev->dev);
 	}
 
+	data = dev_iommu_priv_get(dev);
+	if (!data)
+		return -EPROBE_DEFER;
+	if (data->plat_data->iommu_type == APU_IOMMU &&
+	    of_machine_is_compatible("mediatek,MT6893") &&
+	    of_device_is_compatible(args->np, "mediatek,iommu_v0")) {
+		ret = of_property_read_u32(args->np, "cell-index", &cell);
+		if (ret)
+			return ret;
+		ret = mt6893_legacy_apu_port(cell, args->args[0], &id);
+		if (ret)
+			return ret;
+		return iommu_fwspec_add_ids(dev, &id, 1);
+	}
 	return iommu_fwspec_add_ids(dev, args->args, 1);
 }
 
