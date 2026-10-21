@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0
+# Isolated MT6893 legacy protocol port. Not selected by the boot build.
+ifneq ($(APUSYS_LEGACY_PROVIDERS_ONLY),1)
+obj-m += apusys_legacy_mdw.o
+endif
+ccflags-y += -I$(srctree)/$(src)/include -I$(srctree)/$(src)/midware/1.1 -I$(srctree)/$(src)/util
+ccflags-y += -I$(srctree)/$(src)/power/2.0 -I$(srctree)/$(src)/power/2.0/mt6885
+ccflags-y += -I$(srctree)/$(src)/reviser/1.0 -I$(srctree)/$(src)/mnoc/1.0
+ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat
+apusys_legacy_mdw-y := abi_layout.o midware/1.1/mdw_drv.o \
+ midware/1.1/mdw_usr.o midware/1.1/mdw_dbg.o midware/1.1/mdw_rsc.o \
+ midware/1.1/mdw_cmn.o midware/1.1/mdw_cmd.o midware/1.1/mdw_sched.o \
+ midware/1.1/mdw_queue.o midware/1.1/mdw_queue_norm.o \
+ midware/1.1/mdw_queue_deadline.o midware/1.1/mdw_dispr.o \
+ midware/1.1/mdw_mem.o midware/1.1/mdw_mem_dmabuf.o \
+ midware/1.1/mdw_fence.o midware/1.1/mdw_sysfs.o
+apusys_legacy_mdw-$(CONFIG_FTRACE) += util/apusys_trace.o
+
+obj-m += apusys_legacy_reviser.o
+ccflags-y += -I$(srctree)/$(src)/reviser/mt6885
+apusys_legacy_reviser-y := reviser/1.0/reviser_drv.o reviser/1.0/reviser_hw.o \
+ reviser/1.0/reviser_mem.o reviser/1.0/reviser_mem_mgt.o \
+ reviser/1.0/reviser_dbg.o reviser/1.0/reviser_export.o \
+ reviser/mt6885/reviser_reg.o
+
+# Explicit target selection for the old co-platform table/layout branches.
+ccflags-y += -DCONFIG_MACH_MT6893=1
+obj-m += apusys_legacy_power.o
+apusys_legacy_power-y := power/2.0/apusys_power_driver.o power/2.0/apu_legacy_devinfo.o \
+ power/2.0/apu_checked_power.o power/2.0/apu_checked_power_driver.o \
+ power/2.0/apusys_power_ctl.o power/2.0/apusys_power_debug.o \
+ power/2.0/mt6885/hal_config_power.o power/2.0/mt6885/apu_power_regulator.o \
+ power/2.0/mt6885/apu_power_clock.o power/2.0/mt6885/apusys_power_cust.o \
+ power/2.0/mt6885/apu_power_table.o power/2.0/mt6885/apu_platform_resource.o \
+ power/2.0/mt6885/apu_platform_debug.o power/2.0/mt6885/apusys_power_rule_check.o
