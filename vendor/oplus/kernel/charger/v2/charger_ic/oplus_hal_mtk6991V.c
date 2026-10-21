@@ -48,6 +48,7 @@
 #include <mt6893-charge-guard.h>
 #include <mt6893-charge-limits.h>
 #include <mt6893-full-observer.h>
+#include <mt6893-charger-status.h>
 
 #ifdef OPLUS_FEATURE_CHG_BASIC
 #include <linux/gpio.h>
@@ -201,6 +202,9 @@ static struct {
 	int voltage_rc, current_rc, done_rc, enabled_rc;
 } legacy_full;
 static DEFINE_MUTEX(legacy_full_lock);
+static struct mt6893_charger_status legacy_status;
+static int legacy_status_read_rc = -ENODEV;
+static DEFINE_MUTEX(legacy_status_lock);
 static int legacy_limits_refresh(void);
 static int legacy_limits_request(enum legacy_limit_id id, int value);
 static int legacy_limits_init(struct device *dev);
@@ -232,6 +236,47 @@ static void legacy_guard_notify(void)
 {
 	if (!IS_ERR_OR_NULL(pinfo->psy1))
 		power_supply_changed(pinfo->psy1);
+}
+
+/* Preserve the primary charger's Full and propagate I/O errors to callers.
+ * This reports hardware state; it never sets SOC or controls termination.
+ */
+static int legacy_primary_status(bool *online, int *status)
+{
+	struct power_supply *psy;
+	union power_supply_propval present = {0}, state = {0};
+	int rc;
+
+	psy = power_supply_get_by_name("primary_chg");
+	if (!psy)
+		return -ENODEV;
+	rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &present);
+	if (!rc)
+		rc = power_supply_get_property(psy, POWER_SUPPLY_PROP_STATUS, &state);
+	power_supply_put(psy);
+	if (rc)
+		return rc;
+	*online = !!present.intval;
+	*status = !*online ? POWER_SUPPLY_STATUS_DISCHARGING : state.intval;
+	if (*online && legacy_guard.active && READ_ONCE(legacy_guard.blocked))
+		*status = POWER_SUPPLY_STATUS_NOT_CHARGING;
+	return 0;
+}
+
+static void legacy_status_sample(void)
+{
+	bool online = false, changed;
+	int status = POWER_SUPPLY_STATUS_UNKNOWN;
+	int rc = legacy_primary_status(&online, &status);
+
+	mutex_lock(&legacy_status_lock);
+	legacy_status_read_rc = rc;
+	changed = mt6893_charger_status_update(&legacy_status, rc, online, status);
+	mutex_unlock(&legacy_status_lock);
+	if (changed) {
+		pr_info("legacy charger state online=%d status=%d\n", online, status);
+		legacy_guard_notify();
+	}
 }
 
 /* Avoid repeatedly running MT6360's ICHG ramp-down for an already-off buck. */
@@ -378,6 +423,7 @@ static void legacy_guard_work(struct work_struct *work)
 		mod_delayed_work(system_freezable_wq, &legacy_guard.work, msecs_to_jiffies(5000));
 	mutex_unlock(&legacy_guard_lock);
 	legacy_full_sample();
+	legacy_status_sample();
 	if (changed)
 		legacy_guard_notify();
 }
@@ -2763,12 +2809,27 @@ static ssize_t legacy_full_monitor_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(legacy_full_monitor);
 
+static ssize_t legacy_charge_status_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	ssize_t len;
+
+	mutex_lock(&legacy_status_lock);
+	len = sysfs_emit(buf, "valid=%d online=%d status=%d read_rc=%d changes=%u\n",
+		legacy_status.valid, legacy_status.online, legacy_status.status,
+		legacy_status_read_rc, legacy_status.changes);
+	mutex_unlock(&legacy_status_lock);
+	return len;
+}
+static DEVICE_ATTR_RO(legacy_charge_status);
+
 static struct attribute *legacy_guard_attrs[] = {
 	&dev_attr_legacy_charge_guard.attr,
 	&dev_attr_legacy_guard_test.attr,
 	&dev_attr_legacy_charge_limits.attr,
 	&dev_attr_legacy_limit_test.attr,
 	&dev_attr_legacy_full_monitor.attr,
+	&dev_attr_legacy_charge_status.attr,
 	NULL,
 };
 static const struct attribute_group legacy_guard_group = { .attrs = legacy_guard_attrs };
@@ -4827,6 +4888,11 @@ static int psy_charger_get_property(struct power_supply *psy,
 			val->intval = false;
 		break;
 	case POWER_SUPPLY_PROP_STATUS:
+		if (legacy_charger_ntc && info->psy1 == psy) {
+			bool online;
+
+			return legacy_primary_status(&online, &val->intval);
+		}
 		/* op6893 6.6 bring-up: mtk_battery_manager reads ONLINE+
 		 * STATUS from this psy to compute bat_status (the charging
 		 * icon).  STATUS was missing from the table so the read
