@@ -10,6 +10,7 @@
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/regulator/driver.h>
+#include <linux/regulator/machine.h>
 #include <linux/regulator/of_regulator.h>
 #include <linux/soc/mediatek/mtk_dvfsrc.h>
 
@@ -83,6 +84,10 @@ static int dvfsrc_set_voltage_sel(struct regulator_dev *rdev,
 {
 	struct device *dvfsrc_dev = to_dvfsrc_dev(rdev);
 	int id = rdev_get_id(rdev);
+
+	if (of_device_is_compatible(dvfsrc_dev->of_node, "mediatek,dvfsrc"))
+		return id == DVFSRC_ID_VCORE ?
+			mtk_dvfsrc_set_legacy_vcore(dvfsrc_dev, selector) : -EINVAL;
 
 	if (id == DVFSRC_ID_VCORE) {
 		mtk_dvfsrc_send_request(dvfsrc_dev,
@@ -539,6 +544,24 @@ static const struct of_device_id mtk_dvfsrc_regulator_match[] = {
 };
 MODULE_DEVICE_TABLE(of, mtk_dvfsrc_regulator_match);
 
+/* The stock MT6893 DT has a legacy parent and no virtual-regulator children.
+ * Keep voting in the DVFSRC regulator framework; the MT6893 system VCORE
+ * output is physically VGPU11, but direct PMIC writes bypass shared voting.
+ */
+static const struct dvfsrc_regulator_init_data regulator_mt6893_legacy_data = {
+	.size = 1, /* VCORE only; no VSCP regulator node exists in this legacy DT. */
+	.regulator_info = &mt6893_regulators[0],
+};
+
+static const struct regulator_init_data mt6893_legacy_vcore_constraints = {
+	.constraints = {
+		.name = "dvfsrc-vcore",
+		.min_uV = 575000,
+		.max_uV = 750000,
+		.valid_ops_mask = REGULATOR_CHANGE_VOLTAGE,
+	},
+};
+
 static int dvfsrc_vcore_regulator_probe(struct platform_device *pdev)
 {
 	const struct of_device_id *match;
@@ -548,21 +571,45 @@ static int dvfsrc_vcore_regulator_probe(struct platform_device *pdev)
 	const struct dvfsrc_regulator_init_data *regulator_init_data;
 	struct dvfsrc_regulator *mt_regulators;
 	int i;
+	bool legacy_mt6893;
+	struct regulator_init_data *legacy_constraints = NULL;
+	struct dvfsrc_regulator *legacy_regulator;
+	unsigned int *legacy_uv;
+	int ret;
 
 	match = of_match_node(mtk_dvfsrc_regulator_match, dev->parent->of_node);
 
-	if (!match) {
+	legacy_mt6893 = !match && of_machine_is_compatible("mediatek,MT6893") &&
+		of_device_is_compatible(dev->parent->of_node, "mediatek,dvfsrc");
+	if (!match && !legacy_mt6893) {
 		dev_err(dev, "invalid compatible string\n");
 		return -ENODEV;
 	}
 
-	regulator_init_data = match->data;
+	regulator_init_data = legacy_mt6893 ? &regulator_mt6893_legacy_data : match->data;
 
 	mt_regulators = regulator_init_data->regulator_info;
+	if (legacy_mt6893) {
+		legacy_uv = devm_kcalloc(dev, 5, sizeof(*legacy_uv), GFP_KERNEL);
+		legacy_regulator = devm_kmemdup(dev, mt_regulators,
+			sizeof(*legacy_regulator), GFP_KERNEL);
+		legacy_constraints = devm_kmemdup(dev, &mt6893_legacy_vcore_constraints,
+			sizeof(*legacy_constraints), GFP_KERNEL);
+		if (!legacy_uv || !legacy_regulator || !legacy_constraints)
+			return -ENOMEM;
+		ret = mtk_dvfsrc_get_legacy_vcore_table(dev->parent, legacy_uv, 5);
+		if (ret)
+			return dev_err_probe(dev, ret, "legacy voltage table unavailable\n");
+		legacy_regulator->desc.volt_table = legacy_uv;
+		legacy_constraints->constraints.min_uV = legacy_uv[0];
+		legacy_constraints->constraints.max_uV = legacy_uv[4];
+		mt_regulators = legacy_regulator;
+	}
 	for (i = 0; i < regulator_init_data->size; i++) {
 		config.dev = dev->parent;
 		config.driver_data = (mt_regulators + i);
-		rdev = devm_regulator_register(dev->parent,
+		config.init_data = legacy_constraints;
+		rdev = devm_regulator_register(dev,
 				&(mt_regulators + i)->desc, &config);
 		if (IS_ERR(rdev)) {
 			dev_err(dev, "failed to register %s\n",

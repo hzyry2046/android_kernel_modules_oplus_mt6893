@@ -25,12 +25,22 @@
 #if IS_ENABLED(CONFIG_MTK_DVFSRC)
 void mtk_dvfsrc_send_request(const struct device *dev, u32 cmd, u64 data);
 int mtk_dvfsrc_query_info(const struct device *dev, u32 cmd, int *data);
+int mtk_dvfsrc_get_legacy_vcore_table(const struct device *dev,
+		unsigned int *uv, unsigned int count);
+int mtk_dvfsrc_set_legacy_vcore(const struct device *dev, unsigned int gear);
 #else
 static inline void mtk_dvfsrc_send_request(const struct device *dev, u32 cmd,
 					   u64 data)
 { }
 static inline int mtk_dvfsrc_query_info(const struct device *dev, u32 cmd,
 					int *data)
+{ return -ENODEV; }
+
+static inline int mtk_dvfsrc_get_legacy_vcore_table(const struct device *dev,
+		unsigned int *uv, unsigned int count)
+{ return -ENODEV; }
+static inline int mtk_dvfsrc_set_legacy_vcore(const struct device *dev,
+		unsigned int gear)
 { return -ENODEV; }
 
 #endif /* CONFIG_MTK_DVFSRC */

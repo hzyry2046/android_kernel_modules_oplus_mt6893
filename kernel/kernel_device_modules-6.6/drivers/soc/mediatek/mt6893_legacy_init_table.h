@@ -1,0 +1,91 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Copyright (c) 2019 MediaTek Inc. */
+/* MT6893 configuration 0, imported from helio-dvfsrc-mt6893.c.
+ * Original order and values; cold-start policy applies documented overrides.
+ * Provenance: mt6893_legacy_init_sources.json. */
+#ifndef MT6893_LEGACY_INIT_TABLE_H
+#define MT6893_LEGACY_INIT_TABLE_H
+struct mt6893_legacy_reg_setting { unsigned int offset, value; };
+static const struct mt6893_legacy_reg_setting mt6893_legacy_init_table[] = {
+	{ 0xa60, 0x0000001e }, /* DVFSRC_HRT_REQ_UNIT */
+	{ 0x314, 0x00001965 }, /* DVFSRC_DEBOUNCE_TIME */
+	{ 0x0f8, 0x0000001e }, /* DVFSRC_TIMEOUT_NEXTREQ */
+	{ 0x318, 0x001dc000 }, /* DVFSRC_LEVEL_MASK */
+	{ 0x318, 0x00cccc80 }, /* DVFSRC_LEVEL_MASK */
+	{ 0xa34, 0x00000033 }, /* DVFSRC_DDR_QOS0 */
+	{ 0xa38, 0x0000004c }, /* DVFSRC_DDR_QOS1 */
+	{ 0xa3c, 0x00000062 }, /* DVFSRC_DDR_QOS2 */
+	{ 0xa40, 0x00000077 }, /* DVFSRC_DDR_QOS3 */
+	{ 0xa44, 0x00000099 }, /* DVFSRC_DDR_QOS4 */
+	{ 0xd18, 0x000000cc }, /* DVFSRC_DDR_QOS5 */
+	{ 0xd1c, 0x000000ee }, /* DVFSRC_DDR_QOS6 */
+	{ 0x100, 0x60547064 }, /* DVFSRC_LEVEL_LABEL_0_1 */
+	{ 0x104, 0x50436053 }, /* DVFSRC_LEVEL_LABEL_2_3 */
+	{ 0x108, 0x40335042 }, /* DVFSRC_LEVEL_LABEL_4_5 */
+	{ 0x10c, 0x40314032 }, /* DVFSRC_LEVEL_LABEL_6_7 */
+	{ 0x110, 0x30223023 }, /* DVFSRC_LEVEL_LABEL_8_9 */
+	{ 0x114, 0x30203021 }, /* DVFSRC_LEVEL_LABEL_10_11 */
+	{ 0x118, 0x20122013 }, /* DVFSRC_LEVEL_LABEL_12_13 */
+	{ 0x11c, 0x20102011 }, /* DVFSRC_LEVEL_LABEL_14_15 */
+	{ 0xd4c, 0x10021003 }, /* DVFSRC_LEVEL_LABEL_16_17 */
+	{ 0xd50, 0x10001001 }, /* DVFSRC_LEVEL_LABEL_18_19 */
+	{ 0xd54, 0x00120013 }, /* DVFSRC_LEVEL_LABEL_20_21 */
+	{ 0xd58, 0x00100011 }, /* DVFSRC_LEVEL_LABEL_22_23 */
+	{ 0x30c, 0x00000040 }, /* DVFSRC_MD_LATENCY_IMPROVE */
+	{ 0xa64, 0x001aa1aa }, /* DVSFRC_HRT_REQ_MD_URG */
+	{ 0xa68, 0x00200802 }, /* DVFSRC_HRT_REQ_MD_BW_0 */
+	{ 0xa6c, 0x00200802 }, /* DVFSRC_HRT_REQ_MD_BW_1 */
+	{ 0xa70, 0x00200800 }, /* DVFSRC_HRT_REQ_MD_BW_2 */
+	{ 0xa74, 0x00400802 }, /* DVFSRC_HRT_REQ_MD_BW_3 */
+	{ 0xa78, 0x00601404 }, /* DVFSRC_HRT_REQ_MD_BW_4 */
+	{ 0xa7c, 0x00d02c09 }, /* DVFSRC_HRT_REQ_MD_BW_5 */
+	{ 0xa80, 0x00000012 }, /* DVFSRC_HRT_REQ_MD_BW_6 */
+	{ 0xa84, 0x00000024 }, /* DVFSRC_HRT_REQ_MD_BW_7 */
+	{ 0xaa8, 0x00000000 }, /* DVFSRC_HRT_REQ_MD_BW_8 */
+	{ 0xaac, 0x00000000 }, /* DVFSRC_HRT_REQ_MD_BW_9 */
+	{ 0xab0, 0x0006a800 }, /* DVFSRC_HRT_REQ_MD_BW_10 */
+	{ 0xa88, 0x04b12c4b }, /* DVFSRC_HRT1_REQ_MD_BW_0 */
+	{ 0xa8c, 0x04b12c4b }, /* DVFSRC_HRT1_REQ_MD_BW_1 */
+	{ 0xa90, 0x04b12c00 }, /* DVFSRC_HRT1_REQ_MD_BW_2 */
+	{ 0xa94, 0x04b12c4b }, /* DVFSRC_HRT1_REQ_MD_BW_3 */
+	{ 0xa98, 0x04b12c4b }, /* DVFSRC_HRT1_REQ_MD_BW_4 */
+	{ 0xa9c, 0x04b12c4b }, /* DVFSRC_HRT1_REQ_MD_BW_5 */
+	{ 0xaa0, 0x0000004b }, /* DVFSRC_HRT1_REQ_MD_BW_6 */
+	{ 0xaa4, 0x0000005c }, /* DVFSRC_HRT1_REQ_MD_BW_7 */
+	{ 0xab4, 0x00000000 }, /* DVFSRC_HRT1_REQ_MD_BW_8 */
+	{ 0xab8, 0x00000000 }, /* DVFSRC_HRT1_REQ_MD_BW_9 */
+	{ 0xabc, 0x0006a800 }, /* DVFSRC_HRT1_REQ_MD_BW_10 */
+	{ 0x534, 0x40444440 }, /* DVFSRC_95MD_SCEN_BW0_T */
+	{ 0x538, 0x43344444 }, /* DVFSRC_95MD_SCEN_BW1_T */
+	{ 0x53c, 0x04300444 }, /* DVFSRC_95MD_SCEN_BW2_T */
+	{ 0x540, 0x60000000 }, /* DVFSRC_95MD_SCEN_BW3_T */
+	{ 0x524, 0x20222220 }, /* DVFSRC_95MD_SCEN_BW0 */
+	{ 0x528, 0x22222222 }, /* DVFSRC_95MD_SCEN_BW1 */
+	{ 0x52c, 0x02200222 }, /* DVFSRC_95MD_SCEN_BW2 */
+	{ 0x530, 0x60000000 }, /* DVFSRC_95MD_SCEN_BW3 */
+	{ 0x544, 0x00000006 }, /* DVFSRC_95MD_SCEN_BW4 */
+	{ 0xa00, 0x00004321 }, /* DVFSRC_DDR_REQUEST */
+	{ 0xa08, 0x00000765 }, /* DVFSRC_DDR_REQUEST3 */
+	{ 0xae0, 0x76543210 }, /* DVFSRC_DDR_ADD_REQUEST */
+	{ 0xd74, 0x66543210 }, /* DVFSRC_EMI_ADD_REQUEST */
+	{ 0xac4, 0x77654321 }, /* DVFSRC_HRT_REQUEST */
+	{ 0xa10, 0x54321000 }, /* DVFSRC_DDR_REQUEST5 */
+	{ 0xa18, 0x76000000 }, /* DVFSRC_DDR_REQUEST7 */
+	{ 0x308, 0x4c2d0000 }, /* DVFSRC_EMI_MON_DEBOUNCE_TIME */
+	{ 0x078, 0x21110000 }, /* DVFSRC_VCORE_REQUEST4 */
+	{ 0xd38, 0x3a543a54 }, /* DVFSRC_HRT_HIGH_3 */
+	{ 0xac8, 0x314c2306 }, /* DVFSRC_HRT_HIGH_2 */
+	{ 0xacc, 0x1ad21700 }, /* DVFSRC_HRT_HIGH_1 */
+	{ 0xad0, 0x0e100960 }, /* DVFSRC_HRT_HIGH */
+	{ 0xd3c, 0x3a533a53 }, /* DVFSRC_HRT_LOW_3 */
+	{ 0xad4, 0x314b2305 }, /* DVFSRC_HRT_LOW_2 */
+	{ 0xad8, 0x1ad116ff }, /* DVFSRC_HRT_LOW_1 */
+	{ 0xadc, 0x0e0f095f }, /* DVFSRC_HRT_LOW */
+	{ 0x0c8, 0x00000002 }, /* DVFSRC_INT_EN */
+	{ 0x280, 0x0000407c }, /* DVFSRC_QOS_EN */
+	{ 0xd6c, 0x00000004 }, /* DVFSRC_CURRENT_FORCE */
+	{ 0x000, 0x66f8404b }, /* DVFSRC_BASIC_CONTROL */
+	{ 0x000, 0x66f8014b }, /* DVFSRC_BASIC_CONTROL */
+	{ 0xd6c, 0x00000000 }, /* DVFSRC_CURRENT_FORCE */
+};
+#endif

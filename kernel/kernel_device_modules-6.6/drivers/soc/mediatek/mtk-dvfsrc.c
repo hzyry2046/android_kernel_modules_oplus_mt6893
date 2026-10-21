@@ -4,6 +4,7 @@
  */
 #include <linux/arm-smccc.h>
 #include <linux/clk.h>
+#include <linux/cpuidle.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -16,6 +17,21 @@
 #include "mtk-scpsys.h"
 #include <linux/interrupt.h>
 #include <linux/of_irq.h>
+#include <linux/regulator/consumer.h>
+#include <linux/suspend.h>
+#include <asm/unaligned.h>
+#include "mt6893_legacy_vcore.h"
+#include "mt6893_legacy_cold.h"
+
+static bool enable_legacy_mt6893;
+module_param(enable_legacy_mt6893, bool, 0444);
+MODULE_PARM_DESC(enable_legacy_mt6893,
+	"Opt in to MT6893 legacy firmware handoff");
+static bool cold_start_legacy_mt6893;
+static bool legacy_cold_probe_scope;
+module_param(cold_start_legacy_mt6893, bool, 0444);
+MODULE_PARM_DESC(cold_start_legacy_mt6893,
+	"Explicit legacy cold start: pin highest VCORE/DDR requests, disable DDR DFS");
 
 /* Private */
 #define DVFSRC_OPP_BW_QUERY
@@ -122,6 +138,12 @@ struct mtk_dvfsrc {
 #endif
 	bool disable_wait_level;
 	u32 num_opp;
+	bool legacy_mt6893;
+	bool legacy_cold_started;
+	struct regulator *legacy_vcore;
+	unsigned int legacy_uv[5];
+	unsigned int legacy_floor;
+	struct mutex legacy_request_lock;
 };
 
 #ifdef DVFSRC_OPP_BW_QUERY
@@ -1394,12 +1416,242 @@ out:
 }
 #endif	/* DVFSRC_FORCE_OPP_SUPPORT */
 
+/* The stock firmware uses 0xc2000226, not MTK_SIP_VCOREFS_CONTROL.
+ * Cold writes require a second opt-in and preserve a permanent high vote.
+ */
+#define MT6893_VCOREFS_SMC ARM_SMCCC_CALL_VAL(ARM_SMCCC_FAST_CALL, \
+	ARM_SMCCC_SMC_64, ARM_SMCCC_OWNER_SIP, 0x226)
+static_assert(MT6893_VCOREFS_SMC == 0xc2000226);
+
+static bool mt6893_legacy_controller_ready(struct mtk_dvfsrc *dvfsrc)
+{
+	/* Exact final control word from the old MT6893 initialization table.
+	 * Reject forced/disabled/unknown handoffs rather than reprogramming them.
+	 */
+	return readl(dvfsrc->regs) == 0x66f8014b &&
+		!readl(dvfsrc->regs + 0xd6c);
+}
+
+static int mt6893_legacy_read_devinfo(u32 *dev69, u32 *dev134)
+{
+	struct device_node *np;
+	const u8 *tag;
+	u32 count;
+	int len, ret = -EINVAL;
+
+	np = of_find_node_by_path("/chosen");
+	if (!np)
+		np = of_find_node_by_path("/chosen@0");
+	if (!np)
+		return -ENODEV;
+	tag = of_get_property(np, "atag,devinfo", &len);
+	if (!tag || len < sizeof(u32))
+		goto out;
+	count = get_unaligned_le32(tag);
+	if (count <= 134 || count > 400 ||
+	    count > (len - sizeof(u32)) / sizeof(u32))
+		goto out;
+	*dev69 = get_unaligned_le32(tag + 70 * sizeof(u32));
+	*dev134 = get_unaligned_le32(tag + 135 * sizeof(u32));
+	ret = 0;
+out:
+	of_node_put(np);
+	return ret;
+}
+
+static unsigned int mt6893_cold_read(void *context, unsigned int offset)
+{
+	struct mtk_dvfsrc *dvfsrc = context;
+
+	return readl(dvfsrc->regs + offset);
+}
+
+static void mt6893_cold_write(void *context, unsigned int offset, unsigned int value)
+{
+	struct mtk_dvfsrc *dvfsrc = context;
+
+	writel(value, dvfsrc->regs + offset);
+}
+
+static int mt6893_cold_smc(void *context, unsigned int cmd,
+		unsigned int arg1, unsigned int arg2)
+{
+	struct mtk_dvfsrc *dvfsrc = context;
+	struct arm_smccc_res ares;
+	long status;
+
+	arm_smccc_smc(MT6893_VCOREFS_SMC, cmd, arg1, arg2, 0, 0, 0, 0, &ares);
+	if (!ares.a0)
+		return 0;
+	status = (long)ares.a0;
+	dev_err(dvfsrc->dev, "legacy cold SMC %u failed: %#lx\n", cmd, ares.a0);
+	return status < 0 && status >= -4095 ? (int)status : -EIO;
+}
+
+static int mt6893_cold_voltage(void *context)
+{
+	struct mtk_dvfsrc *dvfsrc = context;
+
+	return regulator_get_voltage(dvfsrc->legacy_vcore);
+}
+
+static int mt6893_cold_wait_high(void *context)
+{
+	struct mtk_dvfsrc *dvfsrc = context;
+	u32 value;
+	int ret;
+
+	ret = readl_poll_timeout(dvfsrc->regs + 0xd48, value, !value, 1, 100000);
+	if (ret)
+		return ret;
+	return readl_poll_timeout(dvfsrc->regs + 0xd44, value,
+		mt6893_legacy_current_vcore(value) == 4, 1, 100000);
+}
+
+static int mt6893_legacy_cold_initialize(struct mtk_dvfsrc *dvfsrc)
+{
+	const struct mt6893_legacy_cold_ops ops = {
+		.context = dvfsrc,
+		.read = mt6893_cold_read,
+		.write = mt6893_cold_write,
+		.smc = mt6893_cold_smc,
+		.voltage = mt6893_cold_voltage,
+		.wait_high = mt6893_cold_wait_high,
+	};
+	int ret, containment;
+
+	/* Global suspend/idle exclusion is held around synchronous driver
+	 * registration. Do not perform a deferred cold start after that scope.
+	 */
+	if (!READ_ONCE(legacy_cold_probe_scope))
+		return dev_err_probe(dvfsrc->dev, -EBUSY,
+			"cold start requires providers ready at synchronous registration\n");
+	ret = mt6893_legacy_cold_start(&ops, dvfsrc->legacy_uv,
+		readl(dvfsrc->regs + 0x610), &containment);
+	if (ret) {
+		dev_err(dvfsrc->dev,
+			"legacy cold start rejected/failed: %d; containment=%d; provider unpublished\n",
+			ret, containment);
+		return ret;
+	}
+	dev_info(dvfsrc->dev,
+		"legacy cold initialized with VCORE/DDR high votes pinned, DDR DFS disabled\n");
+	dvfsrc->legacy_cold_started = true;
+	return 0;
+}
+
+static int mt6893_legacy_cold_stop(struct mtk_dvfsrc *dvfsrc)
+{
+	const struct mt6893_legacy_cold_ops ops = {
+		.context = dvfsrc,
+		.read = mt6893_cold_read,
+		.write = mt6893_cold_write,
+		.smc = mt6893_cold_smc,
+		.voltage = mt6893_cold_voltage,
+		.wait_high = mt6893_cold_wait_high,
+	};
+
+	return mt6893_legacy_cold_quiesce(&ops, dvfsrc->legacy_uv, 1);
+}
+
+int mtk_dvfsrc_get_legacy_vcore_table(const struct device *dev,
+		unsigned int *uv, unsigned int count)
+{
+	struct mtk_dvfsrc *dvfsrc = dev_get_drvdata(dev);
+
+	if (!dvfsrc || !dvfsrc->legacy_mt6893 || !dvfsrc->dvfsrc_enable)
+		return -EOPNOTSUPP;
+	if (!uv || count != ARRAY_SIZE(dvfsrc->legacy_uv))
+		return -EINVAL;
+	memcpy(uv, dvfsrc->legacy_uv, sizeof(dvfsrc->legacy_uv));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mtk_dvfsrc_get_legacy_vcore_table);
+
+/* Unlike the existing void API, this reports failure to the regulator/APU.
+ * The handoff supports only the aggregated AP VCORE vote in SW_REQ3.
+ */
+int mtk_dvfsrc_set_legacy_vcore(const struct device *dev, unsigned int gear)
+{
+	struct mtk_dvfsrc *dvfsrc = dev_get_drvdata(dev);
+	u32 target, current_level, previous, request;
+	int ret, voltage;
+
+	if (!dvfsrc || !dvfsrc->legacy_mt6893)
+		return -EOPNOTSUPP;
+	if (gear >= ARRAY_SIZE(dvfsrc->legacy_uv))
+		return -EINVAL;
+	/* Preserve the pre-existing boot/firmware vote until its owners have
+	 * been migrated to regulator consumers. Releasing APU cannot lower it.
+	 */
+	gear = max(gear, dvfsrc->legacy_floor);
+	mutex_lock(&dvfsrc->legacy_request_lock);
+	if (!dvfsrc->dvfsrc_enable) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!mt6893_legacy_controller_ready(dvfsrc)) {
+		ret = -EIO;
+		goto out;
+	}
+	voltage = regulator_get_voltage(dvfsrc->legacy_vcore);
+	ret = mt6893_legacy_voltage_check(voltage,
+		mt6893_legacy_current_vcore(readl(dvfsrc->regs + 0xd44)),
+		dvfsrc->legacy_uv);
+	if (ret)
+		goto out;
+	previous = readl(dvfsrc->regs + 0xc) & 0x70;
+	request = readl(dvfsrc->regs + 0xc);
+	writel((request & ~0x70) | (gear << 4), dvfsrc->regs + 0xc);
+	udelay(STARTUP_TIME);
+	ret = readl_poll_timeout(dvfsrc->regs + 0xd48, target, !target,
+		STARTUP_TIME, POLL_TIMEOUT);
+	if (ret)
+		goto restore;
+	udelay(STARTUP_TIME);
+	ret = readl_poll_timeout(dvfsrc->regs + 0xd44, current_level,
+		mt6893_legacy_current_vcore(current_level) >= (int)gear,
+		STARTUP_TIME, POLL_TIMEOUT);
+	if (ret)
+		goto restore;
+	/* CURRENT_LEVEL alone is insufficient: verify the physical PMIC rail.
+	 * This consumer is read-only; it never calls regulator_set_voltage.
+	 */
+	ret = read_poll_timeout(regulator_get_voltage, voltage,
+		voltage < 0 || voltage >= dvfsrc->legacy_uv[gear],
+		STARTUP_TIME, POLL_TIMEOUT, false, dvfsrc->legacy_vcore);
+	if (voltage < 0)
+		ret = voltage;
+	else if (!ret)
+		ret = mt6893_legacy_voltage_check(voltage, gear, dvfsrc->legacy_uv);
+	if (!ret && !mt6893_legacy_controller_ready(dvfsrc))
+		ret = -EIO;
+	if (!ret)
+		goto out;
+restore:
+	/* Preserve every non-VCORE field, including firmware DDR requests. */
+	request = readl(dvfsrc->regs + 0xc);
+	writel((request & ~0x70) | previous, dvfsrc->regs + 0xc);
+	dev_err(dvfsrc->dev, "legacy VCORE gear %u failed: %d\n", gear, ret);
+out:
+	mutex_unlock(&dvfsrc->legacy_request_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_dvfsrc_set_legacy_vcore);
+
 /* Request handler */
 void mtk_dvfsrc_send_request(const struct device *dev, u32 cmd, u64 data)
 {
 	int ret = 0;
 	struct arm_smccc_res ares;
 	struct mtk_dvfsrc *dvfsrc = dev_get_drvdata(dev);
+
+	if (dvfsrc->legacy_mt6893) {
+		/* Legacy consumers must use the checked regulator API. */
+		dev_err_ratelimited(dvfsrc->dev,
+			"unchecked request %u rejected for legacy handoff\n", cmd);
+		return;
+	}
 
 	switch (cmd) {
 	case MTK_DVFSRC_CMD_BW_REQUEST:
@@ -1511,6 +1763,13 @@ int mtk_dvfsrc_query_info(const struct device *dev, u32 cmd, int *data)
 {
 	struct mtk_dvfsrc *dvfsrc = dev_get_drvdata(dev);
 
+	if (dvfsrc->legacy_mt6893) {
+		if (!data || cmd != MTK_DVFSRC_CMD_VCORE_LEVEL_QUERY)
+			return -EOPNOTSUPP;
+		*data = (readl(dvfsrc->regs + 0xc) >> 4) & 7;
+		return *data < ARRAY_SIZE(dvfsrc->legacy_uv) ? 0 : -EIO;
+	}
+
 	switch (cmd) {
 	case MTK_DVFSRC_CMD_VCORE_LEVEL_QUERY:
 		*data = dvfsrc->dvd->get_vcore_level(dvfsrc);
@@ -1611,6 +1870,84 @@ static irqreturn_t mtk_dvfsrc_irq_handler_thread(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+static int mt6893_legacy_handoff(struct platform_device *pdev,
+		struct mtk_dvfsrc *dvfsrc)
+{
+	struct arm_smccc_res ares;
+	u32 dev69, dev134;
+	int ret, voltage, gear;
+
+	arm_smccc_smc(MT6893_VCOREFS_SMC, 5, 0, 0, 0, 0, 0, 0, &ares);
+	/* The old driver tests readiness, not a zero-success initialization code.
+	 * Negative/unknown status must never be interpreted as ready.
+	 */
+	if (!mt6893_legacy_firmware_ready(ares.a0))
+		return dev_err_probe(&pdev->dev, -ENODEV,
+			"legacy SPM firmware not ready (status %#lx)\n", ares.a0);
+	arm_smccc_smc(MT6893_VCOREFS_SMC, 6, 0, 0, 0, 0, 0, 0, &ares);
+	if (ares.a0 != 0)
+		return dev_err_probe(&pdev->dev, -EOPNOTSUPP,
+			"unsupported legacy SPM firmware type %#lx\n", ares.a0);
+	if (!mt6893_legacy_controller_ready(dvfsrc) && !cold_start_legacy_mt6893)
+		return dev_err_probe(&pdev->dev, -EIO,
+			"DVFSRC needs explicitly enabled cold initialization\n");
+	ret = mt6893_legacy_read_devinfo(&dev69, &dev134);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "invalid legacy devinfo\n");
+	mt6893_legacy_vcore_table(readl(dvfsrc->regs + 0x610),
+		dev69, dev134, dvfsrc->legacy_uv);
+	/* MT6893 helio-dvfsrc-mt6893.{c,h} uses VGPU11 as system VCORE.
+	 * The PMIC output named VCORE is a different rail on this board.
+	 * Monitoring VGPU11 does not bypass DVFSRC voting or directly set it.
+	 */
+	dvfsrc->legacy_vcore = devm_regulator_get_optional(&pdev->dev, "vgpu11");
+	if (IS_ERR(dvfsrc->legacy_vcore))
+		return dev_err_probe(&pdev->dev, PTR_ERR(dvfsrc->legacy_vcore),
+			"physical VCORE monitor unavailable\n");
+	if (!mt6893_legacy_controller_ready(dvfsrc)) {
+		ret = mt6893_legacy_cold_initialize(dvfsrc);
+		if (ret)
+			return ret;
+	}
+	gear = mt6893_legacy_current_vcore(readl(dvfsrc->regs + 0xd44));
+	if (gear < 0) {
+		ret = dev_err_probe(&pdev->dev, gear, "invalid CURRENT_LEVEL\n");
+		goto stop_cold;
+	}
+	voltage = regulator_get_voltage(dvfsrc->legacy_vcore);
+	if (voltage < 0) {
+		ret = voltage;
+		goto stop_cold;
+	}
+	if (mt6893_legacy_voltage_check(voltage, gear, dvfsrc->legacy_uv) ||
+	    ((readl(dvfsrc->regs + 0xc) >> 4) & 7) >= 5) {
+		ret = dev_err_probe(&pdev->dev, -EIO,
+			"legacy VCORE state and physical voltage do not agree\n");
+		goto stop_cold;
+	}
+	dvfsrc->legacy_floor = (readl(dvfsrc->regs + 0xc) >> 4) & 7;
+	mutex_init(&dvfsrc->legacy_request_lock);
+	dvfsrc->dvfsrc_enable = true;
+	platform_set_drvdata(pdev, dvfsrc);
+	/* Publish only VCORE voting. No IRQ, ICC, devfreq or native start SMC. */
+	dvfsrc->regulator = platform_device_register_data(&pdev->dev,
+		"mtk-dvfsrc-regulator", -1, NULL, 0);
+	if (IS_ERR(dvfsrc->regulator)) {
+		ret = PTR_ERR(dvfsrc->regulator);
+		platform_set_drvdata(pdev, NULL);
+		goto stop_cold;
+	}
+	dev_info(&pdev->dev, "legacy VCORE handoff: %u %u %u %u %u uV\n",
+		dvfsrc->legacy_uv[0], dvfsrc->legacy_uv[1], dvfsrc->legacy_uv[2],
+		dvfsrc->legacy_uv[3], dvfsrc->legacy_uv[4]);
+	return 0;
+stop_cold:
+	if (dvfsrc->legacy_cold_started)
+		dev_err(dvfsrc->dev, "post-cold probe failure containment=%d\n",
+			mt6893_legacy_cold_stop(dvfsrc));
+	return ret;
+}
+
 static int mtk_dvfsrc_probe(struct platform_device *pdev)
 {
 	struct arm_smccc_res ares;
@@ -1623,18 +1960,28 @@ static int mtk_dvfsrc_probe(struct platform_device *pdev)
 	u32 dvfsrc_vmode = 0;
 	struct device_node *np = pdev->dev.of_node;
 #endif
+	bool legacy = of_device_is_compatible(pdev->dev.of_node, "mediatek,dvfsrc");
+
+	/* Fail before mapping, SMC or writes on generic legacy compatibles. */
+	if (legacy && (!enable_legacy_mt6893 ||
+	    !of_machine_is_compatible("mediatek,MT6893")))
+		return -ENODEV;
+
 	dvfsrc = devm_kzalloc(&pdev->dev, sizeof(*dvfsrc), GFP_KERNEL);
 	if (!dvfsrc)
 		return -ENOMEM;
 
 	dvfsrc->dvd = of_device_get_match_data(&pdev->dev);
-	if (dvfsrc->dvd == NULL) {
+	if (dvfsrc->dvd == NULL && !legacy) {
 		ret = -EINVAL;
 		goto err;
 	}
 	dvfsrc->dev = &pdev->dev;
+	dvfsrc->legacy_mt6893 = legacy;
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (legacy && (!res || res->start != 0x10012000 || resource_size(res) != 0x1000))
+		return -EINVAL;
 	dvfsrc->regs = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(dvfsrc->regs))
 		return PTR_ERR(dvfsrc->regs);
@@ -1644,6 +1991,8 @@ static int mtk_dvfsrc_probe(struct platform_device *pdev)
 #ifdef DVFSRC_FORCE_OPP_SUPPORT
 	spin_lock_init(&dvfsrc->force_lock);
 #endif
+	if (legacy)
+		return mt6893_legacy_handoff(pdev, dvfsrc);
 
 #ifdef DVFSRC_PROPERTY_ENABLE
 	of_property_read_u32(np, "dvfsrc-bringup", &is_bringup);
@@ -2313,7 +2662,20 @@ static const struct dvfsrc_soc_data mt6899_data = {
 static int mtk_dvfsrc_remove(struct platform_device *pdev)
 {
 	struct mtk_dvfsrc *dvfsrc = platform_get_drvdata(pdev);
+	int ret;
 
+	if (dvfsrc->legacy_mt6893) {
+		mutex_lock(&dvfsrc->legacy_request_lock);
+		dvfsrc->dvfsrc_enable = false;
+		if (dvfsrc->legacy_cold_started) {
+			ret = mt6893_legacy_cold_stop(dvfsrc);
+			if (ret)
+				dev_err(dvfsrc->dev, "cold removal containment failed: %d\n", ret);
+		}
+		mutex_unlock(&dvfsrc->legacy_request_lock);
+		platform_device_unregister(dvfsrc->regulator);
+		return 0;
+	}
 	platform_device_unregister(dvfsrc->regulator);
 	platform_device_unregister(dvfsrc->icc);
 
@@ -2322,6 +2684,8 @@ static int mtk_dvfsrc_remove(struct platform_device *pdev)
 
 static const struct of_device_id mtk_dvfsrc_of_match[] = {
 	{
+		.compatible = "mediatek,dvfsrc", /* opt-in MT6893 handoff only */
+	}, {
 		.compatible = "mediatek,mt8183-dvfsrc",
 		.data = &mt8183_data,
 	}, {
@@ -2409,7 +2773,25 @@ static struct platform_driver mtk_dvfsrc_driver = {
 
 static int __init mtk_dvfsrc_init(void)
 {
-	return platform_driver_register(&mtk_dvfsrc_driver);
+	unsigned int sleep_flags;
+	int ret;
+
+	if (!cold_start_legacy_mt6893 || !enable_legacy_mt6893 ||
+	    !of_machine_is_compatible("mediatek,MT6893"))
+		return platform_driver_register(&mtk_dvfsrc_driver);
+	/* Lock order: system sleep -> cpuidle -> platform probe/device locks.
+	 * Pause wakes existing idle entries and synchronizes them before SMCs.
+	 */
+	sleep_flags = lock_system_sleep();
+	cpuidle_pause_and_lock();
+	mtk_dvfsrc_driver.driver.probe_type = PROBE_FORCE_SYNCHRONOUS;
+	mtk_dvfsrc_driver.driver.suppress_bind_attrs = true;
+	WRITE_ONCE(legacy_cold_probe_scope, true);
+	ret = platform_driver_register(&mtk_dvfsrc_driver);
+	WRITE_ONCE(legacy_cold_probe_scope, false);
+	cpuidle_resume_and_unlock();
+	unlock_system_sleep(sleep_flags);
+	return ret;
 }
 
 #if IS_BUILTIN(CONFIG_MTK_DVFSRC)
@@ -2420,6 +2802,17 @@ subsys_initcall(mtk_dvfsrc_init);
 
 static void __exit mtk_dvfsrc_exit(void)
 {
+	unsigned int sleep_flags;
+
+	if (cold_start_legacy_mt6893 && enable_legacy_mt6893 &&
+	    of_machine_is_compatible("mediatek,MT6893")) {
+		sleep_flags = lock_system_sleep();
+		cpuidle_pause_and_lock();
+		platform_driver_unregister(&mtk_dvfsrc_driver);
+		cpuidle_resume_and_unlock();
+		unlock_system_sleep(sleep_flags);
+		return;
+	}
 	platform_driver_unregister(&mtk_dvfsrc_driver);
 }
 module_exit(mtk_dvfsrc_exit);

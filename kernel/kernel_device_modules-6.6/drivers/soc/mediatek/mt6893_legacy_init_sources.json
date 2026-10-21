@@ -1,0 +1,14 @@
+{
+  "reference_head": "e1db7235b89ae6128aebf4571d64e368330e97d8",
+  "files": {
+    "android_kernel_oplus_mt6893/drivers/devfreq/helio-dvfsrc-v3/helio-dvfsrc-mt6893.c": "37481ef994744b032ea63f2bdf6e2ce79c6d2bc07c9d165e1f6614d5aec9cfb2",
+    "android_kernel_oplus_mt6893/drivers/devfreq/helio-dvfsrc-v3/mtk_dvfsrc_reg_v2.h": "5ff2c9a67018d22deb9713c6edba51c4a15fd024d1388c9d28e496ee9a5d3e95",
+    "android_kernel_oplus_mt6893/drivers/devfreq/helio-dvfsrc-v3/helio-dvfsrc-smc-control.c": "1266a1b549da41382fee805880c78249caa25ecdfb6bb50b3dd5f8586fbd0c38",
+    "android_kernel_oplus_mt6893/drivers/devfreq/helio-dvfsrc-v3/helio-dvfsrc-mt6893.h": "c518d53bec5f8e9ce9f9f5a10e6292c69378378b8154873b8a75d57063415043"
+  },
+  "table_entries": 80,
+  "runtime_overrides": {
+    "INT_EN": "0: no IRQ handler is registered in experimental legacy mode",
+    "CURRENT_FORCE": "1 instead of 4: hold combined OPP0, highest VCORE/DDR, during initialization"
+  }
+}
