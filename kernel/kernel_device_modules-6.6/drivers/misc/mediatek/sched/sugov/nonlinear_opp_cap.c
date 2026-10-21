@@ -1815,10 +1815,15 @@ int init_pd_topology(void)
 	pd_count++;
 
 	cpu2cluster_id = kcalloc(nr_cpu, sizeof(int), GFP_KERNEL);
+	if (!cpu2cluster_id)
+		return -ENOMEM;
 
 	pd_cpumask = kcalloc(pd_count, sizeof(struct cpumask), GFP_KERNEL);
-	if (!pd_cpumask)
+	if (!pd_cpumask) {
+		kfree(cpu2cluster_id);
+		cpu2cluster_id = NULL;
 		return -ENOMEM;
+	}
 
 	for (i = 0; i < pd_count; i++) {
 		cpumask_clear(&pd_cpumask[i]);
@@ -1871,8 +1876,8 @@ int init_dpt_io(void)
 	/* init dpt io*/
 	dev_node = of_find_node_by_name(NULL, "dpt-info");
 	if (!dev_node) {
-		pr_info("failed to find node dpt-info @ %s\n", __func__);
-		return -ENODEV;
+		/* Legacy platforms do not provide the optional DPT interface. */
+		return -ENOENT;
 	}
 
 	pdev_temp = of_find_device_by_node(dev_node);
@@ -2007,6 +2012,9 @@ static int init_sram_mapping(void)
 static int init_feature_status(void)
 {
 #if IS_ENABLED(CONFIG_MTK_GEARLESS_SUPPORT)
+	if (!csram_res)
+		return -ENODEV;
+
 	sram_base_addr_freq_scaling =
 		ioremap(csram_res->start + REG_FREQ_SCALING, LUT_ROW_SIZE);
 	if (!sram_base_addr_freq_scaling) {
@@ -2057,8 +2065,12 @@ int init_opp_cap_info(struct proc_dir_entry *dir)
 	init_sys_max_cap_cpu();
 
 	ret = init_dpt_io();
-	if (ret)
+	if (ret == -ENOENT) {
+		pr_info("DPT unavailable on legacy platform; skipping DPT IO\n");
+		ret = 0;
+	} else if (ret) {
 		pr_info("init_dpt_io fail, return=%d\n", ret);
+	}
 
 	if (legacy_api_support_get()) {
 		for (int i = 0; i < MAX_NR_CPUS; i++) {
@@ -2096,6 +2108,9 @@ int init_opp_cap_info(struct proc_dir_entry *dir)
 	register_fpsgo_sugov_hooks();
 
 	init_uclamp_involve();
+
+	pr_info("OPP topology initialized: %d domains, legacy capacity=%d, DPT=%d\n",
+		pd_count, legacy_pd_enable, !!dpt_sram_base);
 
 	return ret;
 }
