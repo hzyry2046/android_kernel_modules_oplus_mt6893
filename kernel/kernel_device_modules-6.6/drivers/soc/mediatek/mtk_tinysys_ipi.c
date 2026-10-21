@@ -16,6 +16,7 @@
 #include <linux/soc/mediatek/mtk-mbox.h>
 #include <linux/soc/mediatek/mtk_tinysys_ipi.h>
 #include <linux/freezer.h>
+#include <linux/interrupt.h>
 
 #define MS_TO_NS(x) ((x)*1000000)
 #define ts_before(ts) (cpu_clock(0) < (ts))
@@ -317,6 +318,168 @@ int mtk_ipi_unregister(struct mtk_ipi_device *ipidev, int ipi_id)
 }
 EXPORT_SYMBOL(mtk_ipi_unregister);
 
+/* Quarantine uncertain exchanges across client unload/reload. Firmware ACKs
+ * have no request ID; a late response must never satisfy a new request.
+ * Only a system reboot resets this experimental API's quarantine.
+ */
+struct mtk_ipi_checked_channel {
+    struct list_head list;
+    struct mtk_ipi_device *device;
+    int id;
+    void *buffer;
+    bool poisoned;
+};
+static LIST_HEAD(checked_channels);
+static DEFINE_MUTEX(checked_channels_lock);
+static struct mtk_ipi_checked_channel *checked_channel(
+    struct mtk_ipi_device *device, int id)
+{
+    struct mtk_ipi_checked_channel *entry;
+    list_for_each_entry(entry, &checked_channels, list)
+        if (entry->device == device && entry->id == id)
+            return entry;
+    return NULL;
+}
+
+static int mtk_ipi_checked_pin(struct mtk_ipi_device *ipidev, int ipi_id,
+		struct mtk_mbox_pin_recv **pin, int *irq)
+{
+	if (!ipidev || !ipidev->ipi_inited || !ipidev->table ||
+	    !ipidev->mrpdev || !ipidev->mbdev)
+		return -ENODEV;
+	if (ipi_id < 0 || ipi_id >= ipidev->mrpdev->rpdev.src)
+		return -EINVAL;
+	*pin = ipidev->table[ipi_id].pin_recv;
+	if (!*pin || (*pin)->mbox >= ipidev->mbdev->count ||
+	    !ipidev->mbdev->info_table)
+		return -ENODEV;
+	*irq = ipidev->mbdev->info_table[(*pin)->mbox].irq_num;
+	return *irq > 0 ? 0 : -ENODEV;
+}
+
+int mtk_ipi_register_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		mbox_pin_cb_t cb, void *prdata, void *msg, size_t bytes)
+{
+	struct mtk_mbox_pin_recv *pin;
+	struct mtk_ipi_checked_channel *entry;
+	int irq, ret;
+
+	if (!msg || in_interrupt() || irqs_disabled() || preempt_count())
+		return -EINVAL;
+	ret = mtk_ipi_checked_pin(ipidev, ipi_id, &pin, &irq);
+	if (ret)
+		return ret;
+	if (bytes < (size_t)pin->msg_size * MBOX_SLOT_SIZE || !pin->msg_size)
+		return -EMSGSIZE;
+	mutex_lock(&checked_channels_lock);
+	entry = checked_channel(ipidev, ipi_id);
+	if (entry) {
+		ret = entry->poisoned ? -EPIPE : -EBUSY;
+		goto checked_out;
+	}
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		ret = -ENOMEM;
+		goto checked_out;
+	}
+	mutex_lock(&ipidev->mutex_ipi_reg);
+	if (pin->pin_buf) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* The mailbox ISR doesn't use mutex_ipi_reg. Quiesce it before
+	 * publishing callback/data/buffer together, including pending IRQs.
+	 */
+	disable_irq(irq);
+	reinit_completion(&pin->notify);
+	pin->mbox_pin_cb = cb;
+	pin->prdata = prdata;
+	pin->pin_buf = msg;
+	enable_irq(irq);
+	entry->device = ipidev;
+	entry->id = ipi_id;
+	entry->buffer = msg;
+	list_add_tail(&entry->list, &checked_channels);
+out:
+	mutex_unlock(&ipidev->mutex_ipi_reg);
+	if (ret)
+		kfree(entry);
+checked_out:
+	mutex_unlock(&checked_channels_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_ipi_register_checked);
+
+int mtk_ipi_unregister_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *msg)
+{
+	struct mtk_mbox_pin_recv *pin;
+	struct mtk_ipi_checked_channel *entry;
+	unsigned long flags;
+	int irq, ret;
+
+	if (!msg || in_interrupt() || irqs_disabled() || preempt_count())
+		return -EINVAL;
+	ret = mtk_ipi_checked_pin(ipidev, ipi_id, &pin, &irq);
+	if (ret)
+		return ret;
+	mutex_lock(&checked_channels_lock);
+	entry = checked_channel(ipidev, ipi_id);
+	if (!entry || entry->buffer != msg) {
+		ret = -EPERM;
+		goto checked_out;
+	}
+	mutex_lock(&ipidev->mutex_ipi_reg);
+	if (pin->pin_buf != msg) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (atomic_read(&ipidev->table[ipi_id].holder)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	disable_irq(irq);
+	pin->mbox_pin_cb = NULL;
+	pin->prdata = NULL;
+	pin->pin_buf = NULL;
+	reinit_completion(&pin->notify);
+	spin_lock_irqsave(&ipidev->lock_monitor, flags);
+	ipidev->table[ipi_id].ipi_stage = UNUSED;
+	ipidev->table[ipi_id].ipi_seqno = 0;
+	spin_unlock_irqrestore(&ipidev->lock_monitor, flags);
+	enable_irq(irq);
+	entry->buffer = NULL;
+	if (!entry->poisoned) {
+		list_del(&entry->list);
+		kfree(entry);
+	}
+out:
+	mutex_unlock(&ipidev->mutex_ipi_reg);
+checked_out:
+	mutex_unlock(&checked_channels_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_ipi_unregister_checked);
+
+int mtk_ipi_quarantine_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *msg)
+{
+	struct mtk_ipi_checked_channel *entry;
+	int ret = 0;
+
+	if (!ipidev || !msg || in_interrupt() || irqs_disabled() || preempt_count())
+		return -EINVAL;
+	mutex_lock(&checked_channels_lock);
+	entry = checked_channel(ipidev, ipi_id);
+	if (!entry || entry->buffer != msg)
+		ret = -EPERM;
+	else
+		entry->poisoned = true;
+	mutex_unlock(&checked_channels_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_ipi_quarantine_checked);
+
 int mtk_ipi_send(struct mtk_ipi_device *ipidev, int ipi_id,
 		int opt, void *data, int len, int timeout)
 {
@@ -436,8 +599,8 @@ int mtk_ipi_recv(struct mtk_ipi_device *ipidev, int ipi_id)
 }
 EXPORT_SYMBOL(mtk_ipi_recv);
 
-int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev, int ipi_id,
-		int opt, void *data, int len, unsigned long timeout)
+static int mtk_ipi_send_compl_impl(struct mtk_ipi_device *ipidev, int ipi_id,
+		int opt, void *data, int len, unsigned long timeout, bool fatal_timeout)
 {
 	struct mtk_mbox_pin_send *pin_s;
 	struct mtk_mbox_pin_recv *pin_r;
@@ -549,7 +712,7 @@ int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev, int ipi_id,
 	} else {
 		mtk_mbox_dump_recv_pin(ipidev->mbdev, pin_r);
 		ipi_timeout_dump(ipidev, ipi_id);
-		if (ipidev->timeout_handler)
+		if (fatal_timeout && ipidev->timeout_handler)
 			ipidev->timeout_handler(ipi_id);
 		ret = IPI_COMPL_TIMEOUT;
 	}
@@ -567,7 +730,75 @@ int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev, int ipi_id,
 
 	return ret;
 }
+
+int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev, int ipi_id,
+		int opt, void *data, int len, unsigned long timeout)
+{
+	return mtk_ipi_send_compl_impl(ipidev, ipi_id, opt, data, len,
+			timeout, true);
+}
 EXPORT_SYMBOL(mtk_ipi_send_compl);
+
+int mtk_ipi_send_compl_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *data, int len, unsigned long timeout, void *msg)
+{
+	struct mtk_mbox_pin_recv *pin;
+	struct mtk_ipi_checked_channel *entry;
+	struct mtk_mbox_pin_send *send;
+	int irq, ret;
+
+	if (!data || !msg || len <= 0 || !timeout || timeout > 2000 ||
+	    in_interrupt() || irqs_disabled() || preempt_count())
+		return -EINVAL;
+	ret = mtk_ipi_checked_pin(ipidev, ipi_id, &pin, &irq);
+	if (ret)
+		return ret;
+	send = ipidev->table[ipi_id].pin_send;
+	if (!send || !ipidev->table[ipi_id].ept ||
+	    !ipidev->table[ipi_id].rpchan || pin->recv_opt != MBOX_RECV_ACK)
+		return -ENODEV;
+	if (len > send->msg_size)
+		return -EMSGSIZE;
+	mutex_lock(&checked_channels_lock);
+	entry = checked_channel(ipidev, ipi_id);
+	if (!entry || entry->buffer != msg) {
+		ret = -EPERM;
+		goto checked_out;
+	}
+	if (entry->poisoned) {
+		ret = -EPIPE;
+		goto checked_out;
+	}
+	mutex_lock(&ipidev->mutex_ipi_reg);
+	if (pin->pin_buf != msg) {
+		ret = -EPERM;
+		goto out;
+	}
+	if (atomic_read(&ipidev->table[ipi_id].holder)) {
+		ret = -EBUSY;
+		goto out;
+	}
+	/* Fresh completion for this exclusively owned exchange. Do not retry
+	 * after a timeout: clearing a completion cannot identify late ACKs.
+	 */
+	disable_irq(irq);
+	reinit_completion(&pin->notify);
+	enable_irq(irq);
+	ret = mtk_ipi_send_compl_impl(ipidev, ipi_id, IPI_SEND_WAIT,
+			data, len, timeout, false);
+	if (ret)
+		entry->poisoned = true;
+	if (ret == IPI_COMPL_TIMEOUT || ret == IPI_PIN_BUSY)
+		ret = -ETIMEDOUT;
+	else if (ret)
+		ret = -EIO;
+out:
+	mutex_unlock(&ipidev->mutex_ipi_reg);
+checked_out:
+	mutex_unlock(&checked_channels_lock);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(mtk_ipi_send_compl_checked);
 
 int mtk_ipi_recv_reply(struct mtk_ipi_device *ipidev, int ipi_id,
 		void *reply_data, int len)
@@ -663,6 +894,16 @@ static void ipi_isr_cb(struct mtk_mbox_pin_recv *pin, void *priv)
 	}
 
 }
+
+static void __exit mtk_ipi_checked_exit(void)
+{
+    struct mtk_ipi_checked_channel *entry, *next;
+    list_for_each_entry_safe(entry, next, &checked_channels, list) {
+        list_del(&entry->list);
+        kfree(entry);
+    }
+}
+module_exit(mtk_ipi_checked_exit);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("MediaTek Tinysys IPI driver");

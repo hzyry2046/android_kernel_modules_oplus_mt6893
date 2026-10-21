@@ -557,9 +557,11 @@ static irqreturn_t mtk_mbox_isr(int irq, void *dev_id)
 			irq_temp = irq_temp | (0x1 << pin_recv->pin_index);
 			/*check user buf*/
 			if (!pin_recv->pin_buf) {
-				pr_err("[MBOX Error]null ptr dev=%s ipi_id=%d",
-					mbdev->name, pin_recv->chan_id);
-				BUG_ON(1);
+				/* A late firmware message after client unregister has
+				 * no destination. Clear its IRQ without dereferencing
+				 * a released buffer or invoking a client callback.
+				 */
+				continue;
 			}
 			if (minfo->opt == MBOX_OPT_QUEUE_DIR ||
 			 minfo->opt == MBOX_OPT_QUEUE_SMEM) {
@@ -667,6 +669,8 @@ skip:
 	for (i = 0; i < mbdev->recv_count; i++) {
 		pin_recv = &(mbdev->pin_recv_table[i]);
 		if (pin_recv->mbox != mbox)
+			continue;
+		if (!pin_recv->pin_buf)
 			continue;
 		/*recv irq trigger*/
 		if (((0x1 << pin_recv->pin_index) & irq_status) > 0x0) {

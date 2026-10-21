@@ -130,6 +130,19 @@ int mtk_ipi_register(struct mtk_ipi_device *ipidev, int ipi_id,
 		mbox_pin_cb_t cb, void *prdata, void *msg);
 int mtk_ipi_unregister(struct mtk_ipi_device *ipidev, int ipi_id);
 
+/* Process-context ownership API. Client must serialize its calls and stop
+ * receive workers before unregister. A timed-out exchange must not be retried:
+ * the firmware protocol has no transaction ID to reject a late acknowledgement.
+ */
+int mtk_ipi_register_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		mbox_pin_cb_t cb, void *prdata, void *msg, size_t bytes);
+int mtk_ipi_unregister_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *msg);
+int mtk_ipi_send_compl_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *data, int len, unsigned long timeout, void *msg);
+int mtk_ipi_quarantine_checked(struct mtk_ipi_device *ipidev, int ipi_id,
+		void *msg);
+
 int mtk_ipi_send(struct mtk_ipi_device *ipidev, int ipi_id,
 		int opt, void *data, int len, int timeout);
 int mtk_ipi_send_compl(struct mtk_ipi_device *ipidev, int ipi_id,
