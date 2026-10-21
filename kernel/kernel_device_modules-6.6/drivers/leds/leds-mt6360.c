@@ -47,6 +47,7 @@ enum {
 #define MT6360_PMU_FLED2_STRB_CTRL2	0x378
 #define MT6360_PMU_FLED2_TOR_CTRL	0x379
 #define MT6360_PMU_FLED_EN		0x37E
+#define MT6360_PMU_FLED_VMIDTRK_CTRL1	0x7A
 #define MT6360_PMU_RGB_EN		0x380
 #define MT6360_PMU_RGB1_ISNK		0x381
 #define MT6360_PMU_RGB2_ISNK		0x382
@@ -161,6 +162,7 @@ enum {
 
 struct mt6360_led_platform_data {
 	u32 rgbon_sync;
+	u32 fled_vmid_track;
 	u32 fled1_ultraistrb;
 	u32 fled2_ultraistrb;
 };
@@ -236,6 +238,7 @@ struct mt6360_led_info {
 
 static const struct mt6360_led_platform_data def_platform_data = {
 	.rgbon_sync = 0,
+	.fled_vmid_track = 0,
 	.fled1_ultraistrb = 0,
 	.fled2_ultraistrb = 0,
 };
@@ -1046,6 +1049,108 @@ out_iled_dt:
 	return ret;
 }
 
+/* Flat "mediatek,mt6360_pmu_fled" layout (4.19 DT): the node itself
+ * carries fled<N>_tor_cur / fled<N>_strb_cur in uA and a shared
+ * fled_strb_tout in ms, with no "fled" child container.  Per-channel
+ * type/ct/part/decouple live in the flashlight framework's own
+ * flashlights_mt6360 channel map node, as on 4.19.
+ */
+static int mt6360_fled_parse_legacy_dt(struct device *dev,
+				       struct mt6360_led_info *mli)
+{
+	struct device_node *np = dev->of_node;
+	struct mt6360_fled_classdev *mtfled_cdev;
+	struct led_classdev *led_cdev;
+	struct led_flash_setting *fs;
+	u32 val, tout = MT6360_STRBTIMEOUT_MIN / 1000;
+	int i;
+	char prop[20];
+#if IS_ENABLED(CONFIG_MTK_FLASHLIGHT)
+	struct device_node *flmap, *cnp;
+	u32 decouple = 0;
+
+	flmap = of_find_compatible_node(NULL, NULL,
+					"mediatek,flashlights_mt6360");
+	if (flmap)
+		of_property_read_u32(flmap, "decouple", &decouple);
+#endif
+
+	if (of_property_read_u32(np, "fled1_tor_cur", &val) &&
+	    of_property_read_u32(np, "fled2_tor_cur", &val))
+		goto out_no_fled;
+	of_property_read_u32(np, "fled_strb_tout", &tout);
+	for (i = 0; i < MT6360_FLED_MAX; i++) {
+		snprintf(prop, sizeof(prop), "fled%d_tor_cur", i + 1);
+		if (of_property_read_u32(np, prop, &val))
+			continue;
+		mtfled_cdev = mli->mtfled_cdev + i;
+		led_cdev = &mtfled_cdev->fl_cdev.led_cdev;
+		if (val < MT6360_TORCHCUR_MIN)
+			val = MT6360_TORCHCUR_MIN;
+		val = (val - MT6360_TORCHCUR_MIN) / MT6360_TORCHCUR_STEP + 1;
+		led_cdev->max_brightness =
+			min(led_cdev->max_brightness, val);
+
+		snprintf(prop, sizeof(prop), "fled%d_strb_cur", i + 1);
+		if (of_property_read_u32(np, prop, &val))
+			val = MT6360_STROBECUR_MIN;
+		if (val < MT6360_STROBECUR_MIN)
+			val = MT6360_STROBECUR_MIN;
+		fs = &mtfled_cdev->fl_cdev.brightness;
+		fs->val = fs->max = min(fs->max, val);
+
+		fs = &mtfled_cdev->fl_cdev.timeout;
+		fs->val = fs->max = min(fs->max, tout * 1000);
+		mtfled_cdev->np = np;
+
+#if IS_ENABLED(CONFIG_MTK_FLASHLIGHT)
+		mtfled_cdev->dev_id.channel = i;
+		mtfled_cdev->dev_id.decouple = decouple;
+		snprintf(mtfled_cdev->dev_id.name, FLASHLIGHT_NAME_SIZE,
+			 "flashlights-mt6360");
+		if (flmap) {
+			int j = 0;
+
+			for_each_child_of_node(flmap, cnp) {
+				if (j++ != i)
+					continue;
+				of_property_read_u32(cnp, "type",
+						     &mtfled_cdev->dev_id.type);
+				of_property_read_u32(cnp, "ct",
+						     &mtfled_cdev->dev_id.ct);
+				of_property_read_u32(cnp, "part",
+						     &mtfled_cdev->dev_id.part);
+				of_node_put(cnp);
+				break;
+			}
+		}
+		mt6360_flash_class[i] = &mtfled_cdev->fl_cdev;
+		dev_info(dev,
+			 "Parse dt (type,ct,part,name,channel,decouple)=(%d,%d,%d,%s,%d,%d).\n",
+			 mtfled_cdev->dev_id.type, mtfled_cdev->dev_id.ct,
+			 mtfled_cdev->dev_id.part, mtfled_cdev->dev_id.name,
+			 mtfled_cdev->dev_id.channel,
+			 mtfled_cdev->dev_id.decouple);
+		if (flashlight_dev_register_by_device_id(
+				&mtfled_cdev->dev_id, &mt6360_ops)) {
+			while (--i >= 0) {
+				if (mli->mtfled_cdev[i].np)
+					flashlight_dev_unregister_by_device_id(
+						&mli->mtfled_cdev[i].dev_id);
+				mt6360_flash_class[i] = NULL;
+			}
+			of_node_put(flmap);
+			return -EFAULT;
+		}
+#endif
+	}
+out_no_fled:
+#if IS_ENABLED(CONFIG_MTK_FLASHLIGHT)
+	of_node_put(flmap);
+#endif
+	return 0;
+}
+
 static int mt6360_fled_parse_dt(struct device *dev,
 				struct mt6360_led_info *mli)
 {
@@ -1060,7 +1165,7 @@ static int mt6360_fled_parse_dt(struct device *dev,
 		return 0;
 	fled_np = of_find_node_by_name(dev->of_node, "fled");
 	if (!fled_np)
-		return 0;
+		return mt6360_fled_parse_legacy_dt(dev, mli);
 	for_each_available_child_of_node(fled_np, child) {
 		u32 reg = 0;
 
@@ -1134,6 +1239,8 @@ out_fled_dt:
 }
 
 static const struct mt6360_pdata_prop mt6360_pdata_props[] = {
+	MT6360_PDATA_VALPROP(fled_vmid_track, struct mt6360_led_platform_data,
+			     MT6360_PMU_FLED_VMIDTRK_CTRL1, 6, 0x40, NULL, 0),
 	MT6360_PDATA_VALPROP(fled1_ultraistrb, struct mt6360_led_platform_data,
 			     MT6360_PMU_FLED1_STRB_CTRL2, 7, 0x80, NULL, 0),
 	MT6360_PDATA_VALPROP(fled2_ultraistrb, struct mt6360_led_platform_data,
@@ -1156,6 +1263,7 @@ static int mt6360_led_apply_pdata(struct mt6360_led_info *mli,
 
 static const struct mt6360_val_prop mt6360_val_props[] = {
 	MT6360_DT_VALPROP(rgbon_sync, struct mt6360_led_platform_data),
+	MT6360_DT_VALPROP(fled_vmid_track, struct mt6360_led_platform_data),
 };
 
 static int mt6360_led_parse_dt_data(struct device *dev,
@@ -1214,21 +1322,28 @@ static int mt6360_led_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	memcpy(mli->mtled_cdev, def_led_classdev, sizeof(def_led_classdev));
-	ret = mt6360_iled_parse_dt(&pdev->dev, mli);
-	if (ret < 0) {
-		dev_err(&pdev->dev, "Fail to parse iled dt\n");
-		return ret;
-	}
-	for (i = 0; i < MT6360_LED_MAX; i++) {
-		mtled_cdev = mli->mtled_cdev + i;
-		ret = devm_led_classdev_register(&pdev->dev,
-						 &(mtled_cdev->cdev));
+	/* The flat mt6360_pmu_fled node covers only the flash channels;
+	 * isinks have a sibling rgbled node/driver there. */
+	if (!of_device_is_compatible(pdev->dev.of_node,
+				     "mediatek,mt6360_pmu_fled")) {
+		memcpy(mli->mtled_cdev, def_led_classdev,
+		       sizeof(def_led_classdev));
+		ret = mt6360_iled_parse_dt(&pdev->dev, mli);
 		if (ret < 0) {
-			dev_err(&pdev->dev, "Failed to register led[%d]\n", i);
+			dev_err(&pdev->dev, "Fail to parse iled dt\n");
 			return ret;
 		}
-		mtled_cdev->cdev.dev->of_node = mtled_cdev->np;
+		for (i = 0; i < MT6360_LED_MAX; i++) {
+			mtled_cdev = mli->mtled_cdev + i;
+			ret = devm_led_classdev_register(&pdev->dev,
+							 &(mtled_cdev->cdev));
+			if (ret < 0) {
+				dev_err(&pdev->dev,
+					"Failed to register led[%d]\n", i);
+				return ret;
+			}
+			mtled_cdev->cdev.dev->of_node = mtled_cdev->np;
+		}
 	}
 
 	memcpy(mli->mtfled_cdev, def_fled_classdev, sizeof(def_fled_classdev));
@@ -1306,12 +1421,14 @@ static int mt6360_led_remove(struct platform_device *pdev)
 
 static const struct of_device_id __maybe_unused mt6360_led_of_id[] = {
 	{ .compatible = "mediatek,mt6360-led", },
+	{ .compatible = "mediatek,mt6360_pmu_fled", },
 	{},
 };
 MODULE_DEVICE_TABLE(of, mt6360_led_of_id);
 
 static const struct platform_device_id mt6360_led_id[] = {
 	{ "mt6360-led", 0 },
+	{ "mt6360_pmu_fled", 0 },
 	{},
 };
 MODULE_DEVICE_TABLE(platform, mt6360_led_id);
