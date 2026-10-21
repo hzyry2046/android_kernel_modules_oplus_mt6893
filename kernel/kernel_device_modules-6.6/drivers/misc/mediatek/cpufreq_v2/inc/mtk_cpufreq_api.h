@@ -50,6 +50,8 @@ extern int mt_cpufreq_update_legacy_volt(unsigned int cluster_id,
 			unsigned int *volt_tbl, int nr_volt_tbl);
 extern int mt_cpufreq_update_volt(unsigned int cluster_id,
 	unsigned int *volt_tbl, int nr_volt_tbl);
+/* Sleepable, one-time EM refresh after initial EEM voltage calibration. */
+extern int mt_cpufreq_refresh_energy_model(void);
 extern unsigned int mt_cpufreq_get_cur_volt(unsigned int cluster_id);
 extern unsigned int mt_cpufreq_get_cur_freq(unsigned int cluster_id);
 

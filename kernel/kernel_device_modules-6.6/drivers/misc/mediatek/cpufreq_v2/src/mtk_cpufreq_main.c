@@ -1173,7 +1173,9 @@ static int _mt_cpufreq_target(struct cpufreq_policy *policy,
 	return 0;
 }
 
-static int mtk_cpufreq_get_cpu_power( struct device *dev, unsigned long *uW, unsigned long *KHz)
+/* Caller holds cpufreq_mutex to keep the private voltage table consistent. */
+static int mtk_cpufreq_get_cpu_power_locked(struct device *dev,
+		unsigned long *uW, unsigned long *KHz)
 {
 	int j;
 	int ret,cpu;
@@ -1194,14 +1196,15 @@ static int mtk_cpufreq_get_cpu_power( struct device *dev, unsigned long *uW, uns
 		return -EINVAL;
 
 	ret = of_property_read_u32(np, "dynamic-power-coefficient", &cap);
-	if (ret)
+	if (ret) {
+		of_node_put(np);
 		return -EINVAL;
+	}
 
 	cpu = of_cpu_node_to_id(np);
+	of_node_put(np);
 	if (cpu < 0)
 		return -ENODEV;
-
-	of_node_put(np);
 
 	lv = _mt_cpufreq_get_cpu_level();
 
@@ -1209,11 +1212,14 @@ static int mtk_cpufreq_get_cpu_power( struct device *dev, unsigned long *uW, uns
 	opp_tbl_info = &opp_tbls[cluster][lv];
 
 	for (j = (opp_tbl_info->size-1); j >= 0; j--) {
-		if (opp_tbl_info->opp_tbl[j].cpufreq_khz > *KHz) {
+		if (opp_tbl_info->opp_tbl[j].cpufreq_khz >= *KHz) {
 			new_opp_idx = j;
 			break;
 		}
 	}
+	if (new_opp_idx < 0)
+		return -ERANGE;
+
 	*KHz = opp_tbl_info->opp_tbl[new_opp_idx].cpufreq_khz;
 	mV = (opp_tbl_info->opp_tbl[new_opp_idx].cpufreq_volt) / 100;
 
@@ -1229,6 +1235,85 @@ static int mtk_cpufreq_get_cpu_power( struct device *dev, unsigned long *uW, uns
 	tag_pr_info("Voltage in mV = %lu, Frequency in KHz = %lu, Power in uW = %lu\n", mV, *KHz, *uW);
 	return 0;
 }
+
+static int mtk_cpufreq_get_cpu_power(struct device *dev,
+		unsigned long *uW, unsigned long *KHz)
+{
+	int ret;
+
+	mutex_lock(&cpufreq_mutex);
+	ret = mtk_cpufreq_get_cpu_power_locked(dev, uW, KHz);
+	mutex_unlock(&cpufreq_mutex);
+	return ret;
+}
+
+int mt_cpufreq_refresh_energy_model(void)
+{
+	struct em_perf_domain *pd;
+	struct em_perf_table *new_table;
+	struct em_perf_state *old_states;
+	struct device *dev;
+	unsigned long old_top_power, freq;
+	int cpu, i, ret, updated = 0;
+
+	for_each_possible_cpu(cpu) {
+		pd = em_cpu_get(cpu);
+		if (!pd || cpu != cpumask_first(em_span_cpus(pd)))
+			continue;
+		dev = get_cpu_device(cpu);
+		new_table = em_table_alloc(pd);
+		if (!new_table)
+			return -ENOMEM;
+
+		rcu_read_lock();
+		old_states = em_perf_state_from_pd(pd);
+		memcpy(new_table->state, old_states,
+			pd->nr_perf_states * sizeof(*old_states));
+		old_top_power = old_states[pd->nr_perf_states - 1].power;
+		rcu_read_unlock();
+
+		/* Snapshot a whole domain before another EEM monitor update. */
+		mutex_lock(&cpufreq_mutex);
+		ret = 0;
+		for (i = 0; i < pd->nr_perf_states; i++) {
+			freq = new_table->state[i].frequency;
+			ret = mtk_cpufreq_get_cpu_power_locked(dev,
+				&new_table->state[i].power, &freq);
+			if (ret)
+				break;
+			if (freq != new_table->state[i].frequency ||
+			    !new_table->state[i].performance ||
+			    !new_table->state[i].power ||
+			    new_table->state[i].power > EM_MAX_POWER) {
+				ret = -EINVAL;
+				break;
+			}
+		}
+		mutex_unlock(&cpufreq_mutex);
+		if (ret)
+			goto free_table;
+
+		ret = em_dev_compute_costs(dev, new_table->state,
+					pd->nr_perf_states);
+		if (ret)
+			goto free_table;
+		ret = em_dev_update_perf_domain(dev, new_table);
+		if (!ret) {
+			tag_pr_notice("EEM EM cpu%d: %d OPPs, top power %lu -> %lu uW\n",
+				cpu, pd->nr_perf_states, old_top_power,
+				new_table->state[pd->nr_perf_states - 1].power);
+			updated++;
+		}
+free_table:
+		/* The framework owns a reference after a successful publish. */
+		em_table_free(new_table);
+		if (ret)
+			return ret;
+	}
+
+	return updated ? 0 : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(mt_cpufreq_refresh_energy_model);
 
 #ifndef ONE_CLUSTER
 int cci_is_inited;

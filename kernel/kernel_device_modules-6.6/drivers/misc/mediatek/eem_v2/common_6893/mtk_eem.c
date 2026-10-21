@@ -29,6 +29,7 @@
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
 #include <linux/types.h>
 #include <linux/time.h>
 #include <linux/slab.h>
@@ -257,29 +258,37 @@ static int eem_aee_log_cur_volt(struct eem_det *det)
 #endif
 	return 0;
 }
-static unsigned int read_efuse_by_offset(__u32 offset)
+/* Match the hardware compatible: legacy DTs spell this node eem_fsm. */
+static int read_efuse_by_offset(u32 offset, u32 *value)
 {
-	__u32 value;
 	struct platform_device *pdev;
 	struct nvmem_device *nvmem_dev;
 	struct device_node *node;
+	int ret;
 
-	node = of_find_node_by_name(NULL, "eem-fsm");
-	if (node == NULL) {
-		eem_error("%s fail to get device node\n", __func__);
-		return -1;
-	}
+	node = of_find_compatible_node(NULL, NULL, "mediatek,eem_fsm");
+	if (!node)
+		return -ENODEV;
 	pdev = of_find_device_by_node(node);
-	if (pdev == NULL) {
-		eem_error("%s failed to get pdev\n", __func__);
-		return -1;
-	}
+	of_node_put(node);
+	if (!pdev)
+		return -ENODEV;
+
 	nvmem_dev = nvmem_device_get(&pdev->dev, "mtk_efuse");
-	if (IS_ERR(nvmem_dev))
-		eem_error("%s ptpod failed to get mtk_efuse device\n",__func__);
-	nvmem_device_read(nvmem_dev, offset, sizeof(__u32), &value);
-	eem_error("[EEM_DEBUG] offset= %d, value=%d", offset, value);
-	return value;
+	if (IS_ERR(nvmem_dev)) {
+		ret = PTR_ERR(nvmem_dev);
+		goto out_put_device;
+	}
+
+	ret = nvmem_device_read(nvmem_dev, offset, sizeof(*value), value);
+	nvmem_device_put(nvmem_dev);
+	if (ret == sizeof(*value))
+		ret = 0;
+	else if (ret >= 0)
+		ret = -EIO;
+out_put_device:
+	put_device(&pdev->dev);
+	return ret;
 }
 #ifndef MC50_LOAD
 #if SUPPORT_PICACHU
@@ -348,6 +357,7 @@ static int get_devinfo(void)
 	int ret = 0, i = 0;
 	int *val;
 	unsigned int safeEfuse = 0;
+	u32 segment;
 
 	FUNC_ENTER(FUNC_LV_HELP);
 	/*
@@ -362,20 +372,16 @@ static int get_devinfo(void)
 	 */
 	val = (int *)&eem_devinfo;
 	/* FTPGM */
-	val[0] = read_efuse_by_offset(DEVINFO_IDX_0);
-	val[1] = read_efuse_by_offset(DEVINFO_IDX_1);
-	val[2] = read_efuse_by_offset(DEVINFO_IDX_2);
-	val[3] = read_efuse_by_offset(DEVINFO_IDX_3);
-	val[4] = read_efuse_by_offset(DEVINFO_IDX_4);
-	val[5] = read_efuse_by_offset(DEVINFO_IDX_5);
-	val[6] = read_efuse_by_offset(DEVINFO_IDX_6);
-	val[7] = read_efuse_by_offset(DEVINFO_IDX_7);
-	val[8] = read_efuse_by_offset(DEVINFO_IDX_8);
-	val[9] = read_efuse_by_offset(DEVINFO_IDX_9);
-	val[10] = read_efuse_by_offset(DEVINFO_IDX_10);
-	val[11] = read_efuse_by_offset(DEVINFO_IDX_11);
-	val[12] = read_efuse_by_offset(DEVINFO_IDX_12);
-	val[13] = read_efuse_by_offset(DEVINFO_IDX_13);
+	/* A failed read is not a valid fuse value or a blank-fuse fallback. */
+	for (i = 0; i < NR_HW_RES_FOR_BANK; i++) {
+		ret = read_efuse_by_offset(DEVINFO_IDX_0 + i * 4,
+					 (u32 *)&val[i]);
+		if (ret) {
+			eem_error("efuse read failed at 0x%x: %d\n",
+				  DEVINFO_IDX_0 + i * 4, ret);
+			return ret;
+		}
+	}
 	/*
 	 * efuse_val = get_devinfo_with_index(DEVINFO_TIME_IDX);
 	 * year = ((efuse_val >> 4) & 0xf) + 2018;
@@ -454,8 +460,10 @@ static int get_devinfo(void)
 		val[12] = DEVINFO_12;
 		val[13] = DEVINFO_13;
 	}
-	if ((read_efuse_by_offset(DEVINFO_SEG_IDX)
-				& 0xFF) == 0x40)
+	ret = read_efuse_by_offset(DEVINFO_SEG_IDX, &segment);
+	if (ret)
+		return ret;
+	if ((segment & 0xFF) == 0x40)
 		support_seg40 = 1;
 	eem_error("support_seg40 : %d", support_seg40);
 	FUNC_EXIT(FUNC_LV_HELP);
@@ -1140,6 +1148,9 @@ static void get_volt_table_in_thread(struct eem_det *det)
 {
 	struct eem_det *ndet = det;
 	unsigned int i;
+#if UPDATE_TO_UPOWER
+	bool publish_upower = false;
+#endif
 	int low_temp_offset = 0;
 	unsigned int t_clamp = 0, final_clamp_val;
 #if EN_PI_VOLT_LOG
@@ -1366,12 +1377,17 @@ static void get_volt_table_in_thread(struct eem_det *det)
 	 */
 	if (ndet->set_volt_to_upower == 0) {
 		eem_update_init2_volt_to_upower(ndet, ndet->volt_tbl_pmic);
-		ndet->set_volt_to_upower = 1;
+		publish_upower = true;
 		eem_aee_log_cur_volt(ndet);
 	}
 #endif
 	if (0 == (ndet->disabled % 2))
 		ndet->ops->set_volt(ndet);
+#if UPDATE_TO_UPOWER
+	/* Initial publication must follow the CPU_DVFS voltage table update. */
+	if (publish_upower)
+		ndet->set_volt_to_upower = 1;
+#endif
 }
 /*
  * Thread for voltage setting
@@ -2471,6 +2487,8 @@ static int eem_probe(struct platform_device *pdev)
 	}
 	/* Setup IO addresses */
 	eem_base = of_iomap(node, 0);
+	if (!eem_base)
+		return -ENOMEM;
 	eem_debug("[EEM] eem_base = 0x%p\n", eem_base);
 	eem_irq_number = irq_of_parse_and_map(node, 0);
 	eem_debug("[THERM_CTRL] eem_irq_number=%d\n", eem_irq_number);
@@ -2480,6 +2498,9 @@ static int eem_probe(struct platform_device *pdev)
 	}
 	/* infra_ao */
 	node_infra = of_find_compatible_node(NULL, NULL, INFRA_AO_NODE);
+	if (!node_infra)
+		node_infra = of_find_compatible_node(NULL, NULL,
+						   "mediatek,infracfg_ao");
 	if (!node_infra) {
 		eem_debug("INFRA_AO_NODE Not Found\n");
 		return 0;
@@ -2506,6 +2527,8 @@ static int eem_probe(struct platform_device *pdev)
 		return 0;
 	}
 	temp_cs_base = of_iomap(node_temp_cs, 1);
+	if (!temp_cs_base)
+		return -ENOMEM;
 #endif
 #if EN_EEM_THERM_CLK
 #if !IS_ENABLED(CONFIG_MTK_CLKMGR)
@@ -2519,13 +2542,12 @@ static int eem_probe(struct platform_device *pdev)
 #endif
 #endif
 	create_procfs();
-	informEEMisReady = 1;
 	/* set EEM IRQ */
 	ret = request_irq(eem_irq_number, eem_isr,
 			IRQF_TRIGGER_HIGH, "eem", NULL);
 	if (ret) {
 		eem_error("EEM IRQ register failed (%d)\n", ret);
-		WARN_ON(1);
+		return ret;
 	}
 	eem_debug("Set EEM IRQ OK.\n");
 #if EN_PI_VOLT_LOG
@@ -2563,6 +2585,7 @@ static int eem_probe(struct platform_device *pdev)
 #endif
 	eem_init01();
 	ptp_data[0] = 0;
+	informEEMisReady = 1;
 	eem_debug("%s ok\n", __func__);
 	FUNC_EXIT(FUNC_LV_MODULE);
 	return 0;
@@ -2909,11 +2932,16 @@ static int eem_dump_proc_show(struct seq_file *m, void *v)
 static int eem_hrid_proc_show(struct seq_file *m, void *v)
 {
 	unsigned int i;
+	u32 value;
+	int ret;
 
 	FUNC_ENTER(FUNC_LV_HELP);
-	for (i = 0; i < 4; i++)
-		seq_printf(m, "%s[HRID][%d]: 0x%08X\n", EEM_TAG, i,
-			read_efuse_by_offset(DEVINFO_HRID_0 + i*4));
+	for (i = 0; i < 4; i++) {
+		ret = read_efuse_by_offset(DEVINFO_HRID_0 + i * 4, &value);
+		if (ret)
+			return ret;
+		seq_printf(m, "%s[HRID][%d]: 0x%08X\n", EEM_TAG, i, value);
+	}
 	FUNC_EXIT(FUNC_LV_HELP);
 	return 0;
 }
@@ -2921,19 +2949,28 @@ static int eem_efuse_proc_show(struct seq_file *m, void *v)
 {
 	int *val = (int *)&eem_devinfo;
 	unsigned int i;
+	u32 value;
+	int ret;
 
 	FUNC_ENTER(FUNC_LV_HELP);
-	for (i = 0; i < 24; i++)
-		seq_printf(m, "%s[PTP_DUMP] ORIG_RES%d: 0x%08X\n", EEM_TAG, i,
-			read_efuse_by_offset(DEVINFO_IDX_0 + i*4));
+	for (i = 0; i < 24; i++) {
+		ret = read_efuse_by_offset(DEVINFO_IDX_0 + i * 4, &value);
+		if (ret)
+			return ret;
+		seq_printf(m, "%s[PTP_DUMP] ORIG_RES%d: 0x%08X\n",
+			   EEM_TAG, i, value);
+	}
 	/* Depend on EFUSE location */
 	for (i = 0; i < sizeof(struct eem_devinfo) / sizeof(unsigned int);
 		i++)
 		seq_printf(m, "%s[PTP_DUMP] RES%d: 0x%08X\n", EEM_TAG, i,
 			val[i]);
-	for (i = NR_HW_RES_FOR_BANK; i <= 24; i++)
-		seq_printf(m, "%s[PTP_DUMP] RES%d: 0x%08X\n", EEM_TAG, i,
-			read_efuse_by_offset(DEVINFO_IDX_0 + i*4));
+	for (i = NR_HW_RES_FOR_BANK; i <= 24; i++) {
+		ret = read_efuse_by_offset(DEVINFO_IDX_0 + i * 4, &value);
+		if (ret)
+			return ret;
+		seq_printf(m, "%s[PTP_DUMP] RES%d: 0x%08X\n", EEM_TAG, i, value);
+	}
 	FUNC_EXIT(FUNC_LV_HELP);
 	return 0;
 }
@@ -3390,13 +3427,16 @@ static int __init eem_init(void)
 {
 	int err = 0;
 	struct eem_det *det;
+	unsigned long deadline;
 
 #ifdef EEM_NOT_READY
 	return 0;
 #endif
 
 	eem_debug("[EEM] ctrl_EEM_Enable=%d\n", ctrl_EEM_Enable);
-	get_devinfo();
+	err = get_devinfo();
+	if (err < 0)
+		return err;
 	/* move to eem_probe */
 	/* create_procfs(); */
 	if (eem_checkEfuse == 0) {
@@ -3424,16 +3464,31 @@ static int __init eem_init(void)
 	}
 #endif /* CONFIG_PM */
 
+	/* Probe may stop before calibration; never hold first-stage init forever. */
+	if (!informEEMisReady) {
+		eem_error("probe did not start calibration; retaining default tables\n");
+		return 0;
+	}
+	deadline = jiffies + msecs_to_jiffies(10000);
 	for_each_det(det) {
-		if(HAS_FEATURE(det, FEA_MON))
-			while (!det->set_volt_to_upower) {
-				eem_error("(%s) set_volt_to_upower not completed, sleep 100ms"
-				, det->name);
-				msleep(100);
+		if (!HAS_FEATURE(det, FEA_MON))
+			continue;
+		while (!det->set_volt_to_upower) {
+			if (time_after_eq(jiffies, deadline)) {
+				eem_error("%s calibration timed out; not publishing Upower tables\n",
+					  det->name);
+				/* IRQs/workers are live: keep the module resident. */
+				return 0;
 			}
+			msleep(100);
+		}
 	}
 
 	upower_update_tables_by_eem();
+	err = mt_cpufreq_refresh_energy_model();
+	if (err)
+		eem_error("common EM refresh failed: %d; keeping existing domains\n",
+			  err);
 	return 0;
 }
 static void __exit eem_exit(void)

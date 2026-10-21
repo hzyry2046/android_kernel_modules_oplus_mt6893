@@ -465,24 +465,70 @@ int spower_procfs_init(void)
 	return 0;
 }
 static unsigned int mtSpowerInited;
+#ifndef WITHOUT_LKG_EFUSE
+static int spower_read_efuses(u32 *devinfo)
+{
+	struct device_node *node;
+	struct platform_device *pdev;
+	struct nvmem_device *nvmem_dev;
+	int i, ret;
+
+	/* The legacy MT6893 DT names this node eem_fsm, not eem-fsm. */
+	node = of_find_compatible_node(NULL, NULL, "mediatek,eem_fsm");
+	if (!node)
+		node = of_find_node_by_name(NULL, "eem-fsm");
+	if (!node)
+		node = of_find_node_by_name(NULL, "lkg");
+	if (!node)
+		return -ENODEV;
+
+	pdev = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!pdev)
+		return -ENODEV;
+
+	nvmem_dev = nvmem_device_get(&pdev->dev, "mtk_efuse");
+	if (IS_ERR(nvmem_dev)) {
+		ret = PTR_ERR(nvmem_dev);
+		goto out_put_device;
+	}
+
+	for (i = 0; i < MTK_LEAKAGE_MAX; i++) {
+		ret = nvmem_device_read(nvmem_dev,
+			spower_lkg_info[i].devinfo_idx, sizeof(devinfo[i]),
+			&devinfo[i]);
+		if (ret != sizeof(devinfo[i])) {
+			if (ret >= 0)
+				ret = -EIO;
+			pr_notice("%s: efuse offset %#x read failed: %d\n",
+				__func__, spower_lkg_info[i].devinfo_idx, ret);
+			goto out_put_nvmem;
+		}
+	}
+	ret = 0;
+out_put_nvmem:
+	nvmem_device_put(nvmem_dev);
+out_put_device:
+	put_device(&pdev->dev);
+	return ret;
+}
+#endif
+
 int mt_spower_init(void)
 {
 #ifndef WITHOUT_LKG_EFUSE
-	int devinfo = 0;
+	u32 devinfo[MTK_LEAKAGE_MAX] = { 0 };
 	unsigned int temp_lkg;
+	int efuse_ret;
 #endif
-	int i;
+	int i, ret = 0;
 	unsigned int v_of_fuse;
 	int t_of_fuse;
 	unsigned int idx = 0;
 	char *p_buf = static_power_buf;
 
 	/* Group FF,TT,SS tables of all the banks together */
-	struct sptab_list *tab[MTK_SPOWER_MAX];
-	struct platform_device *pdev;
-	struct nvmem_device *nvmem_dev;
-	struct device_node *node;
-	unsigned int err_flag = 0;
+	struct sptab_list *tab[MTK_SPOWER_MAX] = { NULL };
 
 #ifdef SPOWER_NOT_READY
 	/* FIX ME */
@@ -492,58 +538,28 @@ int mt_spower_init(void)
 	if (mtSpowerInited == 1)
 		return 0;
 
-	node = of_find_node_by_name(NULL, "eem-fsm");
-	if (node == NULL) {
-		pr_notice("%s fail to get device node (eem-fsm)\n", __func__);
-		err_flag = 1;
-		goto efuse_end;
-	}
-	pdev = of_find_device_by_node(node);
-	if (pdev == NULL) {
-		pr_notice("%s fail to create pdev 1 (eem-fsm)\n", __func__);
-		node = of_find_node_by_name(NULL, "lkg");
-		if (node == NULL) {
-			pr_notice("%s fail to get device node (lkg)\n", __func__);
-			err_flag = 1;
-			goto efuse_end;
-		}
-		pdev = of_find_device_by_node(node);
-		if (pdev == NULL) {
-			pr_notice("%s fail to create pdev 1 (lkg)\n", __func__);
-			pdev = of_find_device_by_node(node);
-			if (pdev == NULL) {
-				pr_notice("%s fail to create pdev 2 (lkg)\n", __func__);
-				err_flag = 2;
-				goto efuse_end;
-			}
-		}
-	}
-
-	nvmem_dev = nvmem_device_get(&pdev->dev, "mtk_efuse");
-	if (IS_ERR(nvmem_dev)) {
-		pr_notice("%s failed to get mtk_efuse device\n",
-			__func__);
-		err_flag = 3;
-		goto efuse_end;
-	}
-
-efuse_end:
-	for (i = 0; i < MTK_SPOWER_MAX; i++)
-		tab[i] = kmalloc(sizeof(struct sptab_list), GFP_KERNEL);
-
 	/* avoid side effect from multiple invocation */
 	if (tab_validate(&sptab[0]))
-		goto init_end;
+		return 0;
+
+	for (i = 0; i < MTK_SPOWER_MAX; i++) {
+		tab[i] = kmalloc(sizeof(struct sptab_list), GFP_KERNEL);
+		if (!tab[i]) {
+			ret = -ENOMEM;
+			goto init_end;
+		}
+	}
 
 #ifndef WITHOUT_LKG_EFUSE
+	efuse_ret = spower_read_efuses(devinfo);
+	if (efuse_ret)
+		pr_notice("%s: efuse unavailable (%d), using default leakage\n",
+			__func__, efuse_ret);
+
 	for (i = 0; i < MTK_LEAKAGE_MAX; i++) {
-		if (!err_flag)
-			nvmem_device_read(nvmem_dev,
-				spower_lkg_info[i].devinfo_idx,
-				sizeof(__u32),
-				&devinfo);
-		temp_lkg =
-			(devinfo >> spower_lkg_info[i].devinfo_offset) & 0xff;
+		/* Never decode a failed or partial read as calibration data. */
+		temp_lkg = efuse_ret ? 0 :
+			(devinfo[i] >> spower_lkg_info[i].devinfo_offset) & 0xff;
 		pr_notice("[Efuse] %s => 0x%x\n", spower_lkg_info[i].name,
 				temp_lkg);
 		/*
@@ -599,18 +615,13 @@ efuse_end:
 				&static_power_operations);
 #endif
 	spower_procfs_init();
-	for (i = 0; i < MTK_SPOWER_MAX; i++)
-		kfree(tab[i]);
-
 	mtSpowerInited = 1;
 
 init_end:
-	if (err_flag != 1 && pdev != NULL) {
-		of_node_put(node);
-		platform_device_put(pdev);
-	}
+	for (i = 0; i < MTK_SPOWER_MAX; i++)
+		kfree(tab[i]);
 
-	return 0;
+	return ret;
 }
 
 
