@@ -50,7 +50,7 @@ mt6375-battery-objs := mtk_battery_coulomb_service.o mtk_battery.o mtk_battery_a
 ifneq ($(wildcard $(srctree)/$(src)/k6985v1_64_alpha),)
 obj-$(CONFIG_GAUGE_BQ28Z610)      += k6985v1_64_alpha/
 endif
-mtk_battery_manager-objs := mtk-battery-manager.o mtk_battery_interface.o
+mtk_battery_manager-objs := mtk-battery-manager.o mtk_battery_interface.o mtk_battery_fgd419.o
 mt6357_battery-objs := mt6357-gauge.o mtk_battery_coulomb_service.o mtk_battery.o mtk_battery_algo.o mtk_battery_daemon.o mtk_battery_interface.o
 obj-$(CONFIG_BATTERY_MT6357) += mt6357_battery.o mtk_battery_manager.o
 mt6358_battery-objs := mt6358-gauge.o mtk_battery_coulomb_service.o mtk_battery.o mtk_battery_algo.o mtk_battery_daemon.o mtk_battery_interface.o

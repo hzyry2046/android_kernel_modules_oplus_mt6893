@@ -94,23 +94,21 @@ void get_hw_info(struct mtk_battery *gm)
 
 int get_charger_exist(void)
 {
+	static const char * const names[] = {
+		"primary_chg", "mtk-master-charger", "ac", "usb",
+	};
 	struct power_supply *psy;
-	union power_supply_propval val = {0};
-	int ret;
+	union power_supply_propval val;
+	int ret, i;
 
-	psy = power_supply_get_by_name("ac");
-	if (psy != NULL) {
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		psy = power_supply_get_by_name(names[i]);
+		if (!psy)
+			continue;
 		ret = power_supply_get_property(psy,
 			POWER_SUPPLY_PROP_ONLINE, &val);
-		if (val.intval == true && ret == 0)
-			return true;
-	}
-
-	psy = power_supply_get_by_name("usb");
-	if (psy != NULL) {
-		ret = power_supply_get_property(psy,
-			POWER_SUPPLY_PROP_ONLINE, &val);
-		if (val.intval == true && ret == 0)
+		power_supply_put(psy);
+		if (!ret && val.intval)
 			return true;
 	}
 

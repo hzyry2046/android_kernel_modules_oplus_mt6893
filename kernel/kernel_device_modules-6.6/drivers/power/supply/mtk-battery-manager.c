@@ -26,6 +26,7 @@
 #include <net/sock.h>
 
 #include "mtk_battery.h"
+#include "mtk_battery_fgd419.h"
 #include "mtk_gauge.h"
 #include "mtk-battery-charge-status.h"
 #if IS_ENABLED(CONFIG_MTK_AEE_FEATURE)
@@ -748,6 +749,55 @@ void bm_check_bootmode(struct device *dev,
 	}
 }
 
+/*
+ * op6893: the last percent.  MTK's low-battery shutdown is compiled out on
+ * Oplus builds (shutdown_event_handler() returns early; on 4.19
+ * set_shutdown_cond() did), so nothing sends the FG_INTR_SHUTDOWN that lets
+ * the gauge daemon, or the kernel algorithm, track the UI from 1% down to
+ * 0%, and the phone sat at 1% until it browned out.  On 4.19 Oplus's charger
+ * reported 0% itself once the battery read below qcom,vbatt_soc_1 on more
+ * than four 5 s updates in a row (oplus_chg_soc_reduce_slow_when_1()), and
+ * BatteryService shut down.  Same rule on the 10 s samples here; three of
+ * them span the same 20 s.  With a charger attached BatteryService does not
+ * shut down at 0%, so the rule only runs without one.
+ */
+#define BM_VBAT_SOC_1_DEFAULT	3410	/* mV, oplus_charger.c */
+#define BM_VBAT_SOC_1_SAMPLES	3
+
+static int bm_vbat_soc_1;
+static int bm_vbat_low_cnt;
+static bool bm_vbat_zero;
+
+static void bm_check_vbat_soc_1(struct mtk_battery_manager *bm, int vbat)
+{
+	struct device_node *np;
+	bool zero;
+
+	if (!bm_vbat_soc_1) {
+		np = of_find_node_by_path("/charger");
+		if (!np || of_property_read_u32(np, "qcom,vbatt_soc_1",
+						&bm_vbat_soc_1))
+			bm_vbat_soc_1 = BM_VBAT_SOC_1_DEFAULT;
+		of_node_put(np);
+	}
+
+	if (bm->bs_data.bat_capacity == 1 && vbat < bm_vbat_soc_1 &&
+	    !fgd419_charger_exist())
+		bm_vbat_low_cnt++;
+	else
+		bm_vbat_low_cnt = 0;
+
+	zero = bm_vbat_low_cnt >= BM_VBAT_SOC_1_SAMPLES;
+	if (zero == bm_vbat_zero)
+		return;
+	bm_vbat_zero = zero;
+	pr_err("[%s] vbat %d mV (limit %d), uisoc %d: %s\n", __func__,
+		vbat, bm_vbat_soc_1, bm->bs_data.bat_capacity,
+		zero ? "report 0%" : "back to the gauge's level");
+	if (bm->bs_data.psy)
+		power_supply_changed(bm->bs_data.psy);
+}
+
 static void bm_update_status(struct mtk_battery_manager *bm)
 {
 
@@ -812,6 +862,8 @@ static void bm_update_status(struct mtk_battery_manager *bm)
 			bm->uisoc, bm->gm1->ui_soc,
 			bm->gm1->soc,
 			vbat1, ibat1, car1);
+
+		bm_check_vbat_soc_1(bm, vbat1);
 	}
 }
 
@@ -1190,6 +1242,9 @@ static int bs_psy_get_property(struct power_supply *psy,
 			 * 0 would make BatteryService shut the phone down.
 			 */
 			val->intval = 50;
+		else if (bm_vbat_zero)
+			/* op6893: see bm_check_vbat_soc_1() */
+			val->intval = 0;
 		else
 			val->intval = bs_data->bat_capacity;
 		break;
@@ -1656,6 +1711,9 @@ void mtk_bm_handler(struct mtk_battery *gm,
 	if (bm == NULL)
 		bm = get_mtk_battery_manager();
 
+	if (fgd419_tx(bm, reply_msg))
+		return;
+
 	if (bm != NULL) {
 		if (bm->gm1 == gm) {
 			reply_msg->instance_id = gm->id;
@@ -1842,6 +1900,19 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 
 		if (plen >= legacy_hdr &&
 		    w[legacy_hdr / 4 - 1] == AFW_MAGIC) {
+			if (!bm->fgd_legacy) {
+				bm->fgd_legacy = true;
+				pr_err("[%s]op6893: legacy 28-byte FG daemon layout, translating\n",
+					__func__);
+			}
+			/*
+			 * The header shift alone leaves the 4.19 command
+			 * numbers and data layouts in place, so the daemon
+			 * fails its version check.  With fgd419=1 the whole
+			 * protocol is served in mtk_battery_fgd419.c instead.
+			 */
+			if (fgd419_rx(bm, data, plen, NETLINK_CB(skb).portid, seq))
+				return;
 			xlat = kzalloc(plen + 4, GFP_KERNEL);
 			if (!xlat)
 				return;
@@ -1849,11 +1920,6 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 			memcpy((char *)xlat + 4, data, plen);
 			fgd_msg = xlat;
 			data = xlat;
-			if (!bm->fgd_legacy) {
-				bm->fgd_legacy = true;
-				pr_err("[%s]op6893: legacy 28-byte FG daemon layout, translating\n",
-					__func__);
-			}
 		} else {
 			pr_err("[%s]not correct MTKFG netlink packet!%d\n",
 				__func__, fgd_msg->identity);
