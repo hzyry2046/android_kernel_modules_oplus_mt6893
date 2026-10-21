@@ -5051,12 +5051,40 @@ EXIT:
 	return Ret;
 }
 
+/* The stock 4.19 DTB carries no mediatek,larb(s) phandle on the wpe
+ * nodes; the smi_larb is reachable through the syscon clock provider it
+ * shares with this consumer (imgsys1 -> larb9, imgsys2 -> larb11).
+ */
+static struct device_node *wpe_larb_via_clk_provider(struct device_node *np)
+{
+	struct of_phandle_args clkspec, lclkspec;
+	struct device_node *larb;
+	int i, j;
+
+	for (i = 0; !of_parse_phandle_with_args(np, "clocks", "#clock-cells",
+					      i, &clkspec); i++) {
+		for_each_compatible_node(larb, NULL, "mediatek,smi_larb") {
+			for (j = 0; !of_parse_phandle_with_args(larb, "clocks",
+					"#clock-cells", j, &lclkspec); j++) {
+				if (lclkspec.np == clkspec.np) {
+					of_node_put(lclkspec.np);
+					of_node_put(clkspec.np);
+					return larb;
+				}
+				of_node_put(lclkspec.np);
+			}
+		}
+		of_node_put(clkspec.np);
+	}
+	return NULL;
+}
+
 static void WPE_add_device_link(struct platform_device *pDev)
 {
 	char mtk_larb_str[32];
 	int i = 0, mtk_larb = 0, mtk_larbs = 0, larb_num = 0;
 	unsigned int larb_id = 0;
-	struct device_node *larb_node;
+	struct device_node *larb_node = NULL;
 	struct device_link *link;
 	struct platform_device *larb_pdev;
 
@@ -5074,12 +5102,22 @@ static void WPE_add_device_link(struct platform_device *pDev)
 		LOG_INF("WPE larb_num: %d; (%d, %d)\n", larb_num, mtk_larb, mtk_larbs);
 
 		if (larb_num <= 0) {
+			larb_node = wpe_larb_via_clk_provider(pDev->dev.of_node);
+			larb_num = larb_node ? 1 : 0;
+			if (larb_node)
+				LOG_INF("WPE %s: larb via clock provider\n",
+					pDev->dev.of_node->name);
+		}
+
+		if (larb_num <= 0) {
 			LOG_ERR("WPE %s: find no larb", pDev->dev.of_node->name);
 			return;
 			}
 
 		for (i = 0; i < larb_num; i++) {
-			larb_node = of_parse_phandle(pDev->dev.of_node, mtk_larb_str, i);
+			if (!larb_node)
+				larb_node = of_parse_phandle(pDev->dev.of_node,
+					mtk_larb_str, i);
 
 			if (!larb_node) {
 				LOG_ERR("WPE %s: [%d]: failed to get larb from %s\n",
@@ -5102,6 +5140,7 @@ static void WPE_add_device_link(struct platform_device *pDev)
 				pDev->dev.of_node->name, larb_id);
 
 			of_node_put(larb_node);
+			larb_node = NULL;
 
 			link = device_link_add(&pDev->dev, &larb_pdev->dev,
 				DL_FLAG_PM_RUNTIME | DL_FLAG_STATELESS);

@@ -1137,6 +1137,34 @@ const long jpeg_dev_get_hybrid_decoder_base_VA(int id)
 	return gJpegqDev.hybriddecRegBaseVA[id];
 }
 
+/* The stock 4.19 DTB carries no mediatek,larb(s) phandle on the jpeg
+ * nodes; the smi_larb is reachable through the syscon clock provider it
+ * shares with this consumer (vencsys -> larb7, vencsys_c1 -> larb8).
+ */
+static struct device_node *jpeg_larb_via_clk_provider(struct device_node *np)
+{
+	struct of_phandle_args clkspec, lclkspec;
+	struct device_node *larb;
+	int i, j;
+
+	for (i = 0; !of_parse_phandle_with_args(np, "clocks", "#clock-cells",
+					      i, &clkspec); i++) {
+		for_each_compatible_node(larb, NULL, "mediatek,smi_larb") {
+			for (j = 0; !of_parse_phandle_with_args(larb, "clocks",
+					"#clock-cells", j, &lclkspec); j++) {
+				if (lclkspec.np == clkspec.np) {
+					of_node_put(lclkspec.np);
+					of_node_put(clkspec.np);
+					return larb;
+				}
+				of_node_put(lclkspec.np);
+			}
+		}
+		of_node_put(clkspec.np);
+	}
+	return NULL;
+}
+
 static int jpeg_probe(struct platform_device *pdev)
 {
 	struct device_node *node = NULL, *larbnode = NULL;
@@ -1268,6 +1296,10 @@ static int jpeg_probe(struct platform_device *pdev)
 	}
 
 	larbnode = of_parse_phandle(node, "mediatek,larbs", 0);
+	if (!larbnode)
+		larbnode = of_parse_phandle(node, "mediatek,larb", 0);
+	if (!larbnode)
+		larbnode = jpeg_larb_via_clk_provider(node);
 	if (!larbnode) {
 		JPEG_LOG(0, "fail to get larbnode %d", node_index);
 	} else {
