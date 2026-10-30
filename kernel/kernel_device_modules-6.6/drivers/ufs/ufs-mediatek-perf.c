@@ -2225,6 +2225,17 @@ static int ufs_mtk_init(struct ufs_hba *hba)
 
 	ufs_mtk_dbg_register(hba);
 
+	/*
+	 * rpmb_sem also gates system suspend/resume, so it must be
+	 * usable regardless of CONFIG_RPMB.  With CONFIG_RPMB=n,
+	 * ufs_mtk_rpmb_init() compiles to a stub and the semaphore
+	 * would stay at its zeroed-out state forever, making every
+	 * suspend fail with -EBUSY inside ufs_mtk_system_suspend().
+	 * Initialize it unconditionally; when RPMB is enabled the
+	 * async registration path re-initializes it to 0 and releases
+	 * it once the rpmb cdev is up.
+	 */
+	sema_init(&host->rpmb_sem, 1);
 	ufs_mtk_rpmb_init(hba);
 
 	host->cpuhp_state = cpuhp_setup_state_multi(CPUHP_AP_ONLINE_DYN,

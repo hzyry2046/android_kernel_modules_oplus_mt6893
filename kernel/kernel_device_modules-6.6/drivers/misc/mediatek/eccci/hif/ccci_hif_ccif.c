@@ -1724,6 +1724,13 @@ static int ccif_hif_hw_init(struct device *dev, struct md_ccif_ctrl *ccif_ctrl)
 			ccif_ctrl->ap_ccif_irq0_id, ret);
 		return -1;
 	}
+	/*
+	 * Arm CCIF as a system wakeup source, same as 4.19: an active modem
+	 * (incoming call/SMS/data) is supposed to pull the AP out of suspend,
+	 * so a wake from this line during suspend is expected behaviour and not
+	 * a suspend failure.  In airplane mode the line stays quiet and the SoC
+	 * reaches deep idle normally.
+	 */
 	ret = irq_set_irq_wake(ccif_ctrl->ap_ccif_irq0_id, 1);
 	if (ret)
 		CCCI_ERROR_LOG(0, TAG,

@@ -68,7 +68,6 @@ struct regmap;
 struct mtk_atomic_state {
 	struct drm_atomic_state base;
 	struct list_head list;
-	struct kref kref;
 };
 
 struct mtk_fake_eng_reg {
@@ -296,6 +295,10 @@ struct mtk_drm_private {
 	struct clk **top_clk;
 	bool power_state;
 	struct mtk_drm_kernel_pm kernel_pm;
+	/* task performing the suspend-time atomic commit; it must bypass the
+	 * KERNEL_PM_SUSPEND gate that the PM notifier has already armed.
+	 */
+	struct task_struct *suspend_owner;
 
 	/* for rpo caps info */
 	unsigned int rsz_in_max[2];

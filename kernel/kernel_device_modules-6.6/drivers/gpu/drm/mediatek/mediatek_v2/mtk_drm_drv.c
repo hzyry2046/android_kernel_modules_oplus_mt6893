@@ -367,24 +367,6 @@ static inline struct mtk_atomic_state *to_mtk_state(struct drm_atomic_state *s)
 	return container_of(s, struct mtk_atomic_state, base);
 }
 
-static void mtk_atomic_state_free(struct kref *k)
-{
-	struct mtk_atomic_state *mtk_state =
-		container_of(k, struct mtk_atomic_state, kref);
-	struct drm_atomic_state *state = &mtk_state->base;
-
-	drm_atomic_state_clear(state);
-	drm_atomic_state_default_release(state);
-	kfree(mtk_state);
-}
-
-static void mtk_atomic_state_put(struct drm_atomic_state *state)
-{
-	struct mtk_atomic_state *mtk_state = to_mtk_state(state);
-
-	kref_put(&mtk_state->kref, mtk_atomic_state_free);
-}
-
 void mtk_atomic_state_put_queue(struct drm_atomic_state *state)
 {
 	struct drm_device *drm = state->dev;
@@ -2333,9 +2315,12 @@ static int mtk_atomic_commit(struct drm_device *drm,
 	DDPINFO("%s step1,pm_status :%d\n", __func__,
 		atomic_read(&private->kernel_pm.status));
 
-	/* block atomic commit till kernel resume */
+	/* block atomic commit till kernel resume, except for the commit that
+	 * drm_atomic_helper_suspend() issues from mtk_drm_sys_suspend().
+	 */
 	ret = wait_event_interruptible(private->kernel_pm.wq,
-			atomic_read(&private->kernel_pm.status) != KERNEL_PM_SUSPEND);
+			atomic_read(&private->kernel_pm.status) != KERNEL_PM_SUSPEND ||
+			READ_ONCE(private->suspend_owner) == current);
 	DDPINFO("%s step2,pm_status :%d\n", __func__,
 		atomic_read(&private->kernel_pm.status));
 	if (unlikely(ret != 0))
@@ -2436,7 +2421,6 @@ mtk_drm_atomic_state_alloc(struct drm_device *dev)
 	}
 
 	INIT_LIST_HEAD(&mtk_state->list);
-	kref_init(&mtk_state->kref);
 
 	return &mtk_state->base;
 }
@@ -2446,7 +2430,16 @@ static const struct drm_mode_config_funcs mtk_drm_mode_config_funcs = {
 	.atomic_check = mtk_atomic_check,
 	.atomic_commit = mtk_atomic_commit,
 	.atomic_state_alloc = mtk_drm_atomic_state_alloc,
-	.atomic_state_free = mtk_atomic_state_put,
+	/*
+	 * Leave atomic_state_free NULL: DRM already calls
+	 * drm_atomic_state_clear() and drm_atomic_state_default_release()
+	 * before invoking this hook.  mtk_atomic_state_free() repeated both,
+	 * destroying connector state twice and freeing the state arrays before
+	 * the second clear (KASAN: kmalloc-192 right-redzone overwrite).
+	 * struct mtk_atomic_state embeds drm_atomic_state at offset 0, so the
+	 * default kfree(state) releases the whole allocation.
+	 */
+	.atomic_state_free = NULL,
 };
 
 static const enum mtk_ddp_comp_id mt2701_mtk_ddp_main[] = {
@@ -12294,11 +12287,15 @@ static int mtk_drm_sys_suspend(struct device *dev)
 		goto OUT;
 
 	//DDPMSG("%s\n");
-	drm_kms_helper_poll_disable(drm);
+	if (drm->mode_config.poll_enabled)
+		drm_kms_helper_poll_disable(drm);
 
+	WRITE_ONCE(private->suspend_owner, current);
 	private->suspend_state = drm_atomic_helper_suspend(drm);
+	WRITE_ONCE(private->suspend_owner, NULL);
 	if (IS_ERR(private->suspend_state)) {
-		drm_kms_helper_poll_enable(drm);
+		if (drm->mode_config.poll_enabled)
+			drm_kms_helper_poll_enable(drm);
 		return PTR_ERR(private->suspend_state);
 	}
 OUT:
@@ -12314,6 +12311,8 @@ static int mtk_drm_sys_resume(struct device *dev)
 {
 	struct mtk_drm_private *private = dev_get_drvdata(dev);
 	struct drm_device *drm;
+	struct drm_modeset_acquire_ctx ctx;
+	int err = 0;
 
 	drm = private->drm;
 	if (!drm)
@@ -12324,13 +12323,28 @@ static int mtk_drm_sys_resume(struct device *dev)
 		return 0;
 	}
 
-	drm_atomic_helper_resume(drm, private->suspend_state);
-	drm_kms_helper_poll_enable(drm);
+	/*
+	 * drm_atomic_helper_resume() calls drm_mode_config_reset(), and
+	 * mtk_dsi_connector_reset() frees connector->state while the duplicated
+	 * suspend state still references it.  The later atomic-state teardown
+	 * then touches freed memory (KFENCE: memory corruption in
+	 * drm_atomic_helper_connector_destroy_state).  Commit the duplicated
+	 * state directly; it already carries the full pre-suspend configuration.
+	 */
+	WRITE_ONCE(private->suspend_owner, current);
+	DRM_MODESET_LOCK_ALL_BEGIN(drm, ctx, 0, err);
+	err = drm_atomic_helper_commit_duplicated_state(private->suspend_state, &ctx);
+	DRM_MODESET_LOCK_ALL_END(drm, ctx, err);
+	WRITE_ONCE(private->suspend_owner, NULL);
 
+	drm_atomic_state_put(private->suspend_state);
 	private->suspend_state = NULL;
 
+	if (drm->mode_config.poll_enabled)
+		drm_kms_helper_poll_enable(drm);
+
 	DRM_DEBUG_DRIVER("%s\n", __func__);
-	return 0;
+	return err;
 }
 #endif
 

@@ -2359,14 +2359,23 @@ static int scp_pm_event(struct notifier_block *notifier,
 {
 	switch (pm_event) {
 	case PM_SUSPEND_PREPARE:
-		mt_scp_dump_sleep_count();
-		if (scpreg.low_pwr_dbg)
+		/*
+		 * The sleep-count dump issues a synchronous IPI (IPI_SEND_WAIT)
+		 * to the SCP.  During PM_SUSPEND_PREPARE the SCP never answers
+		 * it, so the notifier blocks the whole suspend transition in
+		 * mtk_ipi_send_compl().  It is a diagnostic only, so it is now
+		 * opt-in via low_pwr_dbg instead of running on every suspend.
+		 */
+		if (scpreg.low_pwr_dbg) {
+			mt_scp_dump_sleep_count();
 			mt_scp_start_res_prof();
+		}
 		return NOTIFY_DONE;
 	case PM_POST_SUSPEND:
-		mt_scp_dump_sleep_count();
-		if (scpreg.low_pwr_dbg)
+		if (scpreg.low_pwr_dbg) {
+			mt_scp_dump_sleep_count();
 			mt_scp_stop_res_prof();
+		}
 		return NOTIFY_DONE;
 	}
 	return NOTIFY_OK;

@@ -3289,11 +3289,14 @@ static int scp_device_probe(struct platform_device *pdev)
 			continue;
 		}
 
-		ret = enable_irq_wake(scp_mboxdev.info_table[i].irq_num);
-		if (ret < 0) {
-			pr_notice("[SCP]mbox%d enable irq fail\n", i);
-			continue;
-		}
+		/*
+		 * The mbox IRQs are requested with IRQF_NO_SUSPEND by mtk-mbox,
+		 * so they cannot also be armed as system wakeup sources: the
+		 * combination makes irq_may_run() report a misconfigured IRQ and
+		 * lets pending SCP mailbox traffic abort every suspend attempt.
+		 * Keep them as normal always-on IRQs and leave wakeup to the
+		 * dedicated IPC0/IPC1 lines.
+		 */
 		mbox_setup_pin_table(i);
 	}
 
