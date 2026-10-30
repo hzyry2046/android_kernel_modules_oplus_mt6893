@@ -122,6 +122,8 @@ static uint32_t private_key2[4] = { 0 };
 
 static struct mtk_charger *pinfo;
 static bool legacy_charger_ntc;
+/* One-shot log for the missing charger-IC NTC, see oplus_get_temp_volt(). */
+static bool legacy_chargeric_ntc_logged;
 static char *legacy_charger_supplied_to[] = { "battery" };
 static u32 legacy_subboard_pull_up_r = 200000;
 
@@ -4936,6 +4938,8 @@ static int psy_charger_get_property(struct power_supply *psy,
 			val->intval = -127;
 #else
 		val->intval = oplus_get_chargeric_temp();
+		if (val->intval == -ENODATA)
+			return -ENODATA;
 #endif
 		break;
 	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
@@ -7969,8 +7973,19 @@ static int oplus_get_temp_volt(struct ntc_temp *ntc_param)
 		break;
 	case NTC_CHARGER_IC:
 		if (!pinfo->chargeric_temp_chan) {
-			chg_err("chargeric_temp_chan NULL\n");
-			return -1;
+			/* This board has no charger-IC NTC: the 20615 product DT
+			 * only provides auxadc3-bat_id_temp, auxadc4-usb_temp_v_l
+			 * and auxadc5-usb_temp_v_r, and 4.19 never asked for a
+			 * chargeric channel either.  Userspace polls the charger's
+			 * TEMP property, so log the absence once instead of on
+			 * every read.
+			 */
+			if (!legacy_chargeric_ntc_logged) {
+				legacy_chargeric_ntc_logged = true;
+				chg_err("no charger-IC NTC on this board (legacy_charger_ntc=%d); TEMP reports -ENODATA\n",
+					legacy_charger_ntc);
+			}
+			return -ENODATA;
 		}
 		temp_chan = pinfo->chargeric_temp_chan;
 		break;
@@ -8308,6 +8323,13 @@ static int oplus_get_chargeric_temp(void)
 		chg_err("null pinfo\n");
 		return TEMP_25C;
 	}
+
+	/* No charger-IC NTC on this board: do not feed a bogus NTC voltage into
+	 * oplus_res_to_temp() (ui_dwvolt is unsigned, so a negative return would
+	 * turn into a huge reading), just report the absence.
+	 */
+	if (!pinfo->chargeric_temp_chan)
+		return -ENODATA;
 
 	if (!is_param_init) {
 		ntc_param.e_ntc_type = NTC_CHARGER_IC;

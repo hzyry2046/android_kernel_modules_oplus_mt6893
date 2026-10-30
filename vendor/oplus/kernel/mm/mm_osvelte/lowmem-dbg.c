@@ -39,8 +39,15 @@
 #include "sys-memstat.h"
 #include "lowmem-dbg.h"
 
+/* Only reachable through android_debug_symbol() in the CONFIG_SLUB_DEBUG dump
+ * path below; keep the declarations conditional so a release kernel (SLUB
+ * debug off, which is what the op6893 bootloader would otherwise force on
+ * every slab) does not fail -Wunused-variable.
+ */
+#ifdef CONFIG_SLUB_DEBUG
 static struct list_head *debug_slab_caches;
 static struct mutex *debug_slab_mutex;
+#endif
 
 static void lowmem_dbg_dump(struct work_struct *work);
 
