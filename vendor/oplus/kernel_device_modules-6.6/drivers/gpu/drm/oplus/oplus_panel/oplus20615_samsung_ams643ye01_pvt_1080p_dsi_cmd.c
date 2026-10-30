@@ -561,10 +561,20 @@ static int lcm_panel_ldo3_regulator_init(struct device *dev)
     pr_err("get lcm_panel_ldo3_regulator_init\n");
 
 	/* please only get regulator once in a driver */
-	disp_ldo3 = regulator_get(dev, "VMC");
-	if (IS_ERR(disp_ldo3)) { /* handle return value */
-		ret = PTR_ERR(disp_ldo3);
-		pr_err("get ldo3 fail, error: %d\n", ret);
+	/* The board DT has no "VMC-supply" for this panel.  The 4.19 tree's own
+	 * copy of this driver is identical and gets no supply either, so the
+	 * stock kernel logs the same "set voltage disp_ldo3 fail, ret = -22"
+	 * twice per boot -- it is not a 6.6 regression.  The DT is read-only for
+	 * this port, so ask optionally: absent means NULL (instead of a dummy
+	 * regulator that rejects every voltage) and the enable/disable paths
+	 * below do nothing, which is what already happens in practice.
+	 */
+	disp_ldo3 = devm_regulator_get_optional(dev, "VMC");
+	if (IS_ERR(disp_ldo3) || !disp_ldo3) {
+		ret = IS_ERR(disp_ldo3) ? PTR_ERR(disp_ldo3) : -ENODEV;
+		pr_info("no VMC supply, panel ldo3 left untouched (%d)\n", ret);
+		disp_ldo3 = NULL;
+		regulator_inited = 1;
 		return ret;
 	}
 	regulator_inited = 1;
@@ -578,6 +588,9 @@ static int lcm_panel_ldo3_enable(struct device *dev)
 	int retval = 0;
 
 	lcm_panel_ldo3_regulator_init(dev);
+
+	if (!disp_ldo3)
+		return 0;
 
 	/* set voltage with min & max*/
 	ret = regulator_set_voltage(disp_ldo3, 3000000, 3000000);
@@ -601,6 +614,9 @@ static int lcm_panel_ldo3_disable(struct device *dev)
 	int retval = 0;
 
 	lcm_panel_ldo3_regulator_init(dev);
+
+	if (!disp_ldo3)
+		return 0;
 
 	ret = regulator_disable(disp_ldo3);
 	if (ret < 0)

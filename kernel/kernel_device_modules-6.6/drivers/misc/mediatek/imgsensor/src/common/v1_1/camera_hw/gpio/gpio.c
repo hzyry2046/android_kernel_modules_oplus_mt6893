@@ -585,13 +585,19 @@ static enum IMGSENSOR_RETURN gpio_init(
 						str_pinctrl_name);
 			}
 
+			/* The board DT defines only a handful of these states
+			 * (rst, mclk, one ldo per sensor).  The 4.19 tree lists the
+			 * same reference table and fails the same way, so this is
+			 * not a 6.6 regression -- but with the DT read-only for this
+			 * port, "the board does not define this pin state" is a
+			 * supported configuration, not an error: gpio_set() already
+			 * skips NULL entries.  Log at debug and keep going.
+			 */
 			if (pgpio->ppinctrl_state_cam[j][i] == NULL ||
 				IS_ERR(pgpio->ppinctrl_state_cam[j][i])) {
-				pr_info(
-					"ERROR: %s : pinctrl err, %s\n",
-					__func__,
-					str_pinctrl_name);
-				ret = IMGSENSOR_RETURN_ERROR;
+				pgpio->ppinctrl_state_cam[j][i] = NULL;
+				PK_DBG("%s : no pinctrl state %s on this board\n",
+					__func__, str_pinctrl_name);
 			}
 		}
 	}
@@ -730,7 +736,7 @@ static enum IMGSENSOR_RETURN gpio_set(
 	if (ppinctrl_state != NULL && !IS_ERR(ppinctrl_state))
 		pinctrl_select_state(pgpio->ppinctrl, ppinctrl_state);
 	else
-		PK_PR_ERR("%s : pinctrl err, PinIdx %d, Val %d\n",
+		PK_DBG("%s : no pinctrl state for PinIdx %d, Val %d\n",
 			__func__, pin, pin_state);
 
 	mutex_unlock(pgpio->pgpio_mutex);
