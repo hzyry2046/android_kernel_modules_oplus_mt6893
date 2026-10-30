@@ -114,11 +114,10 @@ static const struct file_operations wv_fops = {
 #endif
 };
 
-static int wv_probe(struct platform_device *pdev)
+static int wv_create_device(void)
 {
 	int ret = 0;
 
-	WV_LOG(0, "start probe\n");
 	// create char device
 	ret = alloc_chrdev_region(&wv_devt, 0, 1, WV_DEVNAME);
 	if (ret < 0) {
@@ -173,6 +172,12 @@ out:
 	return ret;
 }
 
+static int wv_probe(struct platform_device *pdev)
+{
+	WV_LOG(0, "start probe\n");
+	return wv_create_device();
+}
+
 static int wv_remove(struct platform_device *pdev)
 {
 	WV_LOG(0, "remove device\n");
@@ -218,6 +223,19 @@ static int __init mtk_wv_init(void)
 	if (platform_driver_register(&mtk_wv_driver)) {
 		WV_LOG(0, "failed to register widevine device\n");
 		return -ENODEV;
+	}
+
+	/* This board's runtime DT has no "mediatek,drm_wv" node: LK builds it from
+	 * the dtbo partition, so editing the boot image's appended DTB chain does
+	 * not reach the kernel (verified -- the node is in the image and absent
+	 * from /proc/device-tree).  The driver needs no resources, and without the
+	 * device node the ROM's Widevine HAL has nothing to open, so create it
+	 * here when no DT node matched.
+	 */
+	if (!wv_device) {
+		WV_LOG(0, "no DT node, creating %s directly\n", WV_DEVNAME);
+		if (wv_create_device())
+			WV_LOG(0, "device create failed\n");
 	}
 
 	return 0;

@@ -115,10 +115,26 @@ endif
 #==========================================================================
 # MTEE Multiple Chunk Devices & Geniezone Peer Driver
 #==========================================================================
+# Two different things live under mtee_impl:
+#
+#   tmem_carveout_heap.o is peer-neutral -- it is where
+#   tmem_register_ffa_module()/tmem_ffa_page_alloc()/tmem_ffa_page_free() are
+#   defined, and proc.c calls tmem_register_ffa_module() unconditionally, so
+#   the object is required even on a non-MTEE build.  Without it the module
+#   ends up with three unresolved symbols at depmod time.
+#
+#   mtee_devices.o/mtee_ops.o/mtee_invoke.o are the MicroTrust/GenieZone peer
+#   glue: mtee_ops.c includes <kree/system.h> and friends, and
+#   mtee_devices.c calls get_mtee_peer_ops() from it, so they stand or fall
+#   together.  This board runs Trustonic with GenieZone and MicroTrust
+#   deliberately off, so they stay out.
+trusted_mem-y += mtee_impl/tmem_carveout_heap.o
+
+ifneq ($(filter y m,$(CONFIG_MICROTRUST_TEE_SUPPORT)\
+				  $(CONFIG_MTK_GZ_KREE)),)
 trusted_mem-y += mtee_devices.o
 trusted_mem-y += mtee_impl/mtee_ops.o
 trusted_mem-y += mtee_impl/mtee_invoke.o
-trusted_mem-y += mtee_impl/tmem_carveout_heap.o
 ccflags-y += -DMTEE_DEVICES_SUPPORT
 
 ifneq ($(filter y m,$(CONFIG_ARM_FFA_TRANSPORT)),)
@@ -126,6 +142,7 @@ tmem_ffa-y += mtee_devices.o
 tmem_ffa-y += mtee_impl/mtee_ops.o
 tmem_ffa-y += mtee_impl/mtee_invoke.o
 tmem_ffa-y += mtee_impl/tmem_ffa.o
+endif
 endif
 endif # !CONFIG_MTK_TRUSTED_MEMORY_SUBSYSTEM
 
