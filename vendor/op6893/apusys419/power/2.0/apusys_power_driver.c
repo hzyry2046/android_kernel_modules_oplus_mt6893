@@ -48,8 +48,12 @@ static uint8_t power_info_force_print;
 
 static bool enable;
 static bool power_ready;
+static bool allow_power_on;
 module_param(enable, bool, 0400);
 MODULE_PARM_DESC(enable, "Opt in to blocked-probe diagnostics; physical owner/bootstrap is not implemented");
+module_param(allow_power_on, bool, 0400);
+MODULE_PARM_DESC(allow_power_on,
+	"Opt in to the real APU bootstrap (devinfo, MMIO, rails, clocks, RPC, checked owner). Off by default: the physical resource ledger, PG/PM ordering and IOMMU lifecycle are not complete, so a normal boot must never take this path.");
 
 bool apusys_power_check(void)
 {
@@ -906,10 +910,15 @@ static int apu_power_probe(struct platform_device *pdev)
 
 	if (!enable)
 		return -ENODEV;
-	/* Failure propagation alone does not establish a safe hardware owner. */
-	dev_err(&pdev->dev,
-		"legacy APU power blocked: physical resource ledger, PG, PM and IOMMU lifecycle missing\n");
-	return -EOPNOTSUPP;
+	/* Failure propagation alone does not establish a safe hardware owner.
+	 * The bootstrap below is complete enough to build and to exercise with the
+	 * host fixtures, but the physical resource ledger, PG/PM ordering and the
+	 * IOMMU lifecycle are not, so taking it stays an explicit opt-in. */
+	if (!allow_power_on) {
+		dev_err(&pdev->dev,
+			"legacy APU power blocked: physical resource ledger, PG, PM and IOMMU lifecycle missing (allow_power_on=1 to override)\n");
+		return -EOPNOTSUPP;
+	}
 
 	ret = apu_legacy_devinfo_init();
 	if (ret)
