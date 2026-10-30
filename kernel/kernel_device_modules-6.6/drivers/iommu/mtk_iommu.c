@@ -3016,14 +3016,36 @@ out:
 
 		apunode = of_parse_phandle(dev->of_node, "mediatek,apu-power", 0);
 		if (!apunode) {
-			dev_warn(dev, "Can't find apu power node!\n");
-			return -EINVAL;
+			/*
+			 * op6893: the board DT's APU M4U nodes carry no
+			 * "mediatek,apu-power" phandle, and the DT is read-only
+			 * for this port, so fall back to the APU power node's
+			 * compatible.
+			 */
+			apunode = of_find_compatible_node(NULL, NULL,
+							  "mediatek,apusys_power");
+		}
+		if (!apunode) {
+			dev_info(dev, "no apu power node, deferring\n");
+			return -EPROBE_DEFER;
 		}
 		apudev = of_find_device_by_node(apunode);
 		if (!apudev) {
 			of_node_put(apunode);
-			dev_warn(dev, "Find apudev fail!\n");
-			return -ENODEV;
+			dev_info(dev, "apu power device not created, deferring\n");
+			return -EPROBE_DEFER;
+		}
+		if (!apudev->dev.driver) {
+			/*
+			 * The APU power driver is not bound (it is not part of
+			 * this image), so the domain is off and every register
+			 * access below would hit unpowered hardware.  Wait for a
+			 * real power owner instead of proceeding without one.
+			 */
+			dev_info(dev, "apu power driver not bound, deferring\n");
+			platform_device_put(apudev);
+			of_node_put(apunode);
+			return -EPROBE_DEFER;
 		}
 
 		link = device_link_add(&apudev->dev, dev, DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
@@ -3933,12 +3955,16 @@ static const struct mtk_iommu_plat_data mt6893_data_iommu3 = {
  * deferred forever on iommu_present() -- which is why /dev/dri was never
  * created even with every display component bound.
  *
- * Only the two MM instances are mapped.  cell-index 2/3 are the APU M4Us
- * (LINK_WITH_APU); the APU power domain is not brought up in this tree, so
- * leave them unprobed rather than touching their registers.
+ * cell-index 2/3 are the APU M4Us.  They are wired in so the instances have a
+ * driver, but their probe defers until the APU power device is bound (see the
+ * LINK_WITH_APU branch below): reading an M4U register inside an unpowered APU
+ * domain is the hazard that kept them out of this table during bring-up.
+ * While CONFIG_MTK_APUSYS_SUPPORT is not part of the image they simply stay
+ * deferred, which costs nothing.
  */
 static const struct mtk_iommu_plat_data * const mt6893_legacy_iommu_data[] = {
-	&mt6893_data_iommu0, &mt6893_data_iommu1, NULL, NULL,
+	&mt6893_data_iommu0, &mt6893_data_iommu1,
+	&mt6893_data_iommu2, &mt6893_data_iommu3,
 };
 
 static const struct mtk_iommu_plat_data *mtk_iommu_legacy_plat_data(struct device *dev)
