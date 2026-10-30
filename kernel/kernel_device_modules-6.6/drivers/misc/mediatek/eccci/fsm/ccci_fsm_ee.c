@@ -623,12 +623,14 @@ void ccci_dump_md_in_devapc(char *user_info)
 static enum devapc_cb_status devapc_dump_adv_cb(uint32_t vio_addr)
 {
 	int count;
-
-	CCCI_NORMAL_LOG(0, FSM,
-		"[%s] vio_addr: 0x%x; is normal mdee: %d\n",
-		__func__, vio_addr, s_is_normal_mdee);
+	static unsigned long last_dump;
+	static unsigned long suppressed;
 
 	if (ccci_fsm_get_md_state() == EXCEPTION && s_is_normal_mdee) {
+		CCCI_NORMAL_LOG(0, FSM,
+			"[%s] vio_addr: 0x%x; is normal mdee: %d\n",
+			__func__, vio_addr, s_is_normal_mdee);
+
 		count = ccci_fsm_increase_devapc_dump_counter();
 
 		CCCI_NORMAL_LOG(0, FSM,
@@ -641,7 +643,26 @@ static enum devapc_cb_status devapc_dump_adv_cb(uint32_t vio_addr)
 
 	} else {
 		atomic_set(&md_dapc_ke_occurred, 1);
-		ccci_dump_md_in_devapc((char *)__func__);
+		/* A modem restart or a flight-mode transition raises thousands
+		 * of these in a burst, and dump_md_info_in_devapc() reads the
+		 * whole CCIF/queue/SMEM state and prints it -- 10k of them is
+		 * ~50k log lines and it rotated the log buffer out from under
+		 * an unrelated suspend investigation.  Keep the first dump of
+		 * each burst (that is the one with useful evidence), count the
+		 * rest, and say so once the burst is over.  The return values
+		 * are untouched: the KE decision below is the caller's
+		 * contract, not ours.
+		 */
+		if (time_after(jiffies, last_dump + msecs_to_jiffies(5000))) {
+			CCCI_NORMAL_LOG(0, FSM,
+				"[%s] vio_addr: 0x%x; is normal mdee: %d; %lu earlier dumps suppressed\n",
+				__func__, vio_addr, s_is_normal_mdee, suppressed);
+			suppressed = 0;
+			last_dump = jiffies;
+			ccci_dump_md_in_devapc((char *)__func__);
+		} else {
+			suppressed++;
+		}
 
 		/*
 		 * debug patch

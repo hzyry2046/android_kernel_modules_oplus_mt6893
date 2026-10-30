@@ -89,8 +89,9 @@ static bool is_devmpu_violation(unsigned int emi_id,
 
 	if (dump_cnt >= 2 && dump_reg[2].offset == 0x1fc) {
 		target_dump_bit = (dump_reg[2].value >> 21) & 0x3;
-		pr_info("%s:%d emi(%d), offset(0x%x), value(0x%x)\n", __func__,
-				__LINE__, emi_id, dump_reg[2].offset, dump_reg[2].value);
+		pr_info_ratelimited("%s:%d emi(%d), offset(0x%x), value(0x%x)\n",
+				__func__, __LINE__, emi_id, dump_reg[2].offset,
+				dump_reg[2].value);
 	}
 	if (target_dump_bit)
 		is_devmpu_vio = true;
@@ -206,7 +207,13 @@ static irqreturn_t emimpu_violation_irq(int irq, void *dev_id)
 	}
 
 	if (nr_vio) {
-		pr_info("%s: %s", __func__, mpu->vio_msg);
+		/* vio_msg carries one line per dumped register per EMI instance,
+		 * and a modem restart / flight-mode transition can raise
+		 * thousands of DEVMPU violations in a burst.  Unthrottled this
+		 * print alone filled a 4 MB log buffer and rotated out the
+		 * evidence of whatever else was being debugged.
+		 */
+		pr_info_ratelimited("%s: %s", __func__, mpu->vio_msg);
 		mpu->in_msg_dump = 1;
 		schedule_work(&emimpu_work);
 	}
