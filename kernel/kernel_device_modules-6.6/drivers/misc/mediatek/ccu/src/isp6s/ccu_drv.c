@@ -2120,10 +2120,29 @@ static int __init CCU_INIT(void)
 		"dvfsrc-vcore");
 
 	/*Call mmdvfs_qos_get_freq_steps to get supported frequency*/
-	_step_size = dev_pm_opp_get_opp_count(g_ccu_device->dev);
-	_g_freq_steps = kcalloc(_step_size, sizeof(u64), GFP_KERNEL);
+	/* dev_pm_opp_get_opp_count() returns a negative errno when there is no
+	 * OPP table yet -- at module_init g_ccu_device->dev is still NULL, so
+	 * that is exactly what happens here.  _step_size is unsigned, so the
+	 * errno used to turn into ~4G steps and kcalloc() asked the page
+	 * allocator for an impossible order (WARN at mm/page_alloc.c:4675 on
+	 * every boot).  Keep the table empty in that case; the request path
+	 * already rejects every level when _step_size is 0.
+	 */
+	{
+		int steps = dev_pm_opp_get_opp_count(g_ccu_device->dev);
 
-	while (!IS_ERR(opp = dev_pm_opp_find_freq_ceil(g_ccu_device->dev,
+		if (steps <= 0) {
+			LOG_ERR("get MMDVFS freq steps failed (%d), QoS table left empty\n",
+				steps);
+			_step_size = 0;
+			_g_freq_steps = NULL;
+		} else {
+			_step_size = steps;
+			_g_freq_steps = kcalloc(_step_size, sizeof(u64), GFP_KERNEL);
+		}
+	}
+
+	while (_g_freq_steps && !IS_ERR(opp = dev_pm_opp_find_freq_ceil(g_ccu_device->dev,
 		&freq))) {
 		_g_freq_steps[fi] = freq;
 		freq++;

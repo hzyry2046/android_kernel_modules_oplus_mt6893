@@ -409,8 +409,14 @@ static int scp_update_pmic_vow_lp_mode(bool on)
 	int ret = 0;
 
 	if (g_dvfs_dev.vlp_support || g_dvfs_dev.bypass_pmic_rg_access) {
-		pr_notice("[%s]: VCORE DVS is not supported\n", __func__);
-		WARN_ON(1);
+		/*
+		 * The WARN here asserts "VCORE DVS is configured but the PMIC
+		 * path is bypassed".  On this board the DTB has no PMIC phandle
+		 * and no dvfsrc-vscp supply at all, i.e. no VCORE DVS is a
+		 * supported configuration rather than a bug, and the WARN fired
+		 * on every suspend/resume.  Say it once at notice level.
+		 */
+		pr_notice_once("[%s]: VCORE DVS is not supported\n", __func__);
 		return -ESCP_DVFS_DVS_SHOULD_BE_BYPASSED;
 	}
 
@@ -591,8 +597,12 @@ static void scp_vcore_request(unsigned int clk_opp)
 	if (g_dvfs_dev.vlp_support)
 		return;
 
-	/* SCP vcore request to PMIC */
-	if (g_dvfs_dev.pmic_sshub_en)
+	/* SCP vcore request to PMIC.  bypass_pmic_rg_access means the board's DT
+	 * gives the AP no PMIC handle (the SCP firmware owns the rail over
+	 * SSHub), so there is no register path to fail -- calling it anyway only
+	 * produced "dvfsrc vcore update error" plus a WARN on every request.
+	 */
+	if (g_dvfs_dev.pmic_sshub_en && !g_dvfs_dev.bypass_pmic_rg_access)
 		ret = scp_set_pmic_vcore(clk_opp);
 
 	idx = scp_get_freq_idx(clk_opp);
@@ -608,14 +618,21 @@ static void scp_vcore_request(unsigned int clk_opp)
 	 * if opp[idx].dvfsrc_opp == NO_DVFSRC_OPP, means that
 	 * opp[idx] is not supported by DVFSRC
 	 */
-	if (g_dvfs_dev.opp[idx].dvfsrc_opp != NO_DVFSRC_OPP)
+	/* A zero vcore means the DT carries no voltage table for this OPP (this
+	 * board's scp_dvfs node has none); regulator_set_voltage(0, 0) then fails
+	 * with -EINVAL and the WARN below fires on every request.  Nothing to set
+	 * is not an error.
+	 */
+	if (g_dvfs_dev.opp[idx].dvfsrc_opp != NO_DVFSRC_OPP && dvfsrc_vscp_power &&
+	    g_dvfs_dev.opp[idx].vcore) {
 		ret = regulator_set_voltage(dvfsrc_vscp_power,
 			g_dvfs_dev.opp[idx].vcore,
 			g_dvfs_dev.opp[idx].vcore);
-	if (ret) {
-		pr_notice("[%s]: dvfsrc vcore update error, opp: %d\n",
-			__func__, idx);
-		WARN_ON(1);
+		if (ret) {
+			pr_notice("[%s]: dvfsrc vcore update error, opp: %d\n",
+				__func__, idx);
+			WARN_ON(1);
+		}
 	}
 
 	/* SCP vcore request to SPM */
@@ -2915,11 +2932,18 @@ static int __init mt_scp_dts_init(struct platform_device *pdev)
 	}
 
 	if (!g_dvfs_dev.vlp_support) {
-		/* get dvfsrc regulator */
-		dvfsrc_vscp_power = regulator_get(&pdev->dev, PROPNAME_SCP_DVFSRC);
+		/* get dvfsrc regulator.  _optional so that "the DT has no such
+		 * supply" yields NULL instead of a dummy regulator: this board's
+		 * scp_dvfs node declares none, and every set_voltage() on the
+		 * dummy fails and ends in a WARN.  Same pattern as reg_vcore and
+		 * reg_vsram just below.
+		 */
+		dvfsrc_vscp_power = devm_regulator_get_optional(&pdev->dev,
+							       PROPNAME_SCP_DVFSRC);
 		if (IS_ERR(dvfsrc_vscp_power) || !dvfsrc_vscp_power) {
 			pr_notice("regulator dvfsrc-vscp is not available\n");
 			ret = PTR_ERR(dvfsrc_vscp_power);
+			dvfsrc_vscp_power = NULL;
 			goto PASS;
 		}
 
