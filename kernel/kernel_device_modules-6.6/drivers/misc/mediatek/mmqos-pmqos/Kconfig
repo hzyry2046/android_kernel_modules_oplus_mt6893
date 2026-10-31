@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config MTK_MMQOS_PMQOS_LEGACY
+	tristate "MM QoS / SMI BWC front end for the 4.19 mmdvfs_pmqos board contract"
+	depends on OF
+	help
+	  The op6893 board DT is the 4.19 one: it describes multimedia QoS
+	  with a single "mediatek,mmdvfs_pmqos" node carrying the per-larb
+	  port ratios, the max-OSTD larbs, the VCORE OPP steps and the
+	  clock-mux frequency steps for every multimedia class.
+
+	  The 6.6 multimedia QoS stack (mmqos-common + mmqos-mt6893) instead
+	  expects a "mediatek,mt6893-mmqos" node with larbs-supply and
+	  commons-supply phandles plus per-consumer "interconnects"
+	  properties.  None of that exists in the board DT, so on this port
+	  nothing consumes the QoS contract at all.
+
+	  This driver consumes the contract the board DT actually provides.
+	  Stage 1 parses and validates it and exports it through debugfs
+	  without touching any hardware.
+
+	  If unsure, say N.
