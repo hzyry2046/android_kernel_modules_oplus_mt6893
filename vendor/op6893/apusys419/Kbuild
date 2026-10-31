@@ -7,13 +7,19 @@ ccflags-y += -I$(srctree)/$(src)/include -I$(srctree)/$(src)/midware/1.1 -I$(src
 ccflags-y += -I$(srctree)/$(src)/power/2.0 -I$(srctree)/$(src)/power/2.0/mt6885
 ccflags-y += -I$(srctree)/$(src)/reviser/1.0 -I$(srctree)/$(src)/mnoc/1.0
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/include/mt-plat
+# The middleware's debug tag ring (mdw_tag.c) is built on apu_tags_*/apu_tp_*,
+# which live in the native APUSYS tree that cannot be loaded alongside this
+# port.  Build with the header's inline stubs instead -- the same shape as a
+# vendor build with CONFIG_MTK_APUSYS_DEBUG=n.  Nothing functional depends on it.
+ccflags-y += -DAPUSYS_LEGACY_NO_TAGS
 apusys_legacy_mdw-y := abi_layout.o midware/1.1/mdw_drv.o \
  midware/1.1/mdw_usr.o midware/1.1/mdw_dbg.o midware/1.1/mdw_rsc.o \
  midware/1.1/mdw_cmn.o midware/1.1/mdw_cmd.o midware/1.1/mdw_sched.o \
  midware/1.1/mdw_queue.o midware/1.1/mdw_queue_norm.o \
  midware/1.1/mdw_queue_deadline.o midware/1.1/mdw_dispr.o \
  midware/1.1/mdw_mem.o midware/1.1/mdw_mem_dmabuf.o \
- midware/1.1/mdw_fence.o midware/1.1/mdw_sysfs.o
+ midware/1.1/mdw_fence.o midware/1.1/mdw_sysfs.o \
+ mnoc/1.0/mnoc_qos_none.o
 apusys_legacy_mdw-$(CONFIG_FTRACE) += util/apusys_trace.o
 
 obj-m += apusys_legacy_reviser.o

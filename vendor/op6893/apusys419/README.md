@@ -29,11 +29,13 @@ scripts/build_apusys_legacy.sh dvfsrc-regulators
 ```
 
 `objects` builds the three ARM64 relocatable objects with the existing prepared
-kernel configuration. `modules` runs strict modpost and currently fails on
-missing MNOC QoS implementations. `providers` builds just power and Reviser
-with strict modpost; both .ko files now build successfully. `clocks`/`iommu`
-compile the related native objects for offline verification. The symbol audit also returns
-nonzero for this incomplete closure. Never use warning-only modpost to treat
+kernel configuration. `modules` now builds power, Reviser and middleware in that
+order with strict modpost and no unresolved symbols: each stage appends its
+`Module.symvers` because the middleware imports the provider's exports. The
+native APUSYS tree exports the same `apu_*` names, so its entries are filtered
+out of the merged symvers -- building both is fine, loading both is not.
+`providers` builds just power and Reviser. `clocks`/`iommu` compile the related
+native objects for offline verification. Never use warning-only modpost to treat
 these objects as loadable modules.
 
 The ioctl/task headers retain the old layout. `abi_layout.c` checks the ARM64
@@ -105,7 +107,18 @@ DT binding; enabling it also clears SRAM and sends initialization IPIs.
 Host tests: `tools/apusys-probe/test_legacy_qos.sh`. The scheduler now rejects
 Reviser/QoS prerequisite failures before engine submission, completes device
 references, excludes negative bandwidth values, and preserves multicore errors.
-Full strict modpost still requires real `apu_cmd_qos_start/end` implementations.
+`apu_cmd_qos_start/end` are provided by `mnoc/1.0/mnoc_qos_none.c`, which is
+explicitly *not* a QoS implementation: it is the vendor's own
+`MNOC_QOS_ENABLE=0` shape (start returns 0, end returns 0 bandwidth, nothing is
+programmed, one notice is printed on first use). The real provider needs the
+MNOC shared-buffer layout, the DT binding, an SRAM clear and initialization
+IPIs; `mt6893_qos_snapshot.h` is only a checked layout helper. Do not read
+`sc->bw` from this build as a bandwidth measurement.
+
+`mdw_tag.c` (the debug tag ring) is built out via `-DAPUSYS_LEGACY_NO_TAGS`
+because its `apu_tags_*`/`apu_tp_*` backend lives in the native APUSYS tree that
+cannot be co-loaded with this port. This is the same shape as a vendor build
+with `CONFIG_MTK_APUSYS_DEBUG=n`; nothing functional depends on it.
 
 Sixth-batch checked SSPM sampler: `qos_transport/` builds separately with
 `build_apusys_legacy.sh ipi-modules` then `qos-transport`; default `enable=0`.
