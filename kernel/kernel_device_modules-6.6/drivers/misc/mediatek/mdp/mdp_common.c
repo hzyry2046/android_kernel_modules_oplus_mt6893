@@ -2247,6 +2247,86 @@ static void mdp_parse_opp(struct platform_device *pdev, const char *ref,
 	*volt_out = volts;
 }
 
+/*
+ * op6893: the board DT is the 4.19 one and has no "mdp-opp"/"isp-opp"
+ * phandles, so dev_pm_opp_get_opp_count() returns -ENODEV and mdp_pmqos_freq
+ * stays NULL.  cmdq_mdp_begin_task_virtual() then returns at its first check
+ * ("if (!mdp_pmqos_freq) goto done") and no bandwidth is ever computed, so no
+ * icc request is ever issued.
+ *
+ * The same steps are in the board's mmdvfs_pmqos node, descending, with a
+ * vopp index instead of a microvolt:
+ *
+ *     mdp_step0..3 = 594/416/312/273 MHz   opp_table_mdp = 273/312/416/594
+ *     img_step0..3 = 624/416/343/273 MHz   opp_table_img = 273/343/416/624
+ *
+ * They agree exactly -- the 6.6 mt6893.dtsi opp tables are these numbers in
+ * ascending order -- so read them from there rather than leaving MDP with no
+ * frequency input at all.
+ *
+ * The microvolts are filled with 0, deliberately.  The board's step entries
+ * carry a vopp index, and turning that into microvolts needs DVFSRC's VCORE
+ * table (mtk_dvfsrc_vcore_uv_table), whose module is not staged and whose
+ * controller does not probe on this board -- it would return 0 anyway.  It
+ * does not matter: mdp_request_voltage() only reaches a regulator or an
+ * mmdvfs clock, and this board has neither.
+ *
+ * Returns the number of steps stored, or a negative errno.
+ */
+#define MDP_PMQOS_MAX_STEP	8
+static int mdp_parse_opp_from_pmqos(const char *class, u64 **freq_out,
+	int **volt_out)
+{
+	struct device_node *np;
+	struct property *prop;
+	const char *step_name;
+	char freq_prop[32];
+	u64 desc[MDP_PMQOS_MAX_STEP] = {0};
+	u32 cell[4];
+	u64 *speeds;
+	int *volts;
+	int n = 0, i;
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mmdvfs_pmqos");
+	if (!np)
+		return -ENODEV;
+
+	snprintf(freq_prop, sizeof(freq_prop), "%s_freq", class);
+	of_property_for_each_string(np, freq_prop, prop, step_name) {
+		if (n >= MDP_PMQOS_MAX_STEP)
+			break;
+		if (of_property_read_u32_array(np, step_name, cell,
+					       ARRAY_SIZE(cell)))
+			continue;
+		desc[n++] = cell[0];	/* MHz */
+	}
+
+	of_node_put(np);
+
+	if (!n)
+		return -ENODEV;
+
+	speeds = kcalloc(n, sizeof(*speeds), GFP_KERNEL);
+	volts = kcalloc(n, sizeof(*volts), GFP_KERNEL);
+	if (!speeds || !volts) {
+		kfree(speeds);
+		kfree(volts);
+		return -ENOMEM;
+	}
+
+	/* Ascending, which is what mdp_request_voltage()'s scan expects. */
+	for (i = 0; i < n; i++)
+		speeds[i] = desc[n - 1 - i];
+
+	*freq_out = speeds;
+	*volt_out = volts;
+
+	CMDQ_LOG("%s no OPP table; board %s_freq gives %d steps %llu..%llu MHz\n",
+		 __func__, class, n, speeds[0], speeds[n - 1]);
+
+	return n;
+}
+
 static void cmdq_mdp_init_pmqos(struct platform_device *pdev)
 {
 	u32 i = 0;
@@ -2282,6 +2362,39 @@ static void cmdq_mdp_init_pmqos(struct platform_device *pdev)
 		if (cmdq_mdp_get_func()->mdpIsCaminSupport())
 			mdp_parse_opp(pdev, "isp-opp", mdp_pmqos_opp_num,
 				&isp_pmqos_freq, &isp_volts);
+	} else {
+		/*
+		 * op6893: no OPP table in the board DT.  Without a frequency
+		 * input cmdq_mdp_begin_task_virtual() bails out and MDP never
+		 * issues an icc request, so fall back to the steps the board
+		 * does describe.  Both tables must be the same length:
+		 * isp_t() indexes isp_pmqos_freq with mdp_pmqos_opp_num.
+		 */
+		int steps = mdp_parse_opp_from_pmqos("mdp",
+						    &mdp_pmqos_freq,
+						    &mdp_volts);
+
+		if (steps > 0) {
+			mdp_pmqos_opp_num = steps;
+			if (cmdq_mdp_get_func()->mdpIsCaminSupport()) {
+				int isp_steps =
+					mdp_parse_opp_from_pmqos("img",
+								 &isp_pmqos_freq,
+								 &isp_volts);
+
+				if (isp_steps != steps) {
+					CMDQ_ERR("%s isp steps %d != mdp steps %d, isp pmqos disabled\n",
+						 __func__, isp_steps, steps);
+					kfree(isp_pmqos_freq);
+					kfree(isp_volts);
+					isp_pmqos_freq = NULL;
+					isp_volts = NULL;
+				}
+			}
+		} else {
+			CMDQ_ERR("%s no OPP table and no board step table (%d); icc requests stay off\n",
+				 __func__, steps);
+		}
 	}
 
 	/* Get regulator instance by name */
@@ -2292,8 +2405,18 @@ static void cmdq_mdp_init_pmqos(struct platform_device *pdev)
 			CMDQ_LOG("%s get mmdvfs clk failed\n", __func__);
 	}
 
-	if (cmdq_mdp_get_func()->mdpIsCaminSupport())
-		isp_mmdvfs_reg = devm_regulator_get(&pdev->dev, "isp-dvfsrc-vcore");
+	/*
+	 * op6893: the board DT has no isp-dvfsrc-vcore supply either.  Ask for
+	 * it optionally -- devm_regulator_get() hands back a dummy regulator
+	 * whose set_voltage() always fails, which would be one error line per
+	 * task now that the frequency path is live.
+	 */
+	if (cmdq_mdp_get_func()->mdpIsCaminSupport()) {
+		isp_mmdvfs_reg = devm_regulator_get_optional(&pdev->dev,
+							    "isp-dvfsrc-vcore");
+		if (IS_ERR(isp_mmdvfs_reg))
+			isp_mmdvfs_reg = NULL;
+	}
 
 }
 
@@ -2741,9 +2864,17 @@ static void mdp_request_voltage(unsigned long frequency, bool is_mdp)
 
 	if (is_mdp) {
 		if (IS_ERR_OR_NULL(mdp_mmdvfs_reg)) {
-			if (IS_ERR_OR_NULL(mdp_mmdvfs_clk))
-				CMDQ_ERR("%s wrong mdp_mmdvfs_clk\n", __func__);
-			else {
+			if (IS_ERR_OR_NULL(mdp_mmdvfs_clk)) {
+				/*
+				 * op6893: the board DT has neither a
+				 * mdp-dvfsrc-vcore regulator nor an mmdvfs_clk,
+				 * so there is no voltage owner here.  That is a
+				 * known gap, reported once at probe, not a
+				 * per-job error -- this runs on every task.
+				 */
+				CMDQ_LOG_PMQOS("%s no mmdvfs clk on this board\n",
+					       __func__);
+			} else {
 				if (mmdvfs_get_version())
 					mtk_mmdvfs_enable_vcp(true, VCP_PWR_USR_MDP);
 				ret = clk_set_rate(mdp_mmdvfs_clk, frequency * 1000000);
@@ -2761,7 +2892,11 @@ static void mdp_request_voltage(unsigned long frequency, bool is_mdp)
 					__func__, ret);
 		}
 	} else {
-		if (cmdq_mdp_get_func()->mdpIsCaminSupport()) {
+		if (IS_ERR_OR_NULL(isp_mmdvfs_reg)) {
+			/* op6893: no ISP voltage owner in the board DT. */
+			CMDQ_LOG_PMQOS("%s no isp vcore owner on this board\n",
+				       __func__);
+		} else if (cmdq_mdp_get_func()->mdpIsCaminSupport()) {
 			ret = regulator_set_voltage(isp_mmdvfs_reg, low_volt, INT_MAX);
 			if (ret)
 				CMDQ_ERR("%s regulator_set_voltage(isp) fail ret:%d\n",

@@ -560,6 +560,31 @@ static const s8 mmqos_larb_common[MMQOS_MAX_LARB] = {
 	[7] = 0, [8] = 1, [9] = 1, [10] = -1, [11] = 0, [12] = -1,
 	[13] = 1, [14] = 0, [15] = -1, [16] = 1, [17] = 0, [18] = 1,
 	[19] = 0, [20] = 0,
+	/*
+	 * The synthetic larbs.  These numbers are the vendor node table's,
+	 * not 4.19's VIRTUAL_*_LARB_ID enum: mmqos-mt6893.c puts Virt-CCU at
+	 * 22 and Virt-Disp at 23, and the 6.6 dtsi agrees (disp_hrt_qos is a
+	 * path from SLAVE_LARB(23) to SLAVE_COMMON(0), ccu_g from
+	 * SLAVE_LARB(21) to SLAVE_COMMON(1)).  larb21 is the CCU's write
+	 * port, which is why the vendor marks it is_write.
+	 */
+	[21] = 1, [22] = 0, [23] = 0, [24] = 0,
+};
+
+/*
+ * A few consumer names resolve to a synthetic larb rather than to a port, so
+ * the path starts at the larb node itself.  Display's HRT vote is one of them
+ * and it is the main display QoS request, so leaving it out kept
+ * priv->hrt_bw_request NULL and the whole display bandwidth path dead.
+ */
+struct mmqos_larb_name {
+	const char *name;
+	u32 larb;
+};
+
+static const struct mmqos_larb_name mmqos_larb_names[] = {
+	{ "disp_hrt_qos", 23 },	/* Virt-Disp */
+	{ "ccu_g", 21 },	/* Virt-CCU write port */
 };
 
 static const char *const mmqos_common_names[MMQOS_COMMON_NUM] = {
@@ -657,12 +682,24 @@ static int mmqos_icc_add_common(struct mmqos_contract *c, struct mmqos_icc *icc,
 static int mmqos_icc_add_larb(struct mmqos_contract *c, struct mmqos_icc *icc,
 			      u32 larb)
 {
+	struct mmqos_icc_node *priv;
 	struct icc_node *node;
 	int ret;
+
+	if (icc->larb[larb])
+		return 0;
+	if (larb >= MMQOS_MAX_LARB || mmqos_larb_common[larb] < 0)
+		return -EINVAL;
 
 	node = mtk_icc_node_create(MMQOS_NODE_LARB(larb));
 	if (IS_ERR(node))
 		return PTR_ERR(node);
+
+	priv = devm_kzalloc(c->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	priv->is_write = (larb == 21);	/* Virt-CCU write port */
+	node->data = priv;
 
 	snprintf(icc->larb_name[larb], sizeof(icc->larb_name[larb]),
 		 "larb%u", larb);
@@ -691,10 +728,22 @@ static int mmqos_icc_add_master(struct mmqos_contract *c, struct mmqos_icc *icc,
 		return mtk_icc_node_add_alias(node, p->name);
 	}
 
-	if (larb >= MMQOS_MAX_LARB || !c->larb[larb].present) {
-		mmqos_warn(c, "%s maps to larb%u, which the contract does not list; node skipped\n",
-			   p->name, larb);
+	if (larb >= MMQOS_MAX_LARB) {
+		mmqos_error(c, "%s maps to larb%u, out of range\n", p->name, larb);
 		return 0;
+	}
+	if (!c->larb[larb].present) {
+		/*
+		 * A synthetic larb (21..24).  The board's larb_groups does not
+		 * list them because they have no SMI port table, but they are
+		 * real path endpoints: disp_hrt_qos starts at Virt-Disp.
+		 */
+		ret = mmqos_icc_add_larb(c, icc, larb);
+		if (ret) {
+			mmqos_warn(c, "%s: synthetic larb%u unavailable (%d), node skipped\n",
+				   p->name, larb, ret);
+			return 0;
+		}
 	}
 
 	node = mtk_icc_node_create(MMQOS_NODE_MASTER(p->port));
@@ -746,6 +795,24 @@ static int mmqos_icc_build(struct mmqos_contract *c, struct mmqos_icc *icc)
 
 	for (i = 0; i < c->nlarb_groups; i++) {
 		ret = mmqos_icc_add_larb(c, icc, c->larb_groups[i]);
+		if (ret)
+			goto err;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(mmqos_larb_names); i++) {
+		const struct mmqos_larb_name *ln = &mmqos_larb_names[i];
+
+		if (ln->larb >= MMQOS_MAX_LARB ||
+		    mmqos_larb_common[ln->larb] < 0) {
+			mmqos_error(c, "%s maps to larb%u, which has no common\n",
+				    ln->name, ln->larb);
+			ret = -EINVAL;
+			goto err;
+		}
+		ret = mmqos_icc_add_larb(c, icc, ln->larb);
+		if (ret)
+			goto err;
+		ret = mtk_icc_node_add_alias(icc->larb[ln->larb], ln->name);
 		if (ret)
 			goto err;
 	}
