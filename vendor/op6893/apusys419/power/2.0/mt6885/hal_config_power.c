@@ -103,6 +103,14 @@ static int uninit_power_resource(void);
 static int apusys_power_reg_dump(struct apu_power_info *info, int force);
 static void power_debug_func(void *param);
 static int hw_init_setting(void);
+
+/* Experiment switch, see the comment at the write site in hw_init_setting(). */
+static bool skip_top_con_sleep;
+module_param(skip_top_con_sleep, bool, 0400);
+MODULE_PARM_DESC(skip_top_con_sleep,
+	"Skip APU_RPC_TOP_CON bit0 (sleep request enable); setting it makes the whole APUSYS register space unreachable from the AP");
+
+
 static int buck_control(enum DVFS_USER user, int level);
 static int rpc_power_status_check(int domain_idx, unsigned int enable);
 static int apu_pm_handler(void *param);
@@ -362,10 +370,22 @@ static int hw_init_setting(void)
 	udelay(100);
 
 #if !BYPASS_POWER_OFF
-	// sleep request enable
-	regValue = DRV_Reg32(APU_RPC_TOP_CON);
-	regValue |= 0x1;
-	DRV_WriteReg32(APU_RPC_TOP_CON, regValue);
+	/* sleep request enable
+	 *
+	 * Experiment switch: setting this bit makes the APU RPC take the
+	 * subsystem down, and from that moment the AP can no longer reach any
+	 * APUSYS peripheral register -- RPC, apu_conn, apu_vcore, both APU
+	 * M4Us and DEVAPC all answer a single constant value with a ~7 ms
+	 * per-read latency, which is a bus timeout.  Clearing the bit again
+	 * does not bring the window back; only a reboot does.  With it set the
+	 * APU M4U page-table base cannot be programmed from the AP at all, so
+	 * the APUSYS IOMMU port needs this skipped while that is investigated.
+	 */
+	if (!skip_top_con_sleep) {
+		regValue = DRV_Reg32(APU_RPC_TOP_CON);
+		regValue |= 0x1;
+		DRV_WriteReg32(APU_RPC_TOP_CON, regValue);
+	}
 
 	return rpc_power_status_check(0, 0);
 #else
