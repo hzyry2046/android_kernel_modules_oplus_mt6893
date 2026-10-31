@@ -114,16 +114,39 @@ void apu_tp_exit(struct apu_tp_tbl *tbl)
 static struct apu_checked_client *vpu_clients[APUSYS_DVFS_USER_NUM];
 static struct apu_checked_lease *vpu_leases[APUSYS_DVFS_USER_NUM];
 
+/*
+ * Experiment hook: take the VPU0 lease during probe so the APU VPU domain is
+ * actually up while the engine maps its firmware and builds its algorithm
+ * tables.  Without it the domain is only powered when the char device is
+ * opened, which this standalone module does not provide, and every mapping is
+ * done against a powered-down APU M4U.
+ */
+static bool power_on_probe;
+module_param(power_on_probe, bool, 0400);
+MODULE_PARM_DESC(power_on_probe,
+		 "Take the VPU0 checked lease during probe (experiment only)");
+
 int apu_power_device_register(enum DVFS_USER user, struct platform_device *pdev)
 {
+	int ret;
+
 	if (!apusys_power_check())
 		return -EPROBE_DEFER;
 	if (user < 0 || user >= APUSYS_DVFS_USER_NUM || !pdev)
 		return -EINVAL;
 	if (vpu_clients[user])
 		return 0;
-	return apu_power_checked_client_register(user, &pdev->dev, THIS_MODULE,
-						 NULL, NULL, &vpu_clients[user]);
+	ret = apu_power_checked_client_register(user, &pdev->dev, THIS_MODULE,
+						NULL, NULL, &vpu_clients[user]);
+	if (ret)
+		return ret;
+	if (power_on_probe && user == VPU0) {
+		ret = apu_device_power_on(user);
+		if (ret)
+			pr_info("apusys_legacy_vpu: probe-time VPU0 power-on failed: %d\n",
+				ret);
+	}
+	return 0;
 }
 
 int apu_device_power_on(enum DVFS_USER user)

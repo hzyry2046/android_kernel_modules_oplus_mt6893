@@ -4103,6 +4103,16 @@ int spm_mtcmos_vpu(int state)
 		/* mt6893: no need to wait for power down.*/
 		INCREASE_STEPS;
 	} else {
+		/*
+		 * op6893 6.6 bring-up: the auto-generated loop here has no
+		 * bound, and this domain is only reached from the opt-in APU
+		 * experiment.  A domain that never comes up must not wedge the
+		 * whole system, so give up after ~100ms and say so -- the
+		 * caller turns that into a WARN_ON and the APU power driver
+		 * quarantines the transition instead of pretending success.
+		 */
+		unsigned int wait = 0;
+
 		spm_write(EXT_BUCK_ISO, spm_read(EXT_BUCK_ISO) &
 							~(0x00000021));
 
@@ -4112,6 +4122,12 @@ int spm_mtcmos_vpu(int state)
 
 		while ((spm_read(OTHER_PWR_STATUS) & (0x1UL << 5)) !=
 							(0x1UL << 5)) {
+			if (++wait > 1000) {
+				pr_err("%s: VPU domain did not power up, OTHER_PWR_STATUS=0x%x\n",
+				       __func__, spm_read(OTHER_PWR_STATUS));
+				return -ETIMEDOUT;
+			}
+			udelay(100);
 			ram_console_update();
 		}
 		INCREASE_STEPS;
@@ -4722,6 +4738,29 @@ static int enable_subsys(enum subsys_id id)
 		case SYS_CONN:
 			spm_mtcmos_ctrl_conn(STA_POWER_ON);
 			break;
+		/*
+		 * op6893 6.6 bring-up: SYS_VPU is the only other domain whose
+		 * consumer can actually be loaded here (apusys_power, gated on
+		 * enable_apu + the opt-in legacy APU experiment).  Without this
+		 * arm the whole power-on path below returns success while never
+		 * un-gating the domain, which is exactly how the APU M4Us ended
+		 * up with every register reading 0: enable_apu_mtcmos(1) ->
+		 * clk_prepare_enable(mtcmos_scp_sys_vpu) -> pg_enable() ->
+		 * enable_subsys(SYS_VPU) -> nothing.
+		 *
+		 * It also has to clear the APU conn/vcore gate bits, which the
+		 * real path does through enable_subsys_hwcg().  Those wrappers
+		 * gate the APU peripheral space itself: with the mtcmos on but
+		 * the CGs still powered down, every APU M4U register reads back
+		 * a constant 0x7 (measured) instead of a register file.
+		 */
+		case SYS_VPU:
+			r = spm_mtcmos_vpu(STA_POWER_ON);
+			if (r)
+				return r;
+			if (clk_apu_vcore_base && clk_apu_conn_base)
+				enable_subsys_hwcg(id);
+			return 0;
 		default:
 			break;
 		}
@@ -4792,7 +4831,9 @@ static int disable_subsys(enum subsys_id id)
 		case SYS_CONN:
 			spm_mtcmos_ctrl_conn(STA_POWER_DOWN);
 			break;
-
+		/* see the matching note in enable_subsys() */
+		case SYS_VPU:
+			return spm_mtcmos_vpu(STA_POWER_DOWN);
 		default:
 			break;
 		}
