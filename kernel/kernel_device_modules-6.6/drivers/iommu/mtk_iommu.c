@@ -45,6 +45,10 @@
 
 #include "mtk_iommu.h"
 #include "mt6893_legacy_apu_ports.h"
+/* For enum subsys_id / struct pg_callbacks / register_pg_callback(), which is
+ * how 4.19 hangs mtk_iommu_pg_after_on()/before_off() off the subsystem power
+ * transitions.  The header is self-contained (a plain enum plus one struct). */
+#include "../clk/mediatek/clk-mt6893-pg.h"
 
 #define REG_MMU_PT_BASE_ADDR			0x000
 
@@ -230,6 +234,10 @@
 #define LEGACY_MULTI_LARB		BIT(26)
 #define PM_DOMAIN_SKIP			BIT(27)
 #define CHECK_MMINFRA_POWER		BIT(28)
+/* The M4U register file lives in a subsystem mtcmos domain: it answers only
+ * while that domain is up and loses its contents when it goes down, so the
+ * page-table base has to be (re)written from the power-on callback. */
+#define M4U_IN_POWER_DOMAIN		BIT(29)
 #define POWER_ON_STA		1
 #define POWER_OFF_STA		0
 
@@ -1822,15 +1830,33 @@ static int mtk_iommu_attach_device(struct iommu_domain *domain,
 			pm_runtime_put(m4udev);
 			goto out_unlock;
 		}
-		writel(dom->cfg.arm_v7s_cfg.ttbr, data->base + REG_MMU_PT_BASE_ADDR);
 
-		pr_info("%s, iommu_dev:%s(%d,%d), user_dev:%s, pgtable:0x%lx -- 0x%x -- 0x%x, tab_id:%d\n",
-			__func__, dev_name(data->dev), data->plat_data->iommu_type,
-			data->plat_data->iommu_id, dev_name(dev),
-			(unsigned long)dom->cfg.arm_v7s_cfg.ttbr,
-			dom->cfg.arm_v7s_cfg.ttbr,
-			readl_relaxed(data->base + REG_MMU_PT_BASE_ADDR),
-			dom->tab_id);
+		if (MTK_IOMMU_HAS_FLAG(data->plat_data, M4U_IN_POWER_DOMAIN) &&
+		    !data->poweron) {
+			/* 4.19 takes exactly this branch for the APU M4Us: the
+			 * domain is down at attach, so the register file would
+			 * swallow the write.  Keep the value and let the
+			 * power-on callback restore it. */
+			data->reg.pt_base = dom->cfg.arm_v7s_cfg.ttbr;
+			pr_info("%s, iommu_dev:%s(%d,%d), user_dev:%s, backup pgtable:0x%lx -- 0x%x, tab_id:%d\n",
+				__func__, dev_name(data->dev),
+				data->plat_data->iommu_type,
+				data->plat_data->iommu_id, dev_name(dev),
+				(unsigned long)dom->cfg.arm_v7s_cfg.ttbr,
+				data->reg.pt_base, dom->tab_id);
+		} else {
+			writel(dom->cfg.arm_v7s_cfg.ttbr,
+			       data->base + REG_MMU_PT_BASE_ADDR);
+
+			pr_info("%s, iommu_dev:%s(%d,%d), user_dev:%s, pgtable:0x%lx -- 0x%x -- 0x%x, tab_id:%d\n",
+				__func__, dev_name(data->dev),
+				data->plat_data->iommu_type,
+				data->plat_data->iommu_id, dev_name(dev),
+				(unsigned long)dom->cfg.arm_v7s_cfg.ttbr,
+				dom->cfg.arm_v7s_cfg.ttbr,
+				readl_relaxed(data->base + REG_MMU_PT_BASE_ADDR),
+				dom->tab_id);
+		}
 
 #if IS_ENABLED(CONFIG_MTK_IOMMU_MISC_SECURE)
 		if (MTK_IOMMU_HAS_FLAG(data->plat_data, IOMMU_MAU_EN) &&
@@ -2172,6 +2198,126 @@ static void mtk_iommu_get_resv_regions(struct device *dev,
 		list_add_tail(&region->list, head);
 	}
 }
+
+/*
+ * The APU M4Us sit in the SYS_VPU mtcmos domain.  Their register file only
+ * answers while that domain is up and loses its contents when it goes down, so
+ * the page-table base and the interrupt/MAU configuration have to be written
+ * again on every power-on.  4.19 does this from mtk_iommu_pg_after_on() /
+ * before_off(), registered with register_pg_callback(); this driver had none of
+ * it, so the page-table base written at attach was lost and every later TLB
+ * flush went to a M4U that had no page table at all.
+ *
+ * The write lands *before* the APU RPC acknowledges the power-on, i.e. while
+ * the domain is still effectively off, which is exactly the window in which the
+ * APU M4U register file does answer AP accesses.
+ */
+static void mtk_iommu_pg_reg_backup(struct mtk_iommu_data *data)
+{
+	void __iomem *base = data->base;
+	unsigned long flags;
+
+	spin_lock_irqsave(&data->tlb_lock, flags);
+	data->reg.misc_ctrl = readl_relaxed(base + REG_MMU_MISC_CTRL);
+	data->reg.dcm_dis = readl_relaxed(base + REG_MMU_DCM_DIS);
+	data->reg.ctrl_reg = readl_relaxed(base + REG_MMU_CTRL_REG);
+	data->reg.int_control0 = readl_relaxed(base + REG_MMU_INT_CONTROL0);
+	data->reg.int_main_control = readl_relaxed(base + REG_MMU_INT_MAIN_CONTROL);
+	data->reg.pt_base = readl_relaxed(base + REG_MMU_PT_BASE_ADDR);
+	data->reg.wr_len_ctrl = readl_relaxed(base + REG_MMU_WR_LEN_CTRL);
+	spin_unlock_irqrestore(&data->tlb_lock, flags);
+}
+
+static void mtk_iommu_pg_reg_restore(struct mtk_iommu_data *data)
+{
+	void __iomem *base = data->base;
+	unsigned long flags;
+	u32 readback;
+
+	spin_lock_irqsave(&data->tlb_lock, flags);
+	writel_relaxed(data->reg.misc_ctrl, base + REG_MMU_MISC_CTRL);
+	writel_relaxed(data->reg.dcm_dis, base + REG_MMU_DCM_DIS);
+	writel_relaxed(data->reg.ctrl_reg, base + REG_MMU_CTRL_REG);
+	writel_relaxed(data->reg.int_control0, base + REG_MMU_INT_CONTROL0);
+	writel_relaxed(data->reg.int_main_control, base + REG_MMU_INT_MAIN_CONTROL);
+	writel_relaxed(data->reg.wr_len_ctrl, base + REG_MMU_WR_LEN_CTRL);
+	writel_relaxed(data->reg.pt_base, base + REG_MMU_PT_BASE_ADDR);
+	wmb();
+	readback = readl_relaxed(base + REG_MMU_PT_BASE_ADDR);
+	spin_unlock_irqrestore(&data->tlb_lock, flags);
+
+	dev_info(data->dev,
+		 "power-domain restore: PT_BASE wrote 0x%08x read back 0x%08x (%s)\n",
+		 data->reg.pt_base, readback,
+		 readback == data->reg.pt_base ? "LANDED" : "LOST");
+}
+
+static void mtk_iommu_pg_after_on(enum subsys_id sys)
+{
+	struct mtk_iommu_data *data;
+
+	if (sys != SYS_VPU)
+		return;
+
+	/* m4ulist, not apu_iommu_list: the APU instances carry SHARE_PGTABLE,
+	 * so probe links them into the shared m4ulist and apu_iommu_list stays
+	 * empty.  Walking the wrong one silently did nothing. */
+	for_each_m4u(data, &m4ulist) {
+		if (!MTK_IOMMU_HAS_FLAG(data->plat_data, M4U_IN_POWER_DOMAIN))
+			continue;
+		if (!data->base || data->poweron)
+			continue;
+		data->poweron = true;
+		mtk_iommu_pg_reg_restore(data);
+	}
+}
+
+static void mtk_iommu_pg_before_off(enum subsys_id sys)
+{
+	struct mtk_iommu_data *data;
+
+	if (sys != SYS_VPU)
+		return;
+
+	/* see the note in mtk_iommu_pg_after_on() about m4ulist */
+	for_each_m4u(data, &m4ulist) {
+		if (!MTK_IOMMU_HAS_FLAG(data->plat_data, M4U_IN_POWER_DOMAIN))
+			continue;
+		if (!data->base || !data->poweron)
+			continue;
+		mtk_iommu_pg_reg_backup(data);
+		data->poweron = false;
+	}
+}
+
+static struct pg_callbacks mtk_iommu_pg_handle = {
+	.after_on = mtk_iommu_pg_after_on,
+	.before_off = mtk_iommu_pg_before_off,
+};
+static int pg_callback_registered;
+
+/*
+ * Off by default, on purpose.
+ *
+ * Registering the callback is what 4.19 does and it is the only place the APU
+ * M4U page-table base can be written after the domain powers up, so the code
+ * stays.  But measured on this port, at exactly that moment, the write does not
+ * land: "power-domain restore: PT_BASE wrote 0x0e920001 read back 0x00000000
+ * (LOST)" for both instances.  Worse, each access to that window costs ~7 ms
+ * (bus timeout), and eight registers on two instances inside the clock
+ * enable path's spinlock is enough to break the APU RPC handshake: VPU0
+ * power-on went from "get ret=0 state=2" to "get ret=-5".
+ *
+ * So the default keeps the working power-on and the attach-time "backup"
+ * branch (which is 4.19's behaviour and no longer does a pointless write);
+ * mtk_iommu.pg_restore=1 turns the whole 4.19 model on -- callback plus
+ * powering the clocks back down at the end of probe -- to reproduce the
+ * measurement.
+ */
+static bool pg_restore;
+module_param(pg_restore, bool, 0400);
+MODULE_PARM_DESC(pg_restore,
+		 "Restore the APU M4U registers from the SYS_VPU power-on callback (4.19 behaviour; measured LOST and disturbs the power-on handshake on this port)");
 
 static const struct iommu_ops mtk_iommu_ops = {
 	.domain_alloc	= mtk_iommu_domain_alloc,
@@ -3292,6 +3438,15 @@ skip_smi:
 			pr_info("%s notifier err, dev:%s\n", __func__, dev_name(dev));
 	} else if (data->plat_data->iommu_type == APU_IOMMU) {
 		apu_pm_sta[data->plat_data->iommu_id] = POWER_OFF_STA;
+
+		/* One registration covers every APU instance; the callback walks
+		 * m4ulist (see mtk_iommu_pg_after_on).  Gated on pg_restore --
+		 * see the note at its definition. */
+		if (!pg_callback_registered) {
+			if (pg_restore)
+				register_pg_callback(&mtk_iommu_pg_handle);
+			pg_callback_registered = 1;
+		}
 	}
 
 #if IS_ENABLED(CONFIG_DEVICE_MODULES_MTK_SMI) && !IOMMU_BRING_UP
@@ -3304,6 +3459,30 @@ skip_smi:
 #endif
 
 	mtk_iommu_isr_pause_timer_init(data);
+
+	if (pg_restore && data->apu_clk_on) {
+		/* 4.19 ends its probe with mtk_iommu_power_switch(data, false):
+		 * the clocks were only enabled to run the hardware init.  They
+		 * have to go back off, otherwise the later APU power-on finds
+		 * PG_VPU already enabled, clk_prepare_enable() is a no-op, the
+		 * SYS_VPU power transition never runs, and the pg after_on()
+		 * callback -- the only place the page-table base gets written --
+		 * is never called.  Measured: the VPU0 power-on returned -110
+		 * with no "power-domain restore" line at all. */
+		for (i = 0; i < data->apu_clk_num; i++) {
+			if (data->apu_clks[i].id &&
+			    !strcmp(data->apu_clks[i].id, "power"))
+				continue;
+			clk_disable_unprepare(data->apu_clks[i].clk);
+		}
+		for (i = 0; i < data->apu_clk_num; i++) {
+			if (!data->apu_clks[i].id ||
+			    strcmp(data->apu_clks[i].id, "power"))
+				continue;
+			clk_disable_unprepare(data->apu_clks[i].clk);
+		}
+		data->apu_clk_on = 0;
+	}
 
 	pr_info("%s done dev:%s, head:%lx\n", __func__, dev_name(dev),
 		(unsigned long)data->hw_list);
@@ -3332,8 +3511,10 @@ static void mtk_iommu_remove(struct platform_device *pdev)
 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_BCLK))
 		clk_disable_unprepare(data->bclk);
 
-	for (i = 0; i < data->apu_clk_num; i++)
-		clk_disable_unprepare(data->apu_clks[i].clk);
+	if (data->apu_clk_on) {
+		for (i = 0; i < data->apu_clk_num; i++)
+			clk_disable_unprepare(data->apu_clks[i].clk);
+	}
 
 	device_link_remove(data->smicomm_dev, &pdev->dev);
 	pm_runtime_disable(&pdev->dev);
@@ -4012,7 +4193,8 @@ static const struct mtk_iommu_plat_data mt6893_data_iommu1 = {
 static const struct mtk_iommu_plat_data mt6893_data_iommu2 = {
 	.m4u_plat        = M4U_MT6893,
 	.flags           = LINK_WITH_APU | IOVA_34_EN | GET_DOM_ID_LEGACY |
-			   SHARE_PGTABLE | PGTABLE_PA_35_EN,
+			   SHARE_PGTABLE | PGTABLE_PA_35_EN |
+			   M4U_IN_POWER_DOMAIN,
 	.iommu_id	 = APU_IOMMU0,
 	.iommu_type      = APU_IOMMU,
 	.normal_dom      = 0,
@@ -4026,7 +4208,8 @@ static const struct mtk_iommu_plat_data mt6893_data_iommu2 = {
 static const struct mtk_iommu_plat_data mt6893_data_iommu3 = {
 	.m4u_plat        = M4U_MT6893,
 	.flags           = LINK_WITH_APU | IOVA_34_EN | GET_DOM_ID_LEGACY |
-			   SHARE_PGTABLE | PGTABLE_PA_35_EN,
+			   SHARE_PGTABLE | PGTABLE_PA_35_EN |
+			   M4U_IN_POWER_DOMAIN,
 	.iommu_id	 = APU_IOMMU1,
 	.iommu_type      = APU_IOMMU,
 	.normal_dom	 = 0,

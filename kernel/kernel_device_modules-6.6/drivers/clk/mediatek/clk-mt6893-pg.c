@@ -911,6 +911,10 @@ struct pg_callbacks *register_pg_callback(struct pg_callbacks *pgcb)
 
 	return pgcb;
 }
+/* Exported so drivers whose register file lives in one of these domains can
+ * save/restore it around the power transition -- the APU M4Us in mtk_iommu are
+ * the consumer here, exactly as 4.19's clk-mt6885-pg.c does it. */
+EXPORT_SYMBOL(register_pg_callback);
 
 static struct subsys *id_to_sys(unsigned int id)
 {
@@ -4751,11 +4755,27 @@ static int enable_subsys(enum subsys_id id)
 	 * space itself, so they have to be cleared *after* the mtcmos is up.
 	 */
 	if (id == SYS_VPU) {
+		struct pg_callbacks *pgcb;
+		unsigned long pgcb_flags;
+
 		r = spm_mtcmos_vpu(STA_POWER_ON);
 		if (r)
 			return r;
 		if (clk_apu_vcore_base && clk_apu_conn_base)
 			enable_subsys_hwcg(id);
+		/* The real path fires after_on() here -- after the mtcmos is up
+		 * and the CGs are cleared, but before the APU RPC acknowledges
+		 * the power-on (the caller does that next).  That ordering is
+		 * what lets the APU M4Us be re-programmed: their register file
+		 * answers the AP in this window, and the values survive the
+		 * transition.  Skipping it left mtk_iommu's page-table base
+		 * unwritten. */
+		spin_lock_irqsave(&pgcb_lock, pgcb_flags);
+		list_for_each_entry(pgcb, &pgcb_list, list) {
+			if (pgcb->after_on)
+				pgcb->after_on(id);
+		}
+		spin_unlock_irqrestore(&pgcb_lock, pgcb_flags);
 		return 0;
 	}
 
@@ -4830,8 +4850,20 @@ static int disable_subsys(enum subsys_id id)
 #if MT_CCF_BRINGUP
 	pr_debug("[CCF] %s: sys=%s, id=%d\n", __func__, sys->name, id);
 	/* see the matching note in enable_subsys() */
-	if (id == SYS_VPU)
+	if (id == SYS_VPU) {
+		struct pg_callbacks *pgcb;
+		unsigned long pgcb_flags;
+
+		/* before_off() while the register file still answers, then the
+		 * mtcmos down -- the same order the real path uses. */
+		spin_lock_irqsave(&pgcb_lock, pgcb_flags);
+		list_for_each_entry_reverse(pgcb, &pgcb_list, list) {
+			if (pgcb->before_off)
+				pgcb->before_off(id);
+		}
+		spin_unlock_irqrestore(&pgcb_lock, pgcb_flags);
 		return spm_mtcmos_vpu(STA_POWER_DOWN);
+	}
 
 	if (sys->ops->get_state(sys) == SUBSYS_PWR_ON) {
 		switch (id) {

@@ -33,6 +33,7 @@ struct mtk_iommu_suspend_reg {
 	u32				ctrl_reg;
 	u32				int_control0;
 	u32				int_main_control;
+	u32				pt_base;
 	u32				ivrp_paddr;
 	u32				vld_pa_rng;
 	u32				wr_len_ctrl;
@@ -176,6 +177,10 @@ struct mtk_iommu_data {
 	struct dma_iommu_mapping	*mapping[MTK_IOMMU_GROUP_MAX];
 #endif
 	bool                            enable_4GB;
+	/* M4U_IN_POWER_DOMAIN: the register file only answers while the
+	 * subsystem mtcmos is up, and loses its contents when it goes down.
+	 * Written only from the pg callback, never from attach. */
+	bool				poweron;
 	spinlock_t			tlb_lock; /* lock for tlb range flush */
 
 	struct iommu_device		iommu;
