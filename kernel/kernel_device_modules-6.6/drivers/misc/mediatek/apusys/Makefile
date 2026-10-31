@@ -365,8 +365,13 @@ apusys-objs += aps/aps_sysfs.o
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/apusys/hw_logger/
 apusys-objs += hw_logger/hw_logger.o
 
-# sapu
+# sapu: the secure-APU driver talks to GenieZone through its KREE_* API
+# (<kree/system.h>).  This board runs Trustonic with GenieZone deliberately
+# off, so the subtree cannot compile; gate it the way trusted_mem's MTEE peer
+# is gated instead of dropping APUSYS altogether.
+ifneq ($(filter y m,$(CONFIG_MTK_GZ_KREE)),)
 obj-$(CONFIG_MTK_APUSYS_SUPPORT) += sapu/
+endif
 
 # hw_sema
 ccflags-y += -I$(DEVICE_MODULES_PATH)/drivers/misc/mediatek/apusys/power/3.0/inc/
