@@ -34,6 +34,9 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 
+#include "mtk-interconnect-provider.h"
+#include "mmqos-port-names.h"
+
 #define MMQOS_MAX_STEP		6
 #define MMQOS_MAX_CLASS		10
 #define MMQOS_MAX_CLOCK		32
@@ -90,8 +93,12 @@ struct mmqos_larb {
 	bool is_max_ostd;
 };
 
+struct mmqos_icc;
+
 struct mmqos_contract {
 	struct device *dev;
+
+	struct mmqos_icc *icc;
 
 	int nclocks;
 	const char *clock_name[MMQOS_MAX_CLOCK];
@@ -529,6 +536,278 @@ static int mmqos_contract_parse(struct mmqos_contract *c,
 }
 
 /* ------------------------------------------------------------------ */
+/* Stage 2: an icc provider over the parsed contract                   */
+/* ------------------------------------------------------------------ */
+
+#define MMQOS_COMMON_NUM	2
+
+/*
+ * Node ids are private to this provider.  The board DT has no "interconnects"
+ * phandle pointing at us, so nothing depends on the vendor encoding; all that
+ * matters is that they are unique and positive.
+ */
+#define MMQOS_NODE_MASTER(port)	(0x40000000 | ((port) & 0x1fffff))
+#define MMQOS_NODE_LARB(larb)	(0x30000000 | ((larb) & 0xff))
+#define MMQOS_NODE_COMMON(c)	(0x10000000 | ((c) & 0xff))
+
+/*
+ * Which SMI common each larb hangs off, from the vendor node table
+ * (drivers/interconnect/mediatek/mmqos-mt6893.c).  Larbs 6/10/12/15 do not
+ * exist on this SoC and never appear in "larb_groups".
+ */
+static const s8 mmqos_larb_common[MMQOS_MAX_LARB] = {
+	[0] = 0, [1] = 0, [2] = 1, [3] = 1, [4] = 1, [5] = 0, [6] = -1,
+	[7] = 0, [8] = 1, [9] = 1, [10] = -1, [11] = 0, [12] = -1,
+	[13] = 1, [14] = 0, [15] = -1, [16] = 1, [17] = 0, [18] = 1,
+	[19] = 0, [20] = 0,
+};
+
+static const char *const mmqos_common_names[MMQOS_COMMON_NUM] = {
+	"smi-disp-common", "smi-mdp-common",
+};
+
+struct mmqos_icc_node {
+	bool is_write;
+};
+
+struct mmqos_icc {
+	struct icc_provider prov;
+	struct icc_node *common[MMQOS_COMMON_NUM];
+	struct icc_node *larb[MMQOS_MAX_LARB];
+	struct icc_node *master[ARRAY_SIZE(mmqos_port_names)];
+	int nmaster;
+	char larb_name[MMQOS_MAX_LARB][12];
+
+	/* observability only: Stage 2 programs nothing */
+	u64 set_calls;
+	u64 set_last_avg;
+	u64 set_last_peak;
+};
+
+static int mmqos_icc_aggregate(struct icc_node *node, u32 tag, u32 avg_bw,
+			       u32 peak_bw, u32 *agg_avg, u32 *agg_peak)
+{
+	*agg_avg += avg_bw;
+	if (peak_bw > *agg_peak)
+		*agg_peak = peak_bw;
+	return 0;
+}
+
+static bool mmqos_icc_path_is_write(struct icc_node *node)
+{
+	struct mmqos_icc_node *n = node->data;
+
+	return n ? n->is_write : false;
+}
+
+static int mmqos_icc_comm_chn_info(struct icc_node *src, struct icc_node *dst)
+{
+	return 0;
+}
+
+static int mmqos_icc_set(struct icc_node *src, struct icc_node *dst)
+{
+	struct mmqos_icc *icc = dst->provider->data;
+
+	/*
+	 * Stage 2 proves that the requests arrive and that they aggregate per
+	 * larb and per common.  Nothing is programmed here on purpose: the mux
+	 * step is driven by the MM pm_qos frequency classes in 4.19, and this
+	 * tree dropped them entirely, so there is no frequency input to act
+	 * on yet; the SMI OSTD/ratio write is Stage 4.
+	 */
+	icc->set_calls++;
+	icc->set_last_avg = dst->avg_bw;
+	icc->set_last_peak = dst->peak_bw;
+	return 0;
+}
+
+static struct icc_node *mmqos_icc_xlate(struct of_phandle_args *spec,
+					void *data)
+{
+	/* No board DT phandle points here; consumers resolve by name. */
+	return ERR_PTR(-EINVAL);
+}
+
+static struct icc_node *mmqos_icc_master_by_port(struct mmqos_icc *icc,
+						 u32 port)
+{
+	int i;
+
+	for (i = 0; i < icc->nmaster; i++)
+		if (icc->master[i]->id == MMQOS_NODE_MASTER(port))
+			return icc->master[i];
+	return NULL;
+}
+
+static int mmqos_icc_add_common(struct mmqos_contract *c, struct mmqos_icc *icc,
+				int idx)
+{
+	struct icc_node *node;
+
+	node = mtk_icc_node_create(MMQOS_NODE_COMMON(idx));
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+	node->name = mmqos_common_names[idx];
+	mtk_icc_node_add(node, &icc->prov);
+	icc->common[idx] = node;
+	return 0;
+}
+
+static int mmqos_icc_add_larb(struct mmqos_contract *c, struct mmqos_icc *icc,
+			      u32 larb)
+{
+	struct icc_node *node;
+	int ret;
+
+	node = mtk_icc_node_create(MMQOS_NODE_LARB(larb));
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+
+	snprintf(icc->larb_name[larb], sizeof(icc->larb_name[larb]),
+		 "larb%u", larb);
+	node->name = icc->larb_name[larb];
+	mtk_icc_node_add(node, &icc->prov);
+
+	ret = mtk_icc_link_create(node, MMQOS_NODE_COMMON(mmqos_larb_common[larb]));
+	if (ret)
+		return ret;
+
+	icc->larb[larb] = node;
+	return 0;
+}
+
+static int mmqos_icc_add_master(struct mmqos_contract *c, struct mmqos_icc *icc,
+				const struct mmqos_port_name *p)
+{
+	struct icc_node *node;
+	struct mmqos_icc_node *priv;
+	u32 larb = MTK_M4U_TO_LARB(p->port);
+	int ret;
+
+	node = mmqos_icc_master_by_port(icc, p->port);
+	if (node) {
+		/* Same hardware port, another QoS channel name. */
+		return mtk_icc_node_add_alias(node, p->name);
+	}
+
+	if (larb >= MMQOS_MAX_LARB || !c->larb[larb].present) {
+		mmqos_warn(c, "%s maps to larb%u, which the contract does not list; node skipped\n",
+			   p->name, larb);
+		return 0;
+	}
+
+	node = mtk_icc_node_create(MMQOS_NODE_MASTER(p->port));
+	if (IS_ERR(node))
+		return PTR_ERR(node);
+
+	priv = devm_kzalloc(c->dev, sizeof(*priv), GFP_KERNEL);
+	if (!priv)
+		return -ENOMEM;
+	priv->is_write = p->is_write;
+	node->data = priv;
+
+	node->name = p->name;
+	mtk_icc_node_add(node, &icc->prov);
+
+	ret = mtk_icc_link_create(node, MMQOS_NODE_LARB(larb));
+	if (ret)
+		return ret;
+
+	icc->master[icc->nmaster++] = node;
+	return 0;
+}
+
+static void mmqos_icc_teardown(struct mmqos_icc *icc);
+
+static int mmqos_icc_build(struct mmqos_contract *c, struct mmqos_icc *icc)
+{
+	int i, ret;
+
+	icc->prov.dev = c->dev;
+	icc->prov.set = mmqos_icc_set;
+	icc->prov.aggregate = mmqos_icc_aggregate;
+	icc->prov.path_is_write = mmqos_icc_path_is_write;
+	icc->prov.comm_chn_info = mmqos_icc_comm_chn_info;
+	icc->prov.xlate = mmqos_icc_xlate;
+	icc->prov.data = icc;
+
+	ret = mtk_icc_provider_add(&icc->prov);
+	if (ret) {
+		mmqos_error(c, "mtk_icc_provider_add failed (%d)\n", ret);
+		return ret;
+	}
+
+	for (i = 0; i < MMQOS_COMMON_NUM; i++) {
+		ret = mmqos_icc_add_common(c, icc, i);
+		if (ret)
+			goto err;
+	}
+
+	for (i = 0; i < c->nlarb_groups; i++) {
+		ret = mmqos_icc_add_larb(c, icc, c->larb_groups[i]);
+		if (ret)
+			goto err;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(mmqos_port_names); i++) {
+		ret = mmqos_icc_add_master(c, icc, &mmqos_port_names[i]);
+		if (ret)
+			goto err;
+	}
+
+	dev_info(c->dev,
+		 "icc provider up: %d larbs, %d ports, %d names, 2 commons\n",
+		 c->nlarb_groups, icc->nmaster,
+		 (int)ARRAY_SIZE(mmqos_port_names));
+	return 0;
+
+err:
+	mmqos_error(c, "icc provider build failed at entry %d (%d)\n", i, ret);
+	mmqos_icc_teardown(icc);
+	return ret;
+}
+
+static void mmqos_icc_teardown(struct mmqos_icc *icc)
+{
+	int i;
+
+	for (i = 0; i < icc->nmaster; i++) {
+		struct icc_node *node = icc->master[i];
+		u32 larb = MTK_M4U_TO_LARB(node->id & 0x1fffff);
+
+		if (larb < MMQOS_MAX_LARB && icc->larb[larb])
+			mtk_icc_link_destroy(node, icc->larb[larb]);
+		mtk_icc_node_del_alias(node);
+		mtk_icc_node_del(node);
+		mtk_icc_node_destroy(node->id);
+	}
+	icc->nmaster = 0;
+
+	for (i = 0; i < MMQOS_MAX_LARB; i++) {
+		struct icc_node *node = icc->larb[i];
+
+		if (!node)
+			continue;
+		mtk_icc_link_destroy(node,
+				     icc->common[mmqos_larb_common[i]]);
+		mtk_icc_node_del(node);
+		mtk_icc_node_destroy(node->id);
+		icc->larb[i] = NULL;
+	}
+
+	for (i = 0; i < MMQOS_COMMON_NUM; i++) {
+		if (!icc->common[i])
+			continue;
+		mtk_icc_node_del(icc->common[i]);
+		mtk_icc_node_destroy(icc->common[i]->id);
+		icc->common[i] = NULL;
+	}
+
+	mtk_icc_provider_del(&icc->prov);
+}
+
+/* ------------------------------------------------------------------ */
 /* debugfs: read-only view of the contract                             */
 /* ------------------------------------------------------------------ */
 
@@ -665,8 +944,133 @@ static const struct file_operations mmqos_contract_fops = {
 	.release = single_release,
 };
 
+static int mmqos_topology_show(struct seq_file *s, void *unused)
+{
+	struct mmqos_contract *c = s->private;
+	struct mmqos_icc *icc = c->icc;
+	int i;
+
+	if (!icc) {
+		seq_puts(s, "no icc provider registered\n");
+		return 0;
+	}
+
+	seq_printf(s, "provider: %d ports, %d larbs, set() calls %llu (last avg %llu peak %llu)\n",
+		   icc->nmaster, c->nlarb_groups, icc->set_calls,
+		   icc->set_last_avg, icc->set_last_peak);
+	seq_puts(s, "node                              avg         peak\n");
+	seq_puts(s, "--------------------------------------------------\n");
+
+	for (i = 0; i < MMQOS_COMMON_NUM; i++) {
+		if (!icc->common[i])
+			continue;
+		seq_printf(s, "%-30s %12u %12u\n", icc->common[i]->name,
+			   icc->common[i]->avg_bw, icc->common[i]->peak_bw);
+	}
+
+	for (i = 0; i < MMQOS_MAX_LARB; i++) {
+		if (!icc->larb[i])
+			continue;
+		seq_printf(s, "%-30s %12u %12u\n", icc->larb[i]->name,
+			   icc->larb[i]->avg_bw, icc->larb[i]->peak_bw);
+	}
+
+	return 0;
+}
+
+static int mmqos_topology_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mmqos_topology_show, inode->i_private);
+}
+
+static const struct file_operations mmqos_topology_fops = {
+	.owner = THIS_MODULE,
+	.open = mmqos_topology_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/*
+ * Stage 2 harness.  This exercises exactly the path the multimedia drivers
+ * use -- of_mtk_icc_get(dev, name) on a device whose node has no
+ * "interconnects" -- so a success here is the same resolution MDP would get.
+ *
+ *   echo "mdp_rdma0 1000 2000" > selftest
+ *
+ * The bandwidth is released again before returning, so the aggregates this
+ * prints are the ones produced by that single request.
+ */
+static ssize_t mmqos_selftest_write(struct file *file, const char __user *ubuf,
+				    size_t len, loff_t *ppos)
+{
+	struct mmqos_contract *c = file->private_data;
+	struct icc_path *path;
+	char *buf, name[64];
+	u32 avg = 0, peak = 0;
+	int ret, i;
+
+	if (*ppos != 0 || len == 0 || len > 128)
+		return -EINVAL;
+
+	buf = memdup_user_nul(ubuf, len);
+	if (IS_ERR(buf))
+		return PTR_ERR(buf);
+
+	ret = sscanf(buf, "%63s %u %u", name, &avg, &peak);
+	kfree(buf);
+	if (ret < 1) {
+		dev_info(c->dev, "selftest: expected \"<name> [avg] [peak]\"\n");
+		return -EINVAL;
+	}
+
+	path = of_mtk_icc_get(c->dev, name);
+	if (!path) {
+		dev_info(c->dev, "selftest: %s did not resolve (NULL path)\n",
+			 name);
+		return len;
+	}
+	if (IS_ERR(path)) {
+		dev_info(c->dev, "selftest: %s failed (%ld)\n", name,
+			 PTR_ERR(path));
+		return len;
+	}
+
+	ret = mtk_icc_set_bw(path, avg, peak);
+	dev_info(c->dev, "selftest: %s -> avg %u peak %u, set_bw %d\n",
+		 name, avg, peak, ret);
+
+	for (i = 0; i < MMQOS_MAX_LARB; i++) {
+		struct icc_node *n = c->icc->larb[i];
+
+		if (n && (n->avg_bw || n->peak_bw))
+			dev_info(c->dev, "selftest:   %-8s avg %u peak %u\n",
+				 n->name, n->avg_bw, n->peak_bw);
+	}
+	for (i = 0; i < MMQOS_COMMON_NUM; i++) {
+		struct icc_node *n = c->icc->common[i];
+
+		if (n && (n->avg_bw || n->peak_bw))
+			dev_info(c->dev, "selftest:   %-8s avg %u peak %u\n",
+				 n->name, n->avg_bw, n->peak_bw);
+	}
+
+	mtk_icc_set_bw(path, 0, 0);
+	mtk_icc_put(path);
+	return len;
+}
+
+static const struct file_operations mmqos_selftest_fops = {
+	.owner = THIS_MODULE,
+	.write = mmqos_selftest_write,
+	.open = simple_open,
+	.llseek = noop_llseek,
+};
+
 static struct dentry *mmqos_debugfs_root;
 static struct dentry *mmqos_debugfs_contract;
+static struct dentry *mmqos_debugfs_topology;
+static struct dentry *mmqos_debugfs_selftest;
 
 static void mmqos_debugfs_init(struct mmqos_contract *c)
 {
@@ -678,15 +1082,30 @@ static void mmqos_debugfs_init(struct mmqos_contract *c)
 	mmqos_debugfs_contract = debugfs_create_file("contract", 0444,
 						     mmqos_debugfs_root, c,
 						     &mmqos_contract_fops);
+	mmqos_debugfs_topology = debugfs_create_file("topology", 0444,
+						     mmqos_debugfs_root, c,
+						     &mmqos_topology_fops);
+	mmqos_debugfs_selftest = debugfs_create_file("selftest", 0200,
+						     mmqos_debugfs_root, c,
+						     &mmqos_selftest_fops);
 }
 
 static void mmqos_debugfs_exit(void)
 {
+	debugfs_remove(mmqos_debugfs_selftest);
+	debugfs_remove(mmqos_debugfs_topology);
 	debugfs_remove(mmqos_debugfs_contract);
 	debugfs_remove(mmqos_debugfs_root);
+	mmqos_debugfs_selftest = NULL;
+	mmqos_debugfs_topology = NULL;
 	mmqos_debugfs_contract = NULL;
 	mmqos_debugfs_root = NULL;
 }
+
+static bool provide = true;
+module_param(provide, bool, 0444);
+MODULE_PARM_DESC(provide,
+		 "register the icc provider over the parsed contract (default: 1)");
 
 static int mmqos_pmqos_probe(struct platform_device *pdev)
 {
@@ -716,10 +1135,20 @@ static int mmqos_pmqos_probe(struct platform_device *pdev)
 			 c->cls[i].name, c->cls[i].nsteps,
 			 c->cls[i].step[0].freq_mhz);
 
-	if (c->nerrors)
+	if (c->nerrors) {
 		dev_warn(&pdev->dev,
-			 "contract parsed with %d errors and %d warnings; nothing will be applied\n",
+			 "contract parsed with %d errors and %d warnings; the provider will not be registered\n",
 			 c->nerrors, c->nwarnings);
+	} else if (provide) {
+		c->icc = devm_kzalloc(&pdev->dev, sizeof(*c->icc), GFP_KERNEL);
+		if (!c->icc)
+			return -ENOMEM;
+		ret = mmqos_icc_build(c, c->icc);
+		if (ret) {
+			c->icc = NULL;
+			return ret;
+		}
+	}
 
 	platform_set_drvdata(pdev, c);
 	mmqos_debugfs_init(c);
@@ -729,7 +1158,21 @@ static int mmqos_pmqos_probe(struct platform_device *pdev)
 
 static int mmqos_pmqos_remove(struct platform_device *pdev)
 {
+	struct mmqos_contract *c = platform_get_drvdata(pdev);
+
 	mmqos_debugfs_exit();
+
+	if (c && c->icc) {
+		if (c->icc->prov.users) {
+			dev_warn(&pdev->dev,
+				 "provider still has %d active paths; refusing to unregister\n",
+				 c->icc->prov.users);
+			return -EBUSY;
+		}
+		mmqos_icc_teardown(c->icc);
+		c->icc = NULL;
+	}
+
 	return 0;
 }
 

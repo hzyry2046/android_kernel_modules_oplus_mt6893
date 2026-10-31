@@ -19,6 +19,15 @@
  */
 struct icc_req {
 	struct hlist_node req_node;
+	/*
+	 * Same request, second list.  A source node's request is also linked
+	 * into the node's direct_req_list so aggregate_requests() sees it even
+	 * when the node has no reverse links, and one hlist_node cannot be in
+	 * two lists -- reusing req_node there corrupts req_list, which is what
+	 * made mtk_icc_summary_show() walk into freed memory the first time a
+	 * provider registered any nodes.
+	 */
+	struct hlist_node direct_node;
 	struct icc_node *node;
 	struct device *dev;
 	u32 tag;

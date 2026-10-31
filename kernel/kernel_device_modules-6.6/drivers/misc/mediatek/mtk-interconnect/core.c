@@ -102,7 +102,7 @@ static struct icc_path *path_init(struct device *dev, struct icc_node *dst,
 		node->provider->users++;
 		hlist_add_head(&path->reqs[i].req_node, &node->req_list);
 		if (i == 0)
-			hlist_add_head(&path->reqs[i].req_node, &node->direct_req_list);
+			hlist_add_head(&path->reqs[i].direct_node, &node->direct_req_list);
 		path->reqs[i].node = node;
 		path->reqs[i].dev = dev;
 		/* reference to previous node was saved during path traversal */
@@ -209,7 +209,7 @@ static int aggregate_requests(struct icc_node *node)
 	}
 
 	/* update leave node */
-	hlist_for_each_entry(r, &node->direct_req_list, req_node) {
+	hlist_for_each_entry(r, &node->direct_req_list, direct_node) {
 		MMQOS_ICC_SYSTRACE_BEGIN("%s node:%s direct_req_list\n", __func__, node);
 		p->aggregate(node, r->tag, r->avg_bw, r->peak_bw,
 			     &node->avg_bw, &node->peak_bw);
@@ -377,6 +377,135 @@ static struct icc_node *of_icc_get_from_provider(struct of_phandle_args *spec)
 	return node;
 }
 
+/*
+ * Name aliases.
+ *
+ * A consumer can only name a path, and on a DT without "interconnects" there
+ * is no phandle to translate.  Providers that model several QoS channels on
+ * one hardware port (display has _qos, _hrt_qos and _fbdc_qos on the same
+ * port) also need more than one name for a single node.  Both cases are
+ * handled here: an alias list that the by-name lookup consults before it
+ * falls back to node->name.
+ */
+struct icc_name_alias {
+	struct list_head node;
+	const char *name;
+	struct icc_node *icc_node;
+};
+
+static LIST_HEAD(icc_name_aliases);
+
+int mtk_icc_node_add_alias(struct icc_node *icc_node, const char *name)
+{
+	struct icc_name_alias *alias;
+	const char *dup;
+
+	if (!icc_node || !name)
+		return -EINVAL;
+
+	dup = kstrdup_const(name, GFP_KERNEL);
+	if (!dup)
+		return -ENOMEM;
+
+	alias = kzalloc(sizeof(*alias), GFP_KERNEL);
+	if (!alias) {
+		kfree_const(dup);
+		return -ENOMEM;
+	}
+
+	alias->name = dup;
+	alias->icc_node = icc_node;
+
+	mutex_lock(&icc_lock);
+	list_add_tail(&alias->node, &icc_name_aliases);
+	mutex_unlock(&icc_lock);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(mtk_icc_node_add_alias);
+
+void mtk_icc_node_del_alias(struct icc_node *icc_node)
+{
+	struct icc_name_alias *alias, *tmp;
+
+	mutex_lock(&icc_lock);
+	list_for_each_entry_safe(alias, tmp, &icc_name_aliases, node) {
+		if (alias->icc_node != icc_node)
+			continue;
+		list_del(&alias->node);
+		kfree_const(alias->name);
+		kfree(alias);
+	}
+	mutex_unlock(&icc_lock);
+}
+EXPORT_SYMBOL_GPL(mtk_icc_node_del_alias);
+
+/* icc_lock must be held. */
+static struct icc_node *icc_node_find_by_name_nolock(const char *name)
+{
+	struct icc_name_alias *alias;
+	struct icc_provider *provider;
+	struct icc_node *node;
+
+	list_for_each_entry(alias, &icc_name_aliases, node)
+		if (!strcmp(alias->name, name))
+			return alias->icc_node;
+
+	list_for_each_entry(provider, &icc_providers, provider_list)
+		list_for_each_entry(node, &provider->nodes, node_list)
+			if (node->name && !strcmp(node->name, name))
+				return node;
+
+	return NULL;
+}
+
+/*
+ * Resolve a consumer path by name when the consumer node has no
+ * "interconnects" property.  This is opt-in on the provider side: with no
+ * provider registered under that name the lookup still yields NULL, which is
+ * exactly the behaviour of a DT-driven system without the property.
+ */
+static struct icc_path *icc_get_by_name(struct device *dev, const char *name)
+{
+	struct icc_node *node, *dst;
+	struct icc_path *path;
+	int i;
+
+	if (!name)
+		return NULL;
+
+	mutex_lock(&icc_lock);
+	node = icc_node_find_by_name_nolock(name);
+	if (!node || !node->num_links) {
+		mutex_unlock(&icc_lock);
+		return NULL;
+	}
+
+	/*
+	 * Walk to the end of the chain: a named source node models a hardware
+	 * port, and the interesting path is the whole way down to the shared
+	 * destination, not just its first hop.  Bounded so a provider with a
+	 * cyclic graph cannot spin here.
+	 */
+	dst = node;
+	for (i = 0; i < 8 && dst->num_links; i++)
+		dst = dst->links[0];
+
+	path = path_find(dev, node, dst);
+	mutex_unlock(&icc_lock);
+
+	if (IS_ERR(path))
+		return path;
+
+	path->name = kstrdup_const(name, GFP_KERNEL);
+	if (!path->name) {
+		mtk_icc_put(path);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	return path;
+}
+
 /**
  * of_icc_get() - get a path handle from a DT node based on name
  * @dev: device pointer for the consumer device
@@ -411,7 +540,7 @@ struct icc_path *of_mtk_icc_get(struct device *dev, const char *name)
 	 * return a NULL path to skip setting constraints.
 	 */
 	if (!of_find_property(np, "interconnects", NULL))
-		return NULL;
+		return icc_get_by_name(dev, name);
 
 	/*
 	 * We use a combination of phandle and specifier for endpoint. For now
@@ -691,6 +820,8 @@ void mtk_icc_put(struct icc_path *path)
 	for (i = 0; i < path->num_nodes; i++) {
 		node = path->reqs[i].node;
 		hlist_del(&path->reqs[i].req_node);
+		if (i == 0)
+			hlist_del(&path->reqs[i].direct_node);
 		if (!WARN_ON(!node->provider->users))
 			node->provider->users--;
 	}

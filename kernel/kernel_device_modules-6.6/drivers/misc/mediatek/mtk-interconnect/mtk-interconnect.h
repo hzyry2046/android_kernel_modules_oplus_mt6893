@@ -63,6 +63,9 @@ void mtk_icc_put(struct icc_path *path);
 int mtk_icc_set_bw(struct icc_path *path, u32 avg_bw, u32 peak_bw);
 int mtk_icc_set_bw_not_update(struct icc_path *path, u32 avg_bw, u32 peak_bw);
 void mtk_icc_set_tag(struct icc_path *path, u32 tag);
+struct icc_node;
+int mtk_icc_node_add_alias(struct icc_node *icc_node, const char *name);
+void mtk_icc_node_del_alias(struct icc_node *icc_node);
 
 #else
 
@@ -93,6 +96,16 @@ static inline int mtk_icc_set_bw_not_update(struct icc_path *path, u32 avg_bw, u
 }
 
 static inline void mtk_icc_set_tag(struct icc_path *path, u32 tag)
+{
+}
+
+static inline int mtk_icc_node_add_alias(struct icc_node *icc_node,
+					 const char *name)
+{
+	return -EINVAL;
+}
+
+static inline void mtk_icc_node_del_alias(struct icc_node *icc_node)
 {
 }
 
