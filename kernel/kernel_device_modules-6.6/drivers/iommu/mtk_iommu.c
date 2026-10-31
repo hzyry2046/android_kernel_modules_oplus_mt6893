@@ -3883,6 +3883,42 @@ static const struct mtk_iommu_plat_data mt6886_data_apu0 = {
 	.mau_count	= 4,
 };
 
+/*
+ * op6893 6.6 bring-up: the APU M4Us need MT6893's own IOVA layout, not the
+ * shared mt6873_multi_dom.
+ *
+ * The 4.19 kernel this board shipped with keeps its per-domain windows in
+ * mt_iommu_plat.h (mtk_domain_array[]), and for the mt6873/mt6893 family the
+ * APU ones are:
+ *
+ *   domain 5  APU DATA   0x300000000 .. 0x3ffffffff  minus the three below
+ *   domain 6  APU CODE   0x370000000 .. 0x3825fffff   (0x12600000 bytes)
+ *   domain 7  APU VLM    0x304000000 .. 0x307ffffff   (0x04000000 bytes)
+ *
+ * mt6873_multi_dom instead lists 0x310000000 ("APU VPU") as the region right
+ * after VLM, so the 6.6 domain 7 -- which the dt-bindings and our legacy port
+ * translation both use for APU CODE (larb21/port0) -- ends up 0x310000000,
+ * while the VPU engine's IOVAs are 0x300000000 | {0x7da00000, 0x82600000},
+ * i.e. 0x37da00000 .. 0x380f0ffff.  Every VPU mapping would therefore land
+ * outside its own domain's aperture.
+ *
+ * Only the two APU M4U instances use this table; the MM ones keep the shared
+ * one, and the first five windows are identical either way.
+ */
+static const struct mtk_iommu_iova_region mt6893_apu_multi_dom[] = {
+	{ .iova_base = 0x0, .size = SZ_4G},	      /* disp : 0 ~ 4G */
+#if IS_ENABLED(CONFIG_ARCH_DMA_ADDR_T_64BIT)
+	{ .iova_base = SZ_4G, .size = SZ_4G},     /* vdec : 4G ~ 8G */
+	{ .iova_base = SZ_4G * 2, .size = SZ_4G}, /* CAM/MDP: 8G ~ 12G */
+	{ .iova_base = 0x240000000ULL, .size = 0x4000000}, /* CCU0 */
+	{ .iova_base = 0x244000000ULL, .size = 0x4000000}, /* CCU1 */
+	{ .iova_base = SZ_4G * 3, .size = SZ_4G}, /* APU DATA */
+	{ .iova_base = 0x304000000ULL, .size = 0x4000000}, /* APU VLM */
+	{ .iova_base = 0x370000000ULL, .size = 0x12600000}, /* APU CODE */
+	{ .iova_base = 0x310000000ULL, .size = 0x10000000}, /* APU DATA window */
+#endif
+};
+
 static const struct mtk_iommu_plat_data mt6893_data_iommu0 = {
 	.m4u_plat        = M4U_MT6893,
 	.flags           = NOT_STD_AXI_MODE | HAS_SUB_COMM | OUT_ORDER_WR_EN | WR_THROT_EN |
@@ -3925,10 +3961,10 @@ static const struct mtk_iommu_plat_data mt6893_data_iommu2 = {
 	.iommu_type      = APU_IOMMU,
 	.normal_dom      = 0,
 	.inv_sel_reg	 = REG_MMU_INV_SEL_GEN2,
-	.iova_region	 = mt6873_multi_dom,
+	.iova_region	 = mt6893_apu_multi_dom,
 	/* not use larbid_remap */
 	.larbid_remap    = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
-	.iova_region_nr  = ARRAY_SIZE(mt6873_multi_dom),
+	.iova_region_nr  = ARRAY_SIZE(mt6893_apu_multi_dom),
 };
 
 static const struct mtk_iommu_plat_data mt6893_data_iommu3 = {
@@ -3939,10 +3975,10 @@ static const struct mtk_iommu_plat_data mt6893_data_iommu3 = {
 	.iommu_type      = APU_IOMMU,
 	.normal_dom	 = 0,
 	.inv_sel_reg	 = REG_MMU_INV_SEL_GEN2,
-	.iova_region	 = mt6873_multi_dom,
+	.iova_region	 = mt6893_apu_multi_dom,
 	/* not use larbid_remap */
 	.larbid_remap    = {{0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}},
-	.iova_region_nr  = ARRAY_SIZE(mt6873_multi_dom),
+	.iova_region_nr  = ARRAY_SIZE(mt6893_apu_multi_dom),
 };
 
 /*

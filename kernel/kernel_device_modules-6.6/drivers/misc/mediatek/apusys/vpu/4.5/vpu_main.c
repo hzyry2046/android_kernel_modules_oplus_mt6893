@@ -783,6 +783,23 @@ static int vpu_probe(struct platform_device *pdev)
 	int ret = 0;
 	int id = 0;
 
+	/*
+	 * op6893 6.6 bring-up: this board's APU IOVA windows sit at 12G and
+	 * above while the VPU nodes carry no "dma-ranges", so the DMA-IOMMU
+	 * setup can leave the device on dma-direct with no IOVA domain.  Every
+	 * vpu_iova_sync_for_device() would then hand dma_direct a zero
+	 * sg_dma_address and take the whole system down in dcache_clean_poc()
+	 * (observed, see docs/apusys-vpu-engine-20261101.md).  The engine is
+	 * useless without the IOMMU anyway, so refuse to probe instead.
+	 */
+	if (!device_iommu_mapped(&pdev->dev) || !pdev->dev.dma_ops) {
+		dev_err(&pdev->dev,
+			"no iommu dma domain (iommu_group:%s, dma_ops:%s), refusing to map iova\n",
+			pdev->dev.iommu_group ? "set" : "none",
+			pdev->dev.dma_ops ? "set" : "none");
+		return -ENODEV;
+	}
+
 	ret = of_property_read_u32(pdev->dev.of_node, "id", &id);
 	if (ret) {
 		dev_info(&pdev->dev, "unable to get core ID: %d\n", ret);
