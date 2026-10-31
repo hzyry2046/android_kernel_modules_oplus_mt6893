@@ -607,6 +607,15 @@ struct mmqos_icc {
 	u64 set_calls;
 	u64 set_last_avg;
 	u64 set_last_peak;
+	/*
+	 * Requests are set and cleared inside a single frame, so sampling the
+	 * debugfs file almost always catches the cleared state.  Keep the high
+	 * water mark instead.
+	 */
+	u32 max_avg;
+	u32 max_peak;
+	const char *max_avg_node;
+	const char *max_peak_node;
 };
 
 static int mmqos_icc_aggregate(struct icc_node *node, u32 tag, u32 avg_bw,
@@ -644,6 +653,14 @@ static int mmqos_icc_set(struct icc_node *src, struct icc_node *dst)
 	icc->set_calls++;
 	icc->set_last_avg = dst->avg_bw;
 	icc->set_last_peak = dst->peak_bw;
+	if (dst->avg_bw > icc->max_avg) {
+		icc->max_avg = dst->avg_bw;
+		icc->max_avg_node = dst->name;
+	}
+	if (dst->peak_bw > icc->max_peak) {
+		icc->max_peak = dst->peak_bw;
+		icc->max_peak_node = dst->name;
+	}
 	return 0;
 }
 
@@ -1025,6 +1042,9 @@ static int mmqos_topology_show(struct seq_file *s, void *unused)
 	seq_printf(s, "provider: %d ports, %d larbs, set() calls %llu (last avg %llu peak %llu)\n",
 		   icc->nmaster, c->nlarb_groups, icc->set_calls,
 		   icc->set_last_avg, icc->set_last_peak);
+	seq_printf(s, "peak seen: avg %u on %s, peak %u on %s\n",
+		   icc->max_avg, icc->max_avg_node ? icc->max_avg_node : "-",
+		   icc->max_peak, icc->max_peak_node ? icc->max_peak_node : "-");
 	seq_puts(s, "node                              avg         peak\n");
 	seq_puts(s, "--------------------------------------------------\n");
 

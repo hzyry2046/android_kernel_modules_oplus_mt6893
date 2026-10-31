@@ -1534,6 +1534,61 @@ int mtk_disp_hrt_cond_init(struct drm_crtc *crtc)
 	return 0;
 }
 
+/*
+ * op6893: the board DT is the 4.19 one and has no operating-points-v2 for the
+ * display device, so dev_pm_opp_get_opp_count() returns -ENODEV, the kcalloc()
+ * below fails and g_freq_steps stays NULL.  Every mmclk decision then indexes a
+ * NULL array -- mtk_drm_set_mmclk_by_pixclk() does g_freq_steps[step_size - 1]
+ * with no guard at all, and DSI calls it from its display-off path.
+ *
+ * The board describes the same steps in mmdvfs_pmqos, descending:
+ * disp_step0..3 = 546/416/312/249 MHz.  The 6.6 mt6893.dtsi opp_table_disp
+ * carries exactly those numbers ascending, so read them from there.
+ *
+ * This writes no hardware: mtk_drm_set_mmclk() only records the level, and on
+ * this board it then finds neither "vdisp-dvfs-opp" nor an
+ * "mmdvfs-dvfsrc-vcore" supply, so it returns before touching a regulator.
+ */
+#define MTK_DISP_MAX_STEP	8
+static int mtk_drm_get_steps_from_pmqos(unsigned long **steps_out)
+{
+	struct device_node *np;
+	struct property *prop;
+	const char *step_name;
+	unsigned long desc[MTK_DISP_MAX_STEP];
+	unsigned long *steps;
+	u32 cell[4];
+	int n = 0, i;
+
+	np = of_find_compatible_node(NULL, NULL, "mediatek,mmdvfs_pmqos");
+	if (!np)
+		return -ENODEV;
+
+	of_property_for_each_string(np, "disp_freq", prop, step_name) {
+		if (n >= MTK_DISP_MAX_STEP)
+			break;
+		if (of_property_read_u32_array(np, step_name, cell,
+					       ARRAY_SIZE(cell)))
+			continue;
+		desc[n++] = (unsigned long)cell[0] * 1000000UL;	/* Hz */
+	}
+	of_node_put(np);
+
+	if (!n)
+		return -ENODEV;
+
+	steps = kcalloc(n, sizeof(*steps), GFP_KERNEL);
+	if (!steps)
+		return -ENOMEM;
+
+	/* Ascending, which is what mtk_drm_set_mmclk_by_pixclk() walks. */
+	for (i = 0; i < n; i++)
+		steps[i] = desc[n - 1 - i];
+
+	*steps_out = steps;
+	return n;
+}
+
 static void mtk_drm_mmdvfs_get_avail_freq(struct device *dev)
 {
 	int i = 0;
@@ -1542,13 +1597,21 @@ static void mtk_drm_mmdvfs_get_avail_freq(struct device *dev)
 	int ret;
 
 	step_size = dev_pm_opp_get_opp_count(dev);
-	g_freq_steps = kcalloc(step_size, sizeof(unsigned long), GFP_KERNEL);
-	freq = 0;
-	while (!IS_ERR(opp = dev_pm_opp_find_freq_ceil(dev, &freq))) {
-		g_freq_steps[i] = freq;
-		freq++;
-		i++;
-		dev_pm_opp_put(opp);
+	if (step_size > 0) {
+		g_freq_steps = kcalloc(step_size, sizeof(unsigned long),
+				       GFP_KERNEL);
+		freq = 0;
+		while (!IS_ERR(opp = dev_pm_opp_find_freq_ceil(dev, &freq))) {
+			g_freq_steps[i] = freq;
+			freq++;
+			i++;
+			dev_pm_opp_put(opp);
+		}
+	} else {
+		ret = mtk_drm_get_steps_from_pmqos(&g_freq_steps);
+		step_size = ret > 0 ? ret : 0;
+		DDPMSG("%s no OPP table (%d); board disp_freq gives %d steps\n",
+		       __func__, dev_pm_opp_get_opp_count(dev), step_size);
 	}
 
 	ret = of_property_read_u32(dev->of_node, "lp-mmclk-freq", &lp_freq);
@@ -1599,6 +1662,12 @@ void mtk_drm_set_mmclk(struct drm_crtc *crtc, int level, bool lp_mode,
 	int cnt = 0;
 	struct mtk_drm_crtc *mtk_crtc = to_mtk_crtc(crtc);
 	struct mtk_ddp_comp *output_comp;
+
+	/* No step table means every index below would read a NULL array. */
+	if (!g_freq_steps || step_size <= 0) {
+		DDPINFO("%s no mmclk steps, skip\n", __func__);
+		return;
+	}
 
 	idx = drm_crtc_index(crtc);
 
@@ -1679,6 +1748,11 @@ void mtk_drm_set_mmclk_by_pixclk(struct drm_crtc *crtc,
 
 	g_freq = freq;
 
+	if (!g_freq_steps || step_size <= 0) {
+		DDPINFO("%s no mmclk steps, skip\n", __func__);
+		return;
+	}
+
 	if (freq > g_freq_steps[step_size - 1]) {
 		DDPPR_ERR("%s:pixleclk (%lu) is to big for mmclk (%lu)\n",
 			caller, freq, g_freq_steps[step_size - 1]);
@@ -1713,7 +1787,7 @@ unsigned long mtk_drm_get_mmclk(struct drm_crtc *crtc, const char *caller)
 	int idx;
 	unsigned long freq;
 
-	if (!crtc || !g_freq_steps)
+	if (!crtc || !g_freq_steps || step_size <= 0)
 		return 0;
 
 	idx = drm_crtc_index(crtc);
