@@ -397,6 +397,17 @@ mtk_nanohub_find_cmd(uint32_t packetReason)
 	return NULL;
 }
 
+/*
+ * Oplus extends the SCP action space above MTK's SENSOR_HUB_RAW_DATA (10):
+ * vendor/oplus/sensor/kernel/oplus_sensor_devinfo/sensor_devinfo.h starts at
+ * OPLUS_ACTION_RW_REGISTER = 110 and runs to OPLUS_ACTION_SET_LCD_INFO (117).
+ * Those replies are delivered exactly like the common ones, so they are not
+ * unknown commands -- the SCP_SYNC_UTC reply alone printed the error below
+ * once every two seconds, 307 times per boot on this device.
+ */
+#define OPLUS_ACTION_BASE	110
+#define OPLUS_ACTION_MAX	117
+
 static void mtk_nanohub_ipi_handler(int id,
 		void *data, unsigned int len)
 {
@@ -413,8 +424,15 @@ static void mtk_nanohub_ipi_handler(int id,
 	cmd = mtk_nanohub_find_cmd(rsp->rsp.action);
 	if (cmd != NULL)
 		cmd->handler(rsp, len);
+	else if (rsp->rsp.action >= OPLUS_ACTION_BASE &&
+		 rsp->rsp.action <= OPLUS_ACTION_MAX)
+		mtk_nanohub_common_cmd(rsp, len);
 	else {
-		pr_err("IPI_SENSOR cannot find cmd!\n");
+		/* Name the action: without it an unknown one cannot be
+		 * identified from the log, which is how the old message stayed
+		 * unexplained for the whole port. */
+		pr_err_ratelimited("IPI_SENSOR unknown action=%u len=%u\n",
+				rsp->rsp.action, len);
 #ifdef CONFIG_OPLUS_FEATURE_SENSOR_ALGORITHM
 		SCP_sensorHub_set_oplus_cmd(rsp, len);
 #endif
