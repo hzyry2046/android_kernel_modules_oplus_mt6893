@@ -25,14 +25,18 @@
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/regulator/consumer.h>
 #include <linux/slab.h>
 #include <linux/string.h>
+#include <soc/mediatek/smi.h>
 
 #include "mtk-interconnect-provider.h"
 #include "mmqos-port-names.h"
@@ -46,6 +50,10 @@
 #define MMQOS_MAX_OSTD_LARB	8
 #define MMQOS_MAX_FMETER	9
 #define MMQOS_MAX_COMM		2
+
+/* 4.19 mt6885/mt6893 SMI: 6-bit outstanding limit, at 0x200 + port * 4. */
+#define MMQOS_SMI_OSTD_MAX	0x3f
+#define MMQOS_SMI_OSTDL_PORT	0x200
 
 /*
  * 4.19's mt6885/mt6893 SMI has 21 physical larbs.  mmdvfs_pmqos then appends
@@ -550,6 +558,11 @@ static int mmqos_contract_parse(struct mmqos_contract *c,
 #define MMQOS_NODE_LARB(larb)	(0x30000000 | ((larb) & 0xff))
 #define MMQOS_NODE_COMMON(c)	(0x10000000 | ((c) & 0xff))
 
+#define MMQOS_NODE_IS_MASTER(id) (((id) & 0xf0000000) == 0x40000000)
+#define MMQOS_NODE_IS_LARB(id)	(((id) & 0xf0000000) == 0x30000000)
+#define MMQOS_NODE_PORT(id)	((id) & 0x1fffff)
+#define MMQOS_NODE_LARB_ID(id)	((id) & 0xff)
+
 /*
  * Which SMI common each larb hangs off, from the vendor node table
  * (drivers/interconnect/mediatek/mmqos-mt6893.c).  Larbs 6/10/12/15 do not
@@ -596,6 +609,7 @@ struct mmqos_icc_node {
 };
 
 struct mmqos_icc {
+	struct mmqos_contract *c;
 	struct icc_provider prov;
 	struct icc_node *common[MMQOS_COMMON_NUM];
 	struct icc_node *larb[MMQOS_MAX_LARB];
@@ -616,6 +630,31 @@ struct mmqos_icc {
 	u32 max_peak;
 	const char *max_avg_node;
 	const char *max_peak_node;
+
+	/*
+	 * Stage 4: the SMI larbs behind the parsed port table.  A larb device
+	 * is the only thing that knows its own register base and whether the
+	 * larb is powered, so the OSTD write goes through mtk_smi_larb_bw_set()
+	 * rather than a private mapping.
+	 */
+	struct device *smi_larb[MMQOS_SMI_LARB_NUM];
+	void __iomem *smi_base[MMQOS_SMI_LARB_NUM];
+	int nsmi_larb;
+
+	/* Last value handed to SMI, and what we computed to get there. */
+	u32 ostd_sent[MMQOS_SMI_LARB_NUM][MMQOS_MAX_PORT];
+	u32 ostd_want[MMQOS_SMI_LARB_NUM][MMQOS_MAX_PORT];
+	/*
+	 * Requests are cleared again inside the same frame, so the last value
+	 * is usually the released one.  Keep the high water mark: that is the
+	 * number the enable decision has to be made on.
+	 */
+	u32 ostd_max_bw[MMQOS_SMI_LARB_NUM][MMQOS_MAX_PORT];
+	u32 ostd_max[MMQOS_SMI_LARB_NUM][MMQOS_MAX_PORT];
+	bool ostd_seen[MMQOS_SMI_LARB_NUM][MMQOS_MAX_PORT];
+	u64 ostd_writes;
+	u64 ostd_same;
+	u64 ostd_unbound;
 };
 
 static int mmqos_icc_aggregate(struct icc_node *node, u32 tag, u32 avg_bw,
@@ -639,17 +678,191 @@ static int mmqos_icc_comm_chn_info(struct icc_node *src, struct icc_node *dst)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Stage 4: per-port SMI outstanding-request limits                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * mtk-smi-bwc.ko stops at mt6765 and has no scenario table for this SoC, but
+ * mtk-smi.c itself carries the mt6893 larb generation -- including the vendor
+ * per-port OSTD defaults from mt6885/smi_conf.h -- and exports
+ * mtk_smi_larb_bw_set(), which writes exactly the register 4.19's
+ * smi_ostd_update() writes: base + 0x200 + port * 4.
+ *
+ * 4.19 sizes that limit from the request bandwidth and the port's share of
+ * the larb, taken from the board DT's "larbN" ratio table:
+ *
+ *	ostd = SHIFT_ROUND(bw, ratio[port])	= ceil(bw / 2^ratio)
+ *
+ * with bw in MB/s, and a port on a max_ostd larb pinned to max_ostd.
+ *
+ * For the one consumer on this board that actually reports bandwidth -- camera
+ * MFB -- this is the same arithmetic 4.19 does, not an approximation of it:
+ * MFBQOS_Update() calls mm_qos_set_request(req, qos_total / 1000000, 0,
+ * BW_COMP_NONE), i.e. megabytes per second, no hard-real-time value and no
+ * compression, so 4.19's hrt_value * 3 / 2 and its comp_type scaling both drop
+ * out and only the ratio shift is left.  The unit is the only thing that has to
+ * be converted here, because 6.6's icc model carries kB/s.
+ *
+ * Those two factors are still absent for the traffic that does carry HRT
+ * metadata in 4.19 -- display and MDP -- because the 6.6 icc request has no
+ * field for either.  Neither is a live consumer on this board: display's DRM
+ * QoS helper options are off in the board DT and MDP only submits when
+ * userspace supplies a pmqos property.
+ *
+ * One caveat is not ours to fix: mtk_smi_larb_bw_set() overrides the value for
+ * larb11 ports 15..25 with a fixed 0x30.  That range is exactly camera MFB's
+ * M4U_PORT_L11_IMG_MFB_RDMA0.. and the override predates this driver, so those
+ * ports keep 0x30 whatever is computed here.
+ */
+static bool ostd_program;
+module_param(ostd_program, bool, 0644);
+MODULE_PARM_DESC(ostd_program,
+		 "program per-port SMI OSTD limits from the aggregated bandwidth (default: 0, dry run)");
+
+static u32 mmqos_ostd_from_bw(struct mmqos_contract *c, u32 larb, u32 port,
+			      u32 bw_kbps)
+{
+	u32 bw_mbs, ostd;
+
+	if (!bw_kbps)
+		return 1;
+
+	bw_mbs = DIV_ROUND_UP(bw_kbps, 1000);
+	ostd = ((bw_mbs - 1) >> c->larb[larb].ratio[port]) + 1;
+
+	if (c->larb[larb].is_max_ostd && c->max_ostd > 0)
+		ostd = c->max_ostd;
+	if (ostd > MMQOS_SMI_OSTD_MAX)
+		ostd = MMQOS_SMI_OSTD_MAX;
+
+	return ostd;
+}
+
+static void mmqos_smi_resolve_one(struct mmqos_icc *icc, const char *compat)
+{
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, compat) {
+		struct platform_device *pdev;
+		struct resource *res;
+		u32 id;
+
+		if (of_property_read_u32(np, "mediatek,larb-id", &id))
+			continue;
+		if (id >= MMQOS_SMI_LARB_NUM || icc->smi_larb[id])
+			continue;
+
+		pdev = of_find_device_by_node(np);
+		if (!pdev) {
+			dev_info(icc->c->dev, "larb%u: no platform device yet\n",
+				 id);
+			continue;
+		}
+		icc->smi_larb[id] = &pdev->dev;
+
+		/*
+		 * Read-back mapping only.  mtk-smi owns the region through
+		 * devm_ioremap_resource(), so request no region here.
+		 */
+		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		if (res)
+			icc->smi_base[id] = devm_ioremap(icc->c->dev,
+							 res->start,
+							 resource_size(res));
+		icc->nsmi_larb++;
+	}
+}
+
+static void mmqos_smi_resolve(struct mmqos_icc *icc)
+{
+	/*
+	 * The board boots the 4.19 DTB, which spells the larb nodes
+	 * "mediatek,smi_larbN" plus the generic "mediatek,smi_larb".  The
+	 * 6.6-shaped DT would say "mediatek,mt6893-smi-larb"; accept both so
+	 * the same code works if the board DT is ever replaced.
+	 */
+	mmqos_smi_resolve_one(icc, "mediatek,smi_larb");
+	mmqos_smi_resolve_one(icc, "mediatek,mt6893-smi-larb");
+}
+
+static bool mmqos_smi_reg_read(struct mmqos_icc *icc, u32 larb, u32 port,
+			       u32 *val)
+{
+	struct device *dev = icc->smi_larb[larb];
+
+	if (!dev || !icc->smi_base[larb])
+		return false;
+
+	/*
+	 * Reading a powered-down larb is the same hazard the write path
+	 * guards against, so sample only when the larb is already active.
+	 */
+	if (pm_runtime_get_if_in_use(dev) <= 0)
+		return false;
+
+	*val = readl(icc->smi_base[larb] + MMQOS_SMI_OSTDL_PORT + port * 4);
+	pm_runtime_put(dev);
+
+	return true;
+}
+
+static void mmqos_smi_apply(struct mmqos_icc *icc, struct icc_node *src,
+			    struct icc_node *dst)
+{
+	struct mmqos_contract *c = icc->c;
+	struct device *larbdev;
+	u32 larb, port, avg, peak, want;
+
+	/*
+	 * apply_constraints() walks the path pairwise, so the port node only
+	 * ever shows up as "src": the pairs are (port, larb) and (larb,
+	 * common).  A path that starts at a larb has no port to size.
+	 */
+	if (!MMQOS_NODE_IS_LARB(dst->id) || !MMQOS_NODE_IS_MASTER(src->id))
+		return;
+
+	larb = MMQOS_NODE_LARB_ID(dst->id);
+	port = MTK_M4U_TO_PORT(MMQOS_NODE_PORT(src->id));
+	if (larb >= MMQOS_SMI_LARB_NUM || port >= MMQOS_MAX_PORT)
+		return;
+	if (!c->larb[larb].present || port >= c->larb[larb].nports)
+		return;
+
+	larbdev = icc->smi_larb[larb];
+	if (!larbdev) {
+		icc->ostd_unbound++;
+		return;
+	}
+
+	avg = src->avg_bw;
+	peak = src->peak_bw;
+	/* Size for the instantaneous demand, never below the average. */
+	want = mmqos_ostd_from_bw(c, larb, port, max(avg, peak));
+
+	icc->ostd_want[larb][port] = want;
+	icc->ostd_seen[larb][port] = true;
+	if (want > icc->ostd_max[larb][port]) {
+		icc->ostd_max[larb][port] = want;
+		icc->ostd_max_bw[larb][port] = max(avg, peak);
+	}
+
+	if (icc->ostd_sent[larb][port] == want) {
+		icc->ostd_same++;
+		return;
+	}
+	if (!ostd_program)
+		return;
+
+	mtk_smi_larb_bw_set(larbdev, port, want);
+	icc->ostd_sent[larb][port] = want;
+	icc->ostd_writes++;
+}
+
 static int mmqos_icc_set(struct icc_node *src, struct icc_node *dst)
 {
 	struct mmqos_icc *icc = dst->provider->data;
 
-	/*
-	 * Stage 2 proves that the requests arrive and that they aggregate per
-	 * larb and per common.  Nothing is programmed here on purpose: the mux
-	 * step is driven by the MM pm_qos frequency classes in 4.19, and this
-	 * tree dropped them entirely, so there is no frequency input to act
-	 * on yet; the SMI OSTD/ratio write is Stage 4.
-	 */
 	icc->set_calls++;
 	icc->set_last_avg = dst->avg_bw;
 	icc->set_last_peak = dst->peak_bw;
@@ -661,6 +874,8 @@ static int mmqos_icc_set(struct icc_node *src, struct icc_node *dst)
 		icc->max_peak = dst->peak_bw;
 		icc->max_peak_node = dst->name;
 	}
+
+	mmqos_smi_apply(icc, src, dst);
 	return 0;
 }
 
@@ -790,6 +1005,7 @@ static int mmqos_icc_build(struct mmqos_contract *c, struct mmqos_icc *icc)
 {
 	int i, ret;
 
+	icc->c = c;
 	icc->prov.dev = c->dev;
 	icc->prov.set = mmqos_icc_set;
 	icc->prov.aggregate = mmqos_icc_aggregate;
@@ -840,10 +1056,12 @@ static int mmqos_icc_build(struct mmqos_contract *c, struct mmqos_icc *icc)
 			goto err;
 	}
 
+	mmqos_smi_resolve(icc);
+
 	dev_info(c->dev,
-		 "icc provider up: %d larbs, %d ports, %d names, 2 commons\n",
+		 "icc provider up: %d larbs, %d ports, %d names, 2 commons, %d smi larbs\n",
 		 c->nlarb_groups, icc->nmaster,
-		 (int)ARRAY_SIZE(mmqos_port_names));
+		 (int)ARRAY_SIZE(mmqos_port_names), icc->nsmi_larb);
 	return 0;
 
 err:
@@ -887,6 +1105,14 @@ static void mmqos_icc_teardown(struct mmqos_icc *icc)
 		mtk_icc_node_destroy(icc->common[i]->id);
 		icc->common[i] = NULL;
 	}
+
+	for (i = 0; i < MMQOS_SMI_LARB_NUM; i++) {
+		if (!icc->smi_larb[i])
+			continue;
+		put_device(icc->smi_larb[i]);
+		icc->smi_larb[i] = NULL;
+	}
+	icc->nsmi_larb = 0;
 
 	mtk_icc_provider_del(&icc->prov);
 }
@@ -1079,6 +1305,87 @@ static const struct file_operations mmqos_topology_fops = {
 };
 
 /*
+ * Stage 4 harness.  Shows, per (larb, port), the bandwidth that arrived, the
+ * OSTD it works out to, what was handed to SMI, and -- when the larb is
+ * powered so the read is safe -- what the register actually holds.
+ *
+ * In the default dry-run mode nothing is written, so "ostd" is a proposal and
+ * "sent" stays 0; comparing the two against "reg" is what makes the first
+ * enable decision reviewable instead of blind.
+ */
+static int mmqos_ostd_show(struct seq_file *s, void *unused)
+{
+	struct mmqos_contract *c = s->private;
+	struct mmqos_icc *icc = c->icc;
+	char regbuf[8];
+	int larb, port, shown = 0;
+
+	if (!icc) {
+		seq_puts(s, "no icc provider registered\n");
+		return 0;
+	}
+
+	seq_printf(s, "mode: %s\n",
+		   ostd_program ? "program" : "dry run (ostd_program=0)");
+	seq_printf(s, "smi larbs bound: %d, writes %llu, unchanged %llu, no larb dev %llu\n",
+		   icc->nsmi_larb, icc->ostd_writes, icc->ostd_same,
+		   icc->ostd_unbound);
+	seq_puts(s, "larb port ratio  max(kB/s)  ostd_max  last  sent   reg\n");
+	seq_puts(s, "---------------------------------------------------------\n");
+
+	for (larb = 0; larb < MMQOS_SMI_LARB_NUM; larb++) {
+		for (port = 0; port < MMQOS_MAX_PORT; port++) {
+			u32 reg = 0;
+
+			if (!icc->ostd_seen[larb][port])
+				continue;
+
+			if (mmqos_smi_reg_read(icc, larb, port, &reg))
+				snprintf(regbuf, sizeof(regbuf), "%u", reg);
+			else
+				strscpy(regbuf, "n/a", sizeof(regbuf));
+
+			seq_printf(s, "%4d %4d %5u %10u %9u %5u %5u %5s\n",
+				   larb, port, c->larb[larb].ratio[port],
+				   icc->ostd_max_bw[larb][port],
+				   icc->ostd_max[larb][port],
+				   icc->ostd_want[larb][port],
+				   icc->ostd_sent[larb][port], regbuf);
+			shown++;
+		}
+	}
+
+	if (!shown)
+		seq_puts(s, "no port has carried bandwidth yet\n");
+
+	/*
+	 * DVFSRC HRT reporting is not wired: mtk_mmqos_set_hrt_bw() needs
+	 * mmqos_hrt, which only mtk_mmqos_probe() initialises, and that
+	 * provider binds to the "mediatek,mt6893-mmqos" node this board does
+	 * not have.  mmqos_hrt stays NULL and the call always returns
+	 * -ENOENT, so the total is only reported here.
+	 */
+	seq_printf(s, "hrt total (would go to DVFSRC): disp %u kB/s, mdp %u kB/s\n",
+		   icc->common[0] ? icc->common[0]->avg_bw : 0,
+		   icc->common[1] ? icc->common[1]->avg_bw : 0);
+
+	return 0;
+}
+
+static int mmqos_ostd_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, mmqos_ostd_show, inode->i_private);
+}
+
+static const struct file_operations mmqos_ostd_fops = {
+	.owner = THIS_MODULE,
+	.open = mmqos_ostd_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
+/*
  * Stage 2 harness.  This exercises exactly the path the multimedia drivers
  * use -- of_mtk_icc_get(dev, name) on a device whose node has no
  * "interconnects" -- so a success here is the same resolution MDP would get.
@@ -1157,6 +1464,7 @@ static const struct file_operations mmqos_selftest_fops = {
 static struct dentry *mmqos_debugfs_root;
 static struct dentry *mmqos_debugfs_contract;
 static struct dentry *mmqos_debugfs_topology;
+static struct dentry *mmqos_debugfs_ostd;
 static struct dentry *mmqos_debugfs_selftest;
 
 static void mmqos_debugfs_init(struct mmqos_contract *c)
@@ -1172,6 +1480,9 @@ static void mmqos_debugfs_init(struct mmqos_contract *c)
 	mmqos_debugfs_topology = debugfs_create_file("topology", 0444,
 						     mmqos_debugfs_root, c,
 						     &mmqos_topology_fops);
+	mmqos_debugfs_ostd = debugfs_create_file("ostd", 0444,
+						 mmqos_debugfs_root, c,
+						 &mmqos_ostd_fops);
 	mmqos_debugfs_selftest = debugfs_create_file("selftest", 0200,
 						     mmqos_debugfs_root, c,
 						     &mmqos_selftest_fops);
@@ -1180,10 +1491,12 @@ static void mmqos_debugfs_init(struct mmqos_contract *c)
 static void mmqos_debugfs_exit(void)
 {
 	debugfs_remove(mmqos_debugfs_selftest);
+	debugfs_remove(mmqos_debugfs_ostd);
 	debugfs_remove(mmqos_debugfs_topology);
 	debugfs_remove(mmqos_debugfs_contract);
 	debugfs_remove(mmqos_debugfs_root);
 	mmqos_debugfs_selftest = NULL;
+	mmqos_debugfs_ostd = NULL;
 	mmqos_debugfs_topology = NULL;
 	mmqos_debugfs_contract = NULL;
 	mmqos_debugfs_root = NULL;
