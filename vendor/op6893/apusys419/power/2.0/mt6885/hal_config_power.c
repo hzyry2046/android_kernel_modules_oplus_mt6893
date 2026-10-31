@@ -36,6 +36,23 @@ int conn_mtcmos_on;
  */
 static int power_transition_error;
 
+/* Diagnostic only.  The stock window is 50 x 10us = 500us, inherited from the
+ * 4.19 driver where the APU-side firmware answered the power-down handshake.
+ * Widening it separates "the ack is slower than the window" from "the ack never
+ * comes" without changing what is written to the hardware.  Default is stock,
+ * so nothing changes unless a caller asks.
+ */
+static int rpc_poll_rounds = REG_POLLING_TIMEOUT_ROUNDS;
+module_param(rpc_poll_rounds, int, 0444);
+MODULE_PARM_DESC(rpc_poll_rounds,
+	"RPC power-status poll window in 10us rounds (stock 50 = 500us)");
+
+static unsigned int rpc_poll_limit(void)
+{
+	return rpc_poll_rounds > 0 ? (unsigned int)rpc_poll_rounds :
+				     REG_POLLING_TIMEOUT_ROUNDS;
+}
+
 static bool valid_power_user(enum DVFS_USER user)
 {
 	return (user >= VPU0 && user < APUSYS_DVFS_USER_NUM) ||
@@ -1170,7 +1187,7 @@ static int rpc_power_status_check(int domain_idx, unsigned int mode)
 		else // mode equals to 0 (disable) or 2 (disable mid stage)
 			finished = (chkValue >> domain_idx) & 0x1;
 
-		if (finished && ++check_round >= REG_POLLING_TIMEOUT_ROUNDS) {
+		if (finished && ++check_round >= rpc_poll_limit()) {
 
 			fail_power_transition(-ETIMEDOUT);
 			recording_power_fail_state();
