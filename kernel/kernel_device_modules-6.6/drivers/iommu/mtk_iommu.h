@@ -162,6 +162,10 @@ struct mtk_iommu_data {
 	struct device			*dev;
 	struct device			*bk_dev[IOMMU_BK_NUM];
 	struct clk			*bclk;
+	/* APU M4Us only: every "clocks" entry, held from probe to remove */
+	struct clk_bulk_data		*apu_clks;
+	int				apu_clk_num;
+	int				apu_clk_on;
 	phys_addr_t			protect_base; /* protect memory base */
 	struct mtk_iommu_suspend_reg	reg;
 	struct mtk_iommu_domain		*m4u_dom;

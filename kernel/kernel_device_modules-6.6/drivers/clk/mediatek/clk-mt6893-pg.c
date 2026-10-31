@@ -4730,6 +4730,35 @@ static int enable_subsys(enum subsys_id id)
 
 #if MT_CCF_BRINGUP
 	pr_debug("[CCF] %s: sys=%s, id=%d\n", __func__, sys->name, id);
+	/*
+	 * op6893 6.6 bring-up: SYS_VPU is the only other domain whose consumer
+	 * can actually be loaded here (apusys_power, gated on enable_apu + the
+	 * opt-in legacy APU experiment).  Without an arm here the whole
+	 * power-on path below returns success while never un-gating the
+	 * domain: enable_apu_mtcmos(1) -> clk_prepare_enable(
+	 * mtcmos_scp_sys_vpu) -> pg_enable() -> enable_subsys(SYS_VPU) ->
+	 * nothing.
+	 *
+	 * It is done *before* and independent of the get_state() check that
+	 * guards MD1/CONN, on purpose: after the APU power provider's init the
+	 * SPM status bit reads as if the domain were up while it is not, so a
+	 * get_state()-gated power-up is skipped and the domain never comes up
+	 * (measured: PG_VPU counts reach 2 while the APU M4U window still
+	 * reads 0).  spm_mtcmos_vpu() is safe to repeat.
+	 *
+	 * It also clears the APU conn/vcore gate bits, which the real path does
+	 * through enable_subsys_hwcg().  Those wrappers gate the APU peripheral
+	 * space itself, so they have to be cleared *after* the mtcmos is up.
+	 */
+	if (id == SYS_VPU) {
+		r = spm_mtcmos_vpu(STA_POWER_ON);
+		if (r)
+			return r;
+		if (clk_apu_vcore_base && clk_apu_conn_base)
+			enable_subsys_hwcg(id);
+		return 0;
+	}
+
 	if (sys->ops->get_state(sys) == SUBSYS_PWR_DOWN) {
 		switch (id) {
 		case SYS_MD1:
@@ -4738,29 +4767,6 @@ static int enable_subsys(enum subsys_id id)
 		case SYS_CONN:
 			spm_mtcmos_ctrl_conn(STA_POWER_ON);
 			break;
-		/*
-		 * op6893 6.6 bring-up: SYS_VPU is the only other domain whose
-		 * consumer can actually be loaded here (apusys_power, gated on
-		 * enable_apu + the opt-in legacy APU experiment).  Without this
-		 * arm the whole power-on path below returns success while never
-		 * un-gating the domain, which is exactly how the APU M4Us ended
-		 * up with every register reading 0: enable_apu_mtcmos(1) ->
-		 * clk_prepare_enable(mtcmos_scp_sys_vpu) -> pg_enable() ->
-		 * enable_subsys(SYS_VPU) -> nothing.
-		 *
-		 * It also has to clear the APU conn/vcore gate bits, which the
-		 * real path does through enable_subsys_hwcg().  Those wrappers
-		 * gate the APU peripheral space itself: with the mtcmos on but
-		 * the CGs still powered down, every APU M4U register reads back
-		 * a constant 0x7 (measured) instead of a register file.
-		 */
-		case SYS_VPU:
-			r = spm_mtcmos_vpu(STA_POWER_ON);
-			if (r)
-				return r;
-			if (clk_apu_vcore_base && clk_apu_conn_base)
-				enable_subsys_hwcg(id);
-			return 0;
 		default:
 			break;
 		}
@@ -4823,6 +4829,10 @@ static int disable_subsys(enum subsys_id id)
 
 #if MT_CCF_BRINGUP
 	pr_debug("[CCF] %s: sys=%s, id=%d\n", __func__, sys->name, id);
+	/* see the matching note in enable_subsys() */
+	if (id == SYS_VPU)
+		return spm_mtcmos_vpu(STA_POWER_DOWN);
+
 	if (sys->ops->get_state(sys) == SUBSYS_PWR_ON) {
 		switch (id) {
 		case SYS_MD1:
@@ -4831,9 +4841,6 @@ static int disable_subsys(enum subsys_id id)
 		case SYS_CONN:
 			spm_mtcmos_ctrl_conn(STA_POWER_DOWN);
 			break;
-		/* see the matching note in enable_subsys() */
-		case SYS_VPU:
-			return spm_mtcmos_vpu(STA_POWER_DOWN);
 		default:
 			break;
 		}

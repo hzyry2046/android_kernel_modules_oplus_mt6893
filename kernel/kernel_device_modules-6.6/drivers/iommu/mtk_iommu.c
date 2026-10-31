@@ -3170,6 +3170,58 @@ repeat:
 	platform_device_put(pcommdev);
 
 skip_smi:
+	if (data->plat_data->iommu_type == APU_IOMMU) {
+		/*
+		 * op6893 6.6 bring-up: the APU M4Us need their own gates before
+		 * the register window decodes at all.  Measured on the device
+		 * with a read-only audit: with the VPU mtcmos on but no M4U gate
+		 * the window reads 0; enabling these makes 19010000/19015000
+		 * return a real register file (000a000a, 007fffff, 00004848,
+		 * fffcfffd ...) like the MM instances.
+		 *
+		 * Order matters, and it is why an earlier attempt here did
+		 * nothing: the node lists "clock" (apuc_iommu_0/1, from the
+		 * APUSYS clock controller) before "power" (mtcmos_scp_sys_vpu).
+		 * The gate write only sticks once the mtcmos is up, so the
+		 * mtcmos has to be enabled first -- exactly what 4.19's
+		 * mtk_iommu_power_switch() does when it enables the "power"
+		 * entries before the rest.
+		 */
+		ret = devm_clk_bulk_get_all(dev, &data->apu_clks);
+		if (ret < 0) {
+			dev_err(dev, "%s,get apu clks failed: %d\n", __func__, ret);
+			return ret;
+		}
+		data->apu_clk_num = ret;
+
+		for (i = 0; i < data->apu_clk_num; i++) {
+			if (!data->apu_clks[i].id ||
+			    strcmp(data->apu_clks[i].id, "power"))
+				continue;
+			ret = clk_prepare_enable(data->apu_clks[i].clk);
+			if (ret) {
+				dev_err(dev, "%s,enable %s failed: %d\n",
+					__func__, data->apu_clks[i].id, ret);
+				return ret;
+			}
+			data->apu_clk_on++;
+		}
+		for (i = 0; i < data->apu_clk_num; i++) {
+			if (data->apu_clks[i].id &&
+			    !strcmp(data->apu_clks[i].id, "power"))
+				continue;
+			ret = clk_prepare_enable(data->apu_clks[i].clk);
+			if (ret) {
+				dev_err(dev, "%s,enable %s failed: %d\n",
+					__func__, data->apu_clks[i].id, ret);
+				return ret;
+			}
+			data->apu_clk_on++;
+		}
+		dev_info(dev, "%s, %d/%d apu clks enabled (power first)\n",
+			 __func__, data->apu_clk_on, data->apu_clk_num);
+	}
+
 	pm_runtime_enable(dev);
 
 	if (data->smicomm_dev) {
@@ -3272,12 +3324,16 @@ out_runtime_disable:
 static void mtk_iommu_remove(struct platform_device *pdev)
 {
 	struct mtk_iommu_data *data = platform_get_drvdata(pdev);
+	int i;
 
 	iommu_device_sysfs_remove(&data->iommu);
 	iommu_device_unregister(&data->iommu);
 
 	if (MTK_IOMMU_HAS_FLAG(data->plat_data, HAS_BCLK))
 		clk_disable_unprepare(data->bclk);
+
+	for (i = 0; i < data->apu_clk_num; i++)
+		clk_disable_unprepare(data->apu_clks[i].clk);
 
 	device_link_remove(data->smicomm_dev, &pdev->dev);
 	pm_runtime_disable(&pdev->dev);
