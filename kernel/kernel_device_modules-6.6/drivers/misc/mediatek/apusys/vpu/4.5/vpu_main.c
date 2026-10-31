@@ -1028,6 +1028,16 @@ static const struct of_device_id vpu_of_ids[] = {
 	{.compatible = "mediatek,mt6785-vpu_core", .data = &vpu_plat_mt67xx},
 	{.compatible = "mediatek,mt6779-vpu_core", .data = &vpu_plat_mt67xx},
 	{.compatible = "mediatek,mt8188-vpu_core", .data = &vpu_plat_mt8188},
+	/* op6893 boots a 4.19-generation DT that still spells the VPU nodes the
+	 * old way (mediatek,vpu_core0/1/2, which is what 4.19's vpu/4.0
+	 * matched).  That DT's firmware contract is unchanged -- bin-phy-addr,
+	 * bin-size, img-head, pre-bin, reset-vector, main-prog, iram-data,
+	 * work-buf, algo and id, all read by this driver -- so the same
+	 * platform data applies and no shim is needed.
+	 */
+	{.compatible = "mediatek,vpu_core0", .data = &vpu_plat_mt68xx},
+	{.compatible = "mediatek,vpu_core1", .data = &vpu_plat_mt68xx},
+	{.compatible = "mediatek,vpu_core2", .data = &vpu_plat_mt68xx},
 	{}
 };
 
