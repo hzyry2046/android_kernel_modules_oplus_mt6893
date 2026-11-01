@@ -2208,9 +2208,23 @@ static void mtk_iommu_get_resv_regions(struct device *dev,
  * it, so the page-table base written at attach was lost and every later TLB
  * flush went to a M4U that had no page table at all.
  *
- * The write lands *before* the APU RPC acknowledges the power-on, i.e. while
- * the domain is still effectively off, which is exactly the window in which the
- * APU M4U register file does answer AP accesses.
+ * Measured on this board, that moment is not a usable window, and neither is
+ * any other state the real power flow passes through:
+ *
+ *   - before the first device power-on the APU conn bus clocks (apuc_ahb /
+ *     apuc_axi, the gate registers inside apu_conn itself) are off, so the
+ *     M4Us behind that block read 0 and drop writes;
+ *   - 4.19 turns them on in enable_apu_conn_vcore_clock(), which runs *after*
+ *     enable_apu_mtcmos(1) -- i.e. after after_on() has already fired -- so
+ *     even 4.19 restores into the dead window;
+ *   - once the power sequence has run the whole block answers with a constant
+ *     0x7 (bus timeout, ~7 ms per access) while RPC and apu_vcore stay live.
+ *
+ * The only state in which the AP can write these registers is a diagnostic one
+ * that the real flow never reaches (no APU power driver bound, mtcmos and the
+ * apuc_iommu gate enabled by hand).  So the AP-side page-table base write is
+ * not the mechanism behind 4.19's working VPU; see
+ * docs/apusys-rpc-sleep-20261101.md sections 12 and 13.
  */
 static void mtk_iommu_pg_reg_backup(struct mtk_iommu_data *data)
 {
@@ -2312,7 +2326,8 @@ static int pg_callback_registered;
  * branch (which is 4.19's behaviour and no longer does a pointless write);
  * mtk_iommu.pg_restore=1 turns the whole 4.19 model on -- callback plus
  * powering the clocks back down at the end of probe -- to reproduce the
- * measurement.
+ * measurement.  Section 13 of docs/apusys-rpc-sleep-20261101.md explains why
+ * no reachable state has a writable window, which is why this stays off.
  */
 static bool pg_restore;
 module_param(pg_restore, bool, 0400);
