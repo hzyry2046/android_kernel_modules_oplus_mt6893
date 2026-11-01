@@ -2349,16 +2349,21 @@ MODULE_PARM_DESC(pg_restore,
  * Off by default: probing early leaves SYS_VPU gated on for the length of the
  * probe on every boot, which the shipping image should not do.
  *
- * Measured on the device, this switch alone does not help: the APU clock
- * providers (clk-mt6893-apuc/apuv) are modules that this image does not ship,
- * so devm_clk_bulk_get_all() returns -EPROBE_DEFER until they are loaded and
- * the M4Us only probe once they are insmod'd (~56 s), by which time the window
- * answers a constant 0x4.  Putting those two modules into the ramdisk
- * modules.load ahead of mtk_iommu is what would reproduce 4.19's t=0.43 probe,
- * but that image did not reach init stage 2: init exited with status 127 while
- * loading the next module and the kernel panicked in "Attempted to kill init".
- * Captured in logs/apusys-early-probe-bootloop-20261101/.  Do not retry that
- * combination on the bench phone without a recovery plan.
+ * Measured on the device this does not help either way:
+ *
+ *   - With the APU clock providers missing from modules.load the bulk clock get
+ *     returns -EPROBE_DEFER and the M4Us only probe once the providers are
+ *     insmod'd (~56 s), where the window answers a constant 0x4.
+ *   - Shipping clk-mt6893-apuc/apuv through package_early_modules.sh (a
+ *     one-off LIST) does reproduce the early probe: the M4Us probe at t=1.83 s
+ *     and attach with "backup pgtable", but mtk_iommu_hw_init()'s register dump
+ *     is still a constant 0x4 -- the block does not answer at that point
+ *     either, so nothing is gained.
+ *
+ * The first attempt at that image hand-copied the two .ko into a ramdisk
+ * overlay instead of going through the pipeline, and it did not reach init
+ * stage 2 (init exited with status 127).  Use the pipeline; see
+ * docs/apusys-rpc-sleep-20261101.md sections 14.6 and 14.7.
  */
 static bool apu_early_probe;
 module_param(apu_early_probe, bool, 0400);
