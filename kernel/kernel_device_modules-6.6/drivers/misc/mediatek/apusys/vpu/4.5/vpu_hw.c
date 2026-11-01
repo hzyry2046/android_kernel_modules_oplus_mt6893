@@ -298,7 +298,7 @@ static void vpu_exit_dev_algo_general(struct vpu_device *vd,
 	struct __vpu_algo *alg;
 	struct list_head *ptr, *tmp;
 
-	if (!al)
+	if (!al || !al->a.next)
 		return;
 
 	vpu_alg_debug("%s: %s\n", __func__, al->name);
@@ -517,11 +517,15 @@ static int vpu_free_algo_info(struct vpu_device *vd)
 {
 	struct vpu_mem_ops *mops = vd_mops(vd);
 
-	if (!vd->iova_algo_info.m.va)
-		return 0;
-
-	mops->free(vd->dev, &vd->iova_algo_info);
-	mops->free(vd->dev, &vd->iova_preload_info);
+	/*
+	 * Both iovas live in @vd, so both must leave vpu_drv->vi before @vd is
+	 * freed.  Only the preload one is allocated when the image has no
+	 * normal algo entry, so don't gate on the other.
+	 */
+	if (vd->iova_algo_info.m.va)
+		mops->free(vd->dev, &vd->iova_algo_info);
+	if (vd->iova_preload_info.m.va)
+		mops->free(vd->dev, &vd->iova_preload_info);
 	vd->iova_algo_info.m.va = 0;
 	vd->iova_preload_info.m.va = 0;
 	return 0;

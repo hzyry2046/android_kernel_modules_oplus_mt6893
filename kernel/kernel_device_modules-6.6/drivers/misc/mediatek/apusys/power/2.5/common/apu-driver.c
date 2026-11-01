@@ -34,8 +34,9 @@ int apu_device_power_suspend(enum DVFS_USER user, int is_suspend)
 
 	ad = apu_find_device(user);
 	if (IS_ERR_OR_NULL(ad)) {
-		apower_err(ad->dev, "[%s] called by no-exist user (%d)\n",
-				__func__, ori_usr);
+		/* @ad is an ERR_PTR here, so it cannot be used for logging */
+		pr_info("[%s:"APUPW_PRE"] called by no-exist user (%s)\n",
+				__func__, apu_dev_string(ori_usr));
 		ret = -EFAULT;
 		goto out;
 	}
@@ -58,6 +59,8 @@ int apu_device_power_suspend(enum DVFS_USER user, int is_suspend)
 	if (user == APUCB)
 		mutex_unlock(&apucb_lock);
 out:
+	if (IS_ERR_OR_NULL(ad))
+		return ret;
 	apower_warn(ad->dev, "[%s] called by %s\n",
 		__func__, apu_dev_string(ori_usr));
 	return ret;
@@ -75,8 +78,9 @@ int apu_device_power_on(enum DVFS_USER user)
 
 	ad = apu_find_device(user);
 	if (IS_ERR_OR_NULL(ad)) {
-		apower_err(ad->dev, "[%s] called by no-exist user (%d)\n",
-				__func__, ori_usr);
+		/* @ad is an ERR_PTR here, so it cannot be used for logging */
+		pr_info("[%s:"APUPW_PRE"] called by no-exist user (%s)\n",
+				__func__, apu_dev_string(ori_usr));
 		ret = -EFAULT;
 		goto out;
 	}

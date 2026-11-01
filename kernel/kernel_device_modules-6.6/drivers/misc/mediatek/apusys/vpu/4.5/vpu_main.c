@@ -780,6 +780,7 @@ static int vpu_probe(struct platform_device *pdev)
 {
 	struct vpu_device *vd;
 	struct vpu_probe_ops *probe_ops = NULL;
+	bool drv_created = false;
 	int ret = 0;
 	int id = 0;
 
@@ -825,6 +826,7 @@ static int vpu_probe(struct platform_device *pdev)
 		if (!vpu_drv)
 			return -ENOMEM;
 
+		drv_created = true;
 		kref_init(&vpu_drv->ref);
 
 		ret = vpu_init_bin(pdev->dev.of_node);
@@ -901,19 +903,19 @@ static int vpu_probe(struct platform_device *pdev)
 	/* device algo initialization */
 	ret = vpu_init_dev_algo(pdev, vd);
 	if (ret)
-		goto hw_free;
+		goto algo_free;
 
 	/* register device to APUSYS */
 	ret = probe_ops->init_adev(vd, &vd->adev,
 		APUSYS_DEVICE_VPU, vpu_send_cmd);
 	if (ret)
-		goto hw_free;
+		goto algo_free;
 
 	if (xos_type(vd) == VPU_XOS) {
 		ret = probe_ops->init_adev(vd, &vd->adev_rt,
 			APUSYS_DEVICE_VPU_RT, vpu_send_cmd_rt);
 		if (ret)
-			goto hw_free;
+			goto algo_free;
 	}
 
 	vpu_init_dev_debug(pdev, vd);
@@ -923,13 +925,27 @@ static int vpu_probe(struct platform_device *pdev)
 
 	return 0;
 
-	// TODO: add error handling free algo
+algo_free:
+	/* drops the algo-list iovas, which live in @vd */
+	vpu_exit_dev_algo(pdev, vd);
 hw_free:
 	vpu_exit_dev_hw(pdev, vd);
 free:
 	vpu_exit_dev_mem(pdev, vd);
 out:
 	vpu_free(pdev);
+	/*
+	 * vpu_drv->vi keeps iovas that belong to this core's @vd, so a failed
+	 * core0 must not leave a driver behind: the sibling cores would probe
+	 * against a half-torn-down global state.  Drop it and let them defer.
+	 */
+	if (drv_created) {
+		vpu_exit_drv_tags();
+		vpu_exit_drv_met();
+		vpu_exit_drv_hw();
+		vpu_exit_debug();
+		vpu_drv_put();
+	}
 	dev_info(&pdev->dev, "%s: failed\n", __func__);
 	return ret;
 }

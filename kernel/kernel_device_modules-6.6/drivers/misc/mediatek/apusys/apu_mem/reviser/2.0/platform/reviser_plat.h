@@ -18,6 +18,15 @@ struct reviser_plat {
 	unsigned int up_max;
 	unsigned int slb_wait_time;
 
+	/*
+	 * Fallbacks for DTs written before these became properties (the 4.19
+	 * ABI has neither "boundary" nor "default-dram"): 4.19 took the
+	 * per-SoC BOUNDARY_APUSYS constant and REMAP_DRAM_BASE instead.
+	 * Zero means "the DT must carry it".
+	 */
+	unsigned int boundary_def;
+	unsigned int default_dram_def;
+
 	/* Migration */
 	unsigned int vlm_remap_table_base;
 	unsigned int vlm_CTX_base;

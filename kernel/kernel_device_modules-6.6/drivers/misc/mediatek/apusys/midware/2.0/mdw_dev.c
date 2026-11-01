@@ -41,6 +41,8 @@ int mdw_dev_init(struct device *dev, struct mdw_device *mdev)
 	mutex_init(&mdev->h_mtx);
 
 	mdev->plat_funcs = (struct mdw_plat_func *)of_device_get_match_data(dev);
+	if (!mdev->plat_funcs)
+		mdev->plat_funcs = (struct mdw_plat_func *)dev_get_platdata(dev);
 	if (!mdev->plat_funcs) {
 		pr_info("of_device_get_match_data fail\n");
 		return -EINVAL;

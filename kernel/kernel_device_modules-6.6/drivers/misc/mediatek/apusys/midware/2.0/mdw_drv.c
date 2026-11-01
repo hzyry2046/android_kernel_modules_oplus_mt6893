@@ -6,6 +6,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/of_device.h>
+#include <linux/platform_device.h>
 #include <linux/types.h>
 #include <linux/dma-direct.h>
 #include <linux/rpmsg.h>
@@ -161,10 +162,22 @@ static int mdw_platform_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	/* get parameter from dts */
-	of_property_read_u32(pdev->dev.of_node, "version", &mdev->mdw_ver);
-	of_property_read_u32(pdev->dev.of_node, "dsp_mask", &mdev->dsp_mask);
-	of_property_read_u32(pdev->dev.of_node, "dla_mask", &mdev->dla_mask);
-	of_property_read_u32(pdev->dev.of_node, "dma_mask", &mdev->dma_mask);
+	if (pdev->dev.of_node) {
+		of_property_read_u32(pdev->dev.of_node, "version", &mdev->mdw_ver);
+		of_property_read_u32(pdev->dev.of_node, "dsp_mask", &mdev->dsp_mask);
+		of_property_read_u32(pdev->dev.of_node, "dla_mask", &mdev->dla_mask);
+		of_property_read_u32(pdev->dev.of_node, "dma_mask", &mdev->dma_mask);
+	} else {
+		/*
+		 * no "mediatek, apu_mdw" node: use the same values as the
+		 * mt6893 dtsi node, which is what this board's DT would have
+		 * carried if it had one.
+		 */
+		mdev->mdw_ver = 2;
+		mdev->dsp_mask = 0xff;
+		mdev->dla_mask = 0xff;
+		mdev->dma_mask = 0xff;
+	}
 	mdev->pdev = pdev;
 	mdev->driver_type = MDW_DRIVER_TYPE_PLATFORM;
 	mdev->misc_dev = &mdw_misc_dev;
@@ -237,6 +250,28 @@ static struct platform_driver mdw_platform_driver = {
 	.probe = mdw_platform_probe,
 	.remove = mdw_platform_remove,
 };
+
+/*
+ * DTs older than the mt6893 dtsi have no "mediatek, apu_mdw" node.  The
+ * 4.19 midware never needed one: it registered the platform device itself,
+ * and the driver core then matched it by name.  Do the same when the node
+ * is absent so the middleware still comes up on such DTs.  platform_data
+ * carries the same ops the node's match data would have provided.
+ */
+static void mdw_plat_dev_release(struct device *dev)
+{
+}
+
+static struct platform_device mdw_plat_dev = {
+	.name = "apusys",
+	.id = -1,
+	.dev = {
+		.release = mdw_plat_dev_release,
+		.platform_data = (void *)&ap_plat_drv_v1,
+	},
+};
+
+static bool mdw_plat_dev_registered;
 
 //----------------------------------------
 static int mdw_rpmsg_probe(struct rpmsg_device *rpdev)
@@ -338,6 +373,7 @@ static struct rpmsg_driver mdw_rpmsg_driver = {
 //----------------------------------------
 int mdw_init(struct apusys_core_info *info)
 {
+	struct device_node *np = NULL;
 	int ret = 0;
 
 	g_info = info;
@@ -361,11 +397,24 @@ int mdw_init(struct apusys_core_info *info)
 		goto unregister_misc_dev;
 	}
 
+	np = of_find_compatible_node(NULL, NULL, "mediatek, apu_mdw");
+	if (np) {
+		of_node_put(np);
+	} else {
+		pr_info("%s no apu_mdw node, register platform dev\n", __func__);
+		ret = platform_device_register(&mdw_plat_dev);
+		if (ret) {
+			pr_info("failed to register apu mdw platform dev\n");
+			goto unregister_platform_driver;
+		}
+		mdw_plat_dev_registered = true;
+	}
+
 	pr_info("%s register rpmsg...\n", __func__);
 	ret = register_rpmsg_driver(&mdw_rpmsg_driver);
 	if (ret) {
 		pr_info("failed to register apu mdw rpmsg driver\n");
-		goto unregister_platform_driver;
+		goto unregister_platform_dev;
 	}
 
 	/* init apu ext function */
@@ -380,6 +429,11 @@ int mdw_init(struct apusys_core_info *info)
 
 unregister_rpmsg_driver:
 	unregister_rpmsg_driver(&mdw_rpmsg_driver);
+unregister_platform_dev:
+	if (mdw_plat_dev_registered) {
+		platform_device_unregister(&mdw_plat_dev);
+		mdw_plat_dev_registered = false;
+	}
 unregister_platform_driver:
 	platform_driver_unregister(&mdw_platform_driver);
 unregister_misc_dev:
@@ -392,6 +446,10 @@ void mdw_exit(void)
 {
 	mdw_ext_deinit();
 	unregister_rpmsg_driver(&mdw_rpmsg_driver);
+	if (mdw_plat_dev_registered) {
+		platform_device_unregister(&mdw_plat_dev);
+		mdw_plat_dev_registered = false;
+	}
 	platform_driver_unregister(&mdw_platform_driver);
 	misc_deregister(&mdw_misc_dev);
 	g_info = NULL;

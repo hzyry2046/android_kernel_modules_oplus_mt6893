@@ -347,16 +347,31 @@ static int reviser_map_dts(struct platform_device *pdev)
 
 	if (of_property_read_u32(pdev->dev.of_node,
 			"boundary", &rdv->plat.boundary)) {
-		LOG_ERR("Invalid boundary %d\n", ret);
+		/* 4.19 ABI DT: use the per-SoC BOUNDARY_APUSYS constant */
+		const struct reviser_plat *rplat =
+			of_device_get_match_data(&pdev->dev);
 
-		goto free_int;
+		rdv->plat.boundary = rplat ? rplat->boundary_def : 0;
+		if (!rdv->plat.boundary) {
+			LOG_ERR("Invalid boundary %d\n", ret);
+			ret = -ENODEV;
+			goto free_int;
+		}
 	}
 	LOG_DBG_RVR_FLW("boundary: %08xh\n", rdv->plat.boundary);
 
 	if (of_property_read_u32(pdev->dev.of_node,
 			"default-dram", &dram_offset)) {
-		LOG_ERR("Invalid dram_offset %d\n", ret);
-		goto free_int;
+		/* 4.19 ABI DT: use the per-SoC REMAP_DRAM_BASE */
+		const struct reviser_plat *rplat =
+			of_device_get_match_data(&pdev->dev);
+
+		dram_offset = rplat ? rplat->default_dram_def : 0;
+		if (!dram_offset) {
+			LOG_ERR("Invalid dram_offset %d\n", ret);
+			ret = -ENODEV;
+			goto free_int;
+		}
 	}
 	LOG_DBG_RVR_FLW("dram_offset: %08xh\n", dram_offset);
 	if (dram_offset > 0)

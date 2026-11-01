@@ -20,6 +20,10 @@ static struct reviser_plat mt6893_drv = {
 	.up_max					= 1,
 	.slb_wait_time				= 0,
 
+	/* BOUNDARY_APUSYS with CONFIG_MTK_IOMMU_PGTABLE_EXT=34, REMAP_DRAM_BASE */
+	.boundary_def				= 0x3,
+	.default_dram_def			= 0x4000000,
+
 	.vlm_remap_table_base   = 0x200,
 	.vlm_CTX_base           = 0x300,
 	.vlm_remap_ctx_src      = 0x001C0000,
@@ -184,6 +188,8 @@ static struct reviser_plat rv_drv = {
 };
 
 static const struct of_device_id reviser_of_match[] = {
+	/* the name the 4.19 ABI DT (this board) uses */
+	{ .compatible = "mediatek,apusys_reviser",     .data = &mt6893_drv},
 	{ .compatible = "mediatek, mt6893-reviser",    .data = &mt6893_drv},
 	{ .compatible = "mediatek, mt6885-reviser",    .data = &mt6885_drv},
 	{ .compatible = "mediatek, mt6873-reviser",    .data = &mt6873_drv},
