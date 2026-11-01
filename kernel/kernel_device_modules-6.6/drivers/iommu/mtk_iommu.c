@@ -2334,6 +2334,37 @@ module_param(pg_restore, bool, 0400);
 MODULE_PARM_DESC(pg_restore,
 		 "Restore the APU M4U registers from the SYS_VPU power-on callback (4.19 behaviour; measured LOST and disturbs the power-on handshake on this port)");
 
+/*
+ * Experimental: probe the APU M4Us without waiting for the APU power driver.
+ *
+ * 4.19's mtk_iommu_clks_get() only needs the mtcmos clock (the node's "power"
+ * entry, CLK_SCP_SYS_VPU) and enables it; it never looks at whether
+ * apusys_power has a driver.  So 4.19 configures the APU M4Us at t=0.43,
+ * before the APU power driver runs hw_init_setting() and powers APUTOP back
+ * down.  This port defers until the power driver is bound, by which time the
+ * register window no longer decodes, so every write in mtk_iommu_hw_init()
+ * (CTRL_REG, MISC_CTRL, IVRP_PADDR, DCM_DIS, TBW_ID, the interrupt enables)
+ * lands in a dead block.  See docs/apusys-rpc-sleep-20261101.md section 13.6.
+ *
+ * Off by default: probing early leaves SYS_VPU gated on for the length of the
+ * probe on every boot, which the shipping image should not do.
+ *
+ * Measured on the device, this switch alone does not help: the APU clock
+ * providers (clk-mt6893-apuc/apuv) are modules that this image does not ship,
+ * so devm_clk_bulk_get_all() returns -EPROBE_DEFER until they are loaded and
+ * the M4Us only probe once they are insmod'd (~56 s), by which time the window
+ * answers a constant 0x4.  Putting those two modules into the ramdisk
+ * modules.load ahead of mtk_iommu is what would reproduce 4.19's t=0.43 probe,
+ * but that image did not reach init stage 2: init exited with status 127 while
+ * loading the next module and the kernel panicked in "Attempted to kill init".
+ * Captured in logs/apusys-early-probe-bootloop-20261101/.  Do not retry that
+ * combination on the bench phone without a recovery plan.
+ */
+static bool apu_early_probe;
+module_param(apu_early_probe, bool, 0400);
+MODULE_PARM_DESC(apu_early_probe,
+		 "Probe the APU M4Us before the APU power driver binds, as 4.19 does (experimental)");
+
 static const struct iommu_ops mtk_iommu_ops = {
 	.domain_alloc	= mtk_iommu_domain_alloc,
 	.probe_device	= mtk_iommu_probe_device,
@@ -3202,11 +3233,23 @@ out:
 			 * this image), so the domain is off and every register
 			 * access below would hit unpowered hardware.  Wait for a
 			 * real power owner instead of proceeding without one.
+			 *
+			 * apu_early_probe=1 skips this, which is what 4.19
+			 * effectively does: it only takes the mtcmos clock and
+			 * configures the M4U while the block still answers.
 			 */
-			dev_info(dev, "apu power driver not bound, deferring\n");
+			if (!apu_early_probe) {
+				dev_info(dev, "apu power driver not bound, deferring\n");
+				platform_device_put(apudev);
+				of_node_put(apunode);
+				return -EPROBE_DEFER;
+			}
+			/* A device link to a supplier with no driver would
+			 * only add a PM link that can never resolve. */
+			dev_info(dev, "apu power driver not bound, probing early\n");
 			platform_device_put(apudev);
 			of_node_put(apunode);
-			return -EPROBE_DEFER;
+			goto skip_smi;
 		}
 
 		link = device_link_add(&apudev->dev, dev, DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME);
@@ -3475,7 +3518,7 @@ skip_smi:
 
 	mtk_iommu_isr_pause_timer_init(data);
 
-	if (pg_restore && data->apu_clk_on) {
+	if ((pg_restore || apu_early_probe) && data->apu_clk_on) {
 		/* 4.19 ends its probe with mtk_iommu_power_switch(data, false):
 		 * the clocks were only enabled to run the hardware init.  They
 		 * have to go back off, otherwise the later APU power-on finds
