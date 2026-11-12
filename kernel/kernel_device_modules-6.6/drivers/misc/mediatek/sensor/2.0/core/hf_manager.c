@@ -1145,7 +1145,8 @@ static int hf_manager_debug(struct hf_client *client, uint8_t sensor_type,
 		goto err_out;
 	}
 	device = manager->hf_dev;
-	if (!device || !device->dev_name) {
+	if (!device || !device->dev_name ||
+	    !device->debug) {
 		ret = -EINVAL;
 		goto err_out;
 	}
@@ -1949,9 +1950,11 @@ static int hf_manager_proc_show_sensor(struct seq_file *m, void *v,
 	if (!manager)
 		goto out;
 	device = READ_ONCE(manager->hf_dev);
-	if (!device || !device->dev_name)
+	if (!device || !device->dev_name || !device->debug)
 		goto out;
 	debug_buffer = kzalloc(debug_len, GFP_KERNEL);
+	if (!debug_buffer)
+		goto out;
 	if (device->debug(device, sensor_type, debug_buffer,
 			debug_len) > 0) {
 		seq_printf(m, "On Host Sub Module: %s\n", device->dev_name);
