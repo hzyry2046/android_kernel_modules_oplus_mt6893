@@ -408,9 +408,15 @@ static bool soc3_0WfdmaAllocRxRing(
 {
 	struct GL_HIF_INFO *prHifInfo = &prGlueInfo->rHifInfo;
 
+	/*
+	 * DATA1 is a data ring like DATA0: with RX_DATA_USE_RSV_MEM its
+	 * buffers are carved out of reserved memory at CFG_RX_MAX_PKT_SIZE
+	 * (hif_mem.c), so the ring must not advertise a larger buffer to the
+	 * DMA engine, or memset and large frames run into the next buffer.
+	 */
 	if (!halWpdmaAllocRxRing(prGlueInfo, RX_RING_DATA1,
 			prHifInfo->u4RxDataRingSize, RXD_SIZE,
-			RX_BUFFER_AGGRESIZE,
+			CFG_RX_MAX_PKT_SIZE,
 			fgAllocMem)) {
 		DBGLOG(HAL, ERROR, "AllocWfdmaRxRing fail\n");
 		return false;
