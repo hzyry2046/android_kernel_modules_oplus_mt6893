@@ -2673,11 +2673,23 @@ uint32_t addH3cAkmSuiteFunc(uint8_t *s) {
 	return res;
 }
 
+/*
+ * Rebuild an RSN IE with an extra FT AKM appended.  Every field length
+ * comes from an over-the-air frame, so each one is checked against what
+ * is left of the source IE before it is copied; a malformed IE returns 0
+ * and the caller falls back to the original frame.  The output is at most
+ * rsn_ie_len + 4 bytes.
+ */
 uint16_t generateH3cRsnIeFunc(uint8_t *buf, uint8_t *rsn_ie, uint16_t rsn_ie_len)
 {
 	uint8_t *pos = buf;
 	uint16_t count = 0;
 	uint32_t add_akm = 0;
+	uint32_t n;
+
+	if (rsn_ie_len < ELEM_HDR_LEN + 2 ||
+	    rsn_ie_len > ELEM_HDR_LEN + VENDOR_RSNIE_MAX_LEN - 4)
+		return 0;
 
 	*pos++ = ELEM_ID_RSN;
 	*pos++ = 4 + rsn_ie_len - ELEM_HDR_LEN;
@@ -2701,17 +2713,23 @@ uint16_t generateH3cRsnIeFunc(uint8_t *buf, uint8_t *rsn_ie, uint16_t rsn_ie_len
 	/* 3.Pairwise Cipher Suite[count(0 or 2), list(0 or 4xm)] */
 	if (rsn_ie_len >= 2) {
 		WLAN_GET_FIELD_16(rsn_ie, &count);
-		kalMemCopy(pos, rsn_ie, 2 + count * 4);
-		pos += (2 + count * 4);
-		rsn_ie += (2 + count * 4);
-		rsn_ie_len -= (2 + count * 4);
+		n = 2 + (uint32_t)count * 4;
+		if (n > rsn_ie_len)
+			return 0;
+		kalMemCopy(pos, rsn_ie, n);
+		pos += n;
+		rsn_ie += n;
+		rsn_ie_len -= n;
 	}
 
 	/* 4.AKM Suite[count(0 or 2), list(0 or 4xn)] */
 	if (rsn_ie_len >= 2) {
 		WLAN_GET_FIELD_16(rsn_ie, &count);
-		add_akm = addH3cAkmSuiteFunc(rsn_ie + 2);
-		if (count == 1 && add_akm != 0) {
+		n = 2 + (uint32_t)count * 4;
+		if (n > rsn_ie_len)
+			return 0;
+		add_akm = count == 1 ? addH3cAkmSuiteFunc(rsn_ie + 2) : 0;
+		if (add_akm != 0) {
 			WLAN_SET_FIELD_16(pos, count + 1);
 			pos += 2;
 			rsn_ie += 2;
@@ -2722,10 +2740,10 @@ uint16_t generateH3cRsnIeFunc(uint8_t *buf, uint8_t *rsn_ie, uint16_t rsn_ie_len
 			rsn_ie += 4;
 			rsn_ie_len -= 4;
 		} else {
-			kalMemCopy(pos, rsn_ie, (2 + count * 4));
-			pos += (2 + count * 4);
-			rsn_ie += (2 + count * 4);
-			rsn_ie_len -= (2 + count * 4);
+			kalMemCopy(pos, rsn_ie, n);
+			pos += n;
+			rsn_ie += n;
+			rsn_ie_len -= n;
 		}
 	}
 
@@ -2740,10 +2758,13 @@ uint16_t generateH3cRsnIeFunc(uint8_t *buf, uint8_t *rsn_ie, uint16_t rsn_ie_len
 	/* 6.PMKID[Count(0 or 2), list(0 or 16xs)] */
 	if (rsn_ie_len >= 2) {
 		WLAN_GET_FIELD_16(rsn_ie, &count);
-		kalMemCopy(pos, rsn_ie, 2 + count * IW_PMKID_LEN);
-		pos += (2 + count * IW_PMKID_LEN);
-		rsn_ie += (2 + count * IW_PMKID_LEN);
-		rsn_ie_len -= (2 + count * IW_PMKID_LEN);
+		n = 2 + (uint32_t)count * IW_PMKID_LEN;
+		if (n > rsn_ie_len)
+			return 0;
+		kalMemCopy(pos, rsn_ie, n);
+		pos += n;
+		rsn_ie += n;
+		rsn_ie_len -= n;
 	}
 
 	/* 7.Group Management Cipher Suite[0 or 4]*/
@@ -2978,6 +2999,19 @@ struct BSS_DESC *scanAddToBssDesc(struct ADAPTER *prAdapter,
 	} else {
 		kalMemZero(recreate_buf, max_ie_len);
 		is_recreate_buf = recreateH3cPucIeFunc(recreate_buf, pucIE, u2IELength);
+	}
+
+	/*
+	 * The rebuilt IEs are 9 bytes longer than the received ones and are
+	 * written back over the frame in the RX buffer; only do that when the
+	 * buffer really has the room, otherwise keep the original IEs.
+	 */
+	if (is_recreate_buf && (prSwRfb->pvPacket == NULL ||
+	    skb_tail_pointer((struct sk_buff *)prSwRfb->pvPacket) +
+	    skb_tailroom((struct sk_buff *)prSwRfb->pvPacket) <
+	    prWlanBeaconFrame->aucInfoElem + max_ie_len)) {
+		log_dbg(SCN, WARN, "H3C FT: no room to rebuild IEs, skip\n");
+		is_recreate_buf = FALSE;
 	}
 
 	if (is_recreate_buf) {
