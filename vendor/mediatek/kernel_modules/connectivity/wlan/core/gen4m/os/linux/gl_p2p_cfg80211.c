@@ -2171,6 +2171,10 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy,
 			MBOX_ID_0,
 			(struct MSG_HDR *) prP2pBcnUpdateMsg,
 			MSG_SEND_METHOD_BUF);
+		/* The mailbox owns the message now; the err path must not
+		 * free it again.
+		 */
+		prP2pBcnUpdateMsg = NULL;
 
 		prP2pStartAPMsg = (struct MSG_P2P_START_AP *)
 			cnmMemAlloc(prGlueInfo->prAdapter,
