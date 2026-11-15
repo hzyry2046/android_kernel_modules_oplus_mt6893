@@ -498,23 +498,24 @@ schedule_next:
 		struct RM_BCN_REQ *prBeaconReq =
 			(struct RM_BCN_REQ *)&prCurrReq->aucRequestFields[0];
 
-		if (prBeaconReq->u2RandomInterval == 0)
-			rrmDoBeaconMeasurement(prAdapter, ucBssIndex);
-		else {
+		/* always run the measurement from the timer: table mode
+		 * completes synchronously and calls back into
+		 * rrmStartNextMeasurement, so a beacon request with
+		 * repetitions would otherwise recurse once per repeat and
+		 * can exhaust the kernel stack.
+		 */
+		if (prBeaconReq->u2RandomInterval != 0) {
 			u2RandomTime = (uint16_t) (kalRandomNumber() & 0xFFFF);
 			u2RandomTime =
 				(u2RandomTime * prBeaconReq->u2RandomInterval) /
 				65535;
 			u2RandomTime = TU_TO_MSEC(u2RandomTime);
-			if (u2RandomTime > 0) {
-				cnmTimerStopTimer(prAdapter, &rBeaconReqTimer);
-				cnmTimerInitTimer(prAdapter, &rBeaconReqTimer,
-					rrmDoBeaconMeasurement, ucBssIndex);
-				cnmTimerStartTimer(prAdapter, &rBeaconReqTimer,
-						   u2RandomTime);
-			} else
-				rrmDoBeaconMeasurement(prAdapter, ucBssIndex);
 		}
+		cnmTimerStopTimer(prAdapter, &rBeaconReqTimer);
+		cnmTimerInitTimer(prAdapter, &rBeaconReqTimer,
+			rrmDoBeaconMeasurement, ucBssIndex);
+		cnmTimerStartTimer(prAdapter, &rBeaconReqTimer,
+				   u2RandomTime);
 		break;
 	}
 #if 0
