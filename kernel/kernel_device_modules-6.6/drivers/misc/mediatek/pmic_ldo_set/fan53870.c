@@ -72,6 +72,9 @@ static struct fan53870_pw_chip *fan53870_pchip;
 int is_fan53870_1p1 = -1;
 int ldo5_power_on = 0;
 int ldo7_power_on = 0;
+/* per-LDO user count: several camera sensors can share one rail */
+static DEFINE_MUTEX(fan53870_cam_ldo_lock);
+static int fan53870_cam_ldo_users[FAN53870_LDO_NUM_MAX];
 void enable_fan53870_gpio(int pwr_status)
 {
     if(fan53870_pchip->en_gpio)
@@ -343,6 +346,7 @@ int fan53870_cam_ldo_set_voltage(unsigned int LDO_NUM, int set_mv)
     unsigned int reg_value = 0; /*2.804V*/
     struct fan53870_pw_chip *pchip = fan53870_pchip;
     pr_err("fan53870_cam_ldo_set_voltage LDO_NUM:%d set_mv:%d\n", LDO_NUM, set_mv);
+    mutex_lock(&fan53870_cam_ldo_lock);
     switch(LDO_NUM){
         case 1:
             if (set_mv == 1050) {
@@ -545,8 +549,11 @@ int fan53870_cam_ldo_set_voltage(unsigned int LDO_NUM, int set_mv)
             goto out;
         break;
     }
+    fan53870_cam_ldo_users[LDO_NUM]++;
+    mutex_unlock(&fan53870_cam_ldo_lock);
     return 0;
 out:
+    mutex_unlock(&fan53870_cam_ldo_lock);
     pr_err("fan53870_cam_ldo_set_voltage error!\n");
     return ret;
 }
@@ -557,7 +564,15 @@ int fan53870_cam_ldo_disable(unsigned int LDO_NUM)
     int ret;
     struct fan53870_pw_chip *pchip = fan53870_pchip;
     pr_info("fan53870_cam_ldo_disable LDO-%d\n", LDO_NUM);
+    mutex_lock(&fan53870_cam_ldo_lock);
     if (LDO_NUM > 0 && LDO_NUM < FAN53870_LDO_NUM_MAX) {
+        if (fan53870_cam_ldo_users[LDO_NUM] > 1) {
+            /* another sensor still shares this LDO, keep it on */
+            fan53870_cam_ldo_users[LDO_NUM]--;
+            mutex_unlock(&fan53870_cam_ldo_lock);
+            return 0;
+        }
+        fan53870_cam_ldo_users[LDO_NUM] = 0;
         LDO_NUM = 1 << (LDO_NUM - 1);
         ret = fan53870_mask_write_reg(pchip->regmap, FAN53870_LDO_ENABLE_REG, LDO_NUM, 0x00);
         pr_info("fan53870_cam_ldo_disable channel:0x%x!\n", LDO_NUM);
@@ -565,7 +580,7 @@ int fan53870_cam_ldo_disable(unsigned int LDO_NUM)
         ret = -1;
         pr_err("fan53870_cam_ldo_disable invalid LDO_NUM\n");
     }
-
+    mutex_unlock(&fan53870_cam_ldo_lock);
     return ret;
 }
 EXPORT_SYMBOL(fan53870_cam_ldo_disable);
