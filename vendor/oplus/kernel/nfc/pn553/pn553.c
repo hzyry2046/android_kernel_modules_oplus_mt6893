@@ -1366,7 +1366,6 @@ static long set_jcop_download_state(unsigned long arg)
         else
         {
             pr_info("%s bad ese pwr arg %lu\n", __func__, arg);
-            p61_access_unlock(pn544_dev);
             return -EBADRQC; /* Invalid request code */
         }
         pr_info("%s: PN544_SET_DWNLD_STATUS  = %x",__func__, current_state);
