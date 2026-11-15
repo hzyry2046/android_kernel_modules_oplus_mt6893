@@ -2231,7 +2231,7 @@ uint32_t fwDlGetFwdlInfo(struct ADAPTER *prAdapter,
 	kalSnprintf(aucBuf, sizeof(aucBuf), "%4s", prVerInfo->aucFwBranchInfo);
 	kalSnprintf(aucDate, sizeof(aucDate), "%16s", prVerInfo->aucFwDateCode);
 
-	u4Offset += snprintf(pcBuf + u4Offset,
+	u4Offset += scnprintf(pcBuf + u4Offset,
 			i4TotalLen - u4Offset,
 			"\nN9 FW version %s-%u.%u.%u[DEC] (%s)\n",
 			aucBuf,
@@ -2245,7 +2245,7 @@ uint32_t fwDlGetFwdlInfo(struct ADAPTER *prAdapter,
 						   i4TotalLen - u4Offset);
 
 	if (prChipInfo->patch_addr && !prVerInfo->fgPatchIsDlByDrv) {
-		u4Offset += snprintf(pcBuf + u4Offset,
+		u4Offset += scnprintf(pcBuf + u4Offset,
 				     i4TotalLen - u4Offset,
 				     "MCU patch is not downloaded by wlan driver, read patch info\n");
 #if (CFG_MTK_ANDROID_WMT == 0)
@@ -2259,13 +2259,13 @@ uint32_t fwDlGetFwdlInfo(struct ADAPTER *prAdapter,
 	kalSnprintf(aucDate, sizeof(aucDate), "%16s",
 			prVerInfo->rPatchHeader.aucBuildDate);
 
-	u4Offset += snprintf(pcBuf + u4Offset,
+	u4Offset += scnprintf(pcBuf + u4Offset,
 			     i4TotalLen - u4Offset,
 			     "Patch platform %s version 0x%04X %s\n",
 			     aucBuf, prVerInfo->rPatchHeader.u4PatchVersion,
 			     aucDate);
 
-	u4Offset += snprintf(pcBuf + u4Offset, i4TotalLen - u4Offset,
+	u4Offset += scnprintf(pcBuf + u4Offset, i4TotalLen - u4Offset,
 			"Drv version %u.%u[DEC]\n",
 			(uint32_t)(prVerInfo->u2FwPeerVersion >> 8),
 			(uint32_t)(prVerInfo->u2FwPeerVersion & BITS(0, 7)));
