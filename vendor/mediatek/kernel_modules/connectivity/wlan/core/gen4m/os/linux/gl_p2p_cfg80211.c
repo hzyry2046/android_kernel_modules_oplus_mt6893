@@ -2657,6 +2657,7 @@ int mtk_p2p_cfg80211_change_beacon(struct wiphy *wiphy,
 			dev->name, link_id, ucRoleIdx);
 
 		if (info->head_len + info->tail_len > MAX_BEACON_LENGTH ||
+			info->tail_len > MAX_IE_LENGTH ||
 			info->assocresp_ies_len > MAX_IE_LENGTH
 #if CFG_SUPPORT_P2P_GO_OFFLOAD_PROBE_RSP
 			|| info->proberesp_ies_len > MAX_IE_LENGTH
