@@ -2188,6 +2188,7 @@ int consys_spi_update_bits_mt6893(enum sys_spi_subsystem subsystem, unsigned int
 	if (ret) {
 		pr_err("[%s][%s] Get 0x%08x error, ret=%d",
 			__func__, g_spi_system_name[subsystem], addr, ret);
+		consys_sema_release_mt6893(CONN_SEMA_RFSPI_INDEX);
 		return CONNINFRA_SPI_OP_FAIL;
 	}
 
