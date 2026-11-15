@@ -5948,8 +5948,55 @@ static void aw8697_rtp_work_routine(struct work_struct *work)
     rtp_file = aw8697_rtp_load_file_accord_f0(aw8697);
     if (!rtp_file)
     {
+        unsigned int rtp_name_max;
+
         pr_err("%s  aw8697->rtp_file_num[%d]\n", __func__, aw8697->rtp_file_num);
         aw8697->rtp_routine_on = 1;
+
+        /* rtp_store only bounds the number by the generic 411-entry
+         * table, but the dispatch below picks a per-device/f0 table that
+         * can be much smaller; bound it by the table that will be used.
+         */
+#ifdef KERNEL_VERSION_510
+        /* all five 815 tables in this build are 411 entries */
+        if (aw8697->device_id == 815) {
+            rtp_name_max = ARRAY_SIZE(aw8697_rtp_name);
+        } else
+#else
+        if (aw8697->device_id == 815) {
+            if (aw8697->f0 <= 1670)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_165Hz);
+            else if (aw8697->f0 <= 1725)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name);
+            else
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_175Hz);
+        } else
+#endif
+        if (aw8697->device_id == 81538) {
+            rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_150Hz);
+        } else if (aw8697->device_id == 832) {
+            if (aw8697->f0 <= 2280)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_226Hz);
+            else if (aw8697->f0 <= 2320)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_230Hz);
+            else
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_234Hz);
+        } else {
+            if (aw8697->f0 <= 2280)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_226Hz);
+            else if (aw8697->f0 <= 2320)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_230Hz);
+            else if (aw8697->f0 <= 2350)
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_234Hz);
+            else
+                rtp_name_max = ARRAY_SIZE(aw8697_rtp_name_19065_237Hz);
+        }
+        if (aw8697->rtp_file_num >= rtp_name_max) {
+            pr_err("%s: rtp_file_num %d over table size %d\n",
+                    __func__, aw8697->rtp_file_num, rtp_name_max);
+            aw8697->rtp_routine_on = 0;
+            return;
+        }
 #ifdef KERNEL_VERSION_510
 		if (aw8697->device_id == 815) {
 			if (aw8697->f0 <= 1630) {
