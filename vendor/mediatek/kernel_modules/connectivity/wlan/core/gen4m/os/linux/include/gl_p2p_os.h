@@ -207,6 +207,7 @@ struct GL_P2P_INFO {
 #endif
 
 	struct LINK rWaitTxDoneLink;
+	spinlock_t rWaitTxDoneLinkLock;
 
 	enum ENUM_CHNL_SWITCH_POLICY eChnlSwitchPolicy;
 	u_int8_t fgChannelSwitchReq;

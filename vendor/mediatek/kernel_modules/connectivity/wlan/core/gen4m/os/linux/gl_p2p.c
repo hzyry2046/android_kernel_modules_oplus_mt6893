@@ -592,11 +592,23 @@ u_int8_t p2PFreeInfo(struct GLUE_INFO *prGlueInfo, uint8_t ucIdx)
 			(void **)&prWifiVar->prP2pQueryStaStatistics[ucIdx],
 			sizeof(struct PARAM_GET_STA_STATISTICS));
 #endif
-		while (!LINK_IS_EMPTY(&prGlP2pInfo->rWaitTxDoneLink)) {
+		while (TRUE) {
+			unsigned long u4Flags;
+
+			spin_lock_irqsave(
+				&prGlP2pInfo->rWaitTxDoneLinkLock, u4Flags);
+			if (LINK_IS_EMPTY(&prGlP2pInfo->rWaitTxDoneLink)) {
+				spin_unlock_irqrestore(
+					&prGlP2pInfo->rWaitTxDoneLinkLock,
+					u4Flags);
+				break;
+			}
 			LINK_REMOVE_HEAD(
 				&prGlP2pInfo->rWaitTxDoneLink,
 				prPendingMgmtInfo,
 				struct P2P_PENDING_MGMT_INFO *);
+			spin_unlock_irqrestore(
+				&prGlP2pInfo->rWaitTxDoneLinkLock, u4Flags);
 			DBGLOG(P2P, INFO,
 				"Free pending mgmt link[%u] cookie: 0x%llx\n",
 				ucIdx,
@@ -1105,6 +1117,7 @@ int glSetupP2P(struct GLUE_INFO *prGlueInfo, struct wireless_dev *prP2pWdev,
 	}
 
 	LINK_INITIALIZE(&prP2PInfo->rWaitTxDoneLink);
+	spin_lock_init(&prP2PInfo->rWaitTxDoneLinkLock);
 
 	if ((fgSkipRole == SKIP_ROLE_ALL) ||
 		((fgSkipRole == SKIP_ROLE_EXCEPT_MAIN) && u4Idx))

@@ -781,8 +781,16 @@ p2pFuncAddPendingMgmtLinkEntry(struct ADAPTER *prAdapter,
 	prPendingMgmtInfo->ucChannelNum =
 		prMgmtTxMsg->rChannelInfo.ucChannelNum;
 	prPendingMgmtInfo->fgIsOffChannel = prMgmtTxMsg->fgIsOffChannel;
-	LINK_INSERT_TAIL(&prGlueP2pInfo->rWaitTxDoneLink,
-		&prPendingMgmtInfo->rLinkEntry);
+	{
+		unsigned long u4Flags;
+
+		spin_lock_irqsave(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
+		LINK_INSERT_TAIL(&prGlueP2pInfo->rWaitTxDoneLink,
+			&prPendingMgmtInfo->rLinkEntry);
+		spin_unlock_irqrestore(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
+	}
 
 	DBGLOG(P2P, TRACE,
 		"Add pending mgmt TX cookie:0x%llx eBand:%d ucChannelNum:%u\n",
@@ -798,6 +806,8 @@ p2pFuncRemovePendingMgmtLinkEntry(struct ADAPTER *prAdapter,
 	struct P2P_ROLE_FSM_INFO *prP2pRoleFsmInfo = NULL;
 	struct P2P_PENDING_MGMT_INFO *prPendingMgmtInfo = NULL;
 	struct P2P_PENDING_MGMT_INFO *prPendingMgmtInfoNext = NULL;
+	struct P2P_PENDING_MGMT_INFO *prFound = NULL;
+	unsigned long u4Flags;
 
 	prP2pRoleFsmInfo = p2pFuncGetRoleByBssIdx(prAdapter,
 		ucBssIdx);
@@ -808,6 +818,7 @@ p2pFuncRemovePendingMgmtLinkEntry(struct ADAPTER *prAdapter,
 	else
 		prGlueP2pInfo = prAdapter->prGlueInfo->prP2PInfo[0];
 
+	spin_lock_irqsave(&prGlueP2pInfo->rWaitTxDoneLinkLock, u4Flags);
 	LINK_FOR_EACH_ENTRY_SAFE(prPendingMgmtInfo,
 		prPendingMgmtInfoNext, &prGlueP2pInfo->rWaitTxDoneLink,
 		rLinkEntry, struct P2P_PENDING_MGMT_INFO) {
@@ -816,13 +827,18 @@ p2pFuncRemovePendingMgmtLinkEntry(struct ADAPTER *prAdapter,
 			LINK_REMOVE_KNOWN_ENTRY(
 				&prGlueP2pInfo->rWaitTxDoneLink,
 				&prPendingMgmtInfo->rLinkEntry);
-			cnmMemFree(prAdapter,
-				prPendingMgmtInfo);
-			DBGLOG(P2P, TRACE,
-				"Remove pending mgmt TX cookie:0x%llx\n",
-				u8Cookie);
+			prFound = prPendingMgmtInfo;
 			break;
 		}
+	}
+	spin_unlock_irqrestore(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+		u4Flags);
+
+	if (prFound) {
+		cnmMemFree(prAdapter, prFound);
+		DBGLOG(P2P, TRACE,
+			"Remove pending mgmt TX cookie:0x%llx\n",
+			u8Cookie);
 	}
 }
 
@@ -855,12 +871,19 @@ p2pFuncIsPendingTxMgmtNeedWait(struct ADAPTER *prAdapter, uint8_t ucRoleIndex,
 		} else
 			return FALSE;
 
+		u_int8_t fgNeedWait = FALSE;
+		unsigned long u4Flags;
+
+		spin_lock_irqsave(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
 		LINK_FOR_EACH_ENTRY_SAFE(prPendingMgmtInfo,
 			prPendingMgmtInfoNext, &prGlueP2pInfo->rWaitTxDoneLink,
 			rLinkEntry, struct P2P_PENDING_MGMT_INFO) {
 			/* The non off ch TX frame is rely on RoC channel */
-			if (prPendingMgmtInfo->fgIsOffChannel == FALSE)
-				return TRUE;
+			if (prPendingMgmtInfo->fgIsOffChannel == FALSE) {
+				fgNeedWait = TRUE;
+				break;
+			}
 
 			/* The off ch TX frame is not enqueue if RoC on the
 			 * different channel. Only need wait the off ch TX
@@ -868,16 +891,31 @@ p2pFuncIsPendingTxMgmtNeedWait(struct ADAPTER *prAdapter, uint8_t ucRoleIndex,
 			 */
 			if (prPendingMgmtInfo->fgIsOffChannel &&
 				prPendingMgmtInfo->eBand == eBand &&
-				prPendingMgmtInfo->ucChannelNum == ucChannelNum)
-				return TRUE;
+				prPendingMgmtInfo->ucChannelNum == ucChannelNum) {
+				fgNeedWait = TRUE;
+				break;
+			}
 		}
+		spin_unlock_irqrestore(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
+		return fgNeedWait;
 	} else if (eP2pMgmtTxType == P2P_MGMT_OFF_CH_TX) {
+		u_int8_t fgNeedWait = FALSE;
+		unsigned long u4Flags;
+
+		spin_lock_irqsave(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
 		LINK_FOR_EACH_ENTRY_SAFE(prPendingMgmtInfo,
 			prPendingMgmtInfoNext, &prGlueP2pInfo->rWaitTxDoneLink,
 			rLinkEntry, struct P2P_PENDING_MGMT_INFO) {
-			if (prPendingMgmtInfo->fgIsOffChannel)
-				return TRUE;
+			if (prPendingMgmtInfo->fgIsOffChannel) {
+				fgNeedWait = TRUE;
+				break;
+			}
 		}
+		spin_unlock_irqrestore(&prGlueP2pInfo->rWaitTxDoneLinkLock,
+			u4Flags);
+		return fgNeedWait;
 	}
 	return FALSE;
 }
