@@ -5580,6 +5580,16 @@ p2pFuncParseBeaconContent(struct ADAPTER *prAdapter,
 					      prP2pBssInfo->u4PrivateData))
 				break;
 #endif
+			if (IE_SIZE(pucIE) >
+			    sizeof(prP2pSpecificBssInfo->aucRnrIeBuffer)) {
+				DBGLOG(P2P, WARN,
+					"RNR IE length %d exceeds %u\n",
+					IE_SIZE(pucIE),
+					(uint32_t)sizeof(prP2pSpecificBssInfo
+						->aucRnrIeBuffer));
+				prP2pSpecificBssInfo->u2RnrIeLen = 0;
+				break;
+			}
 			kalMemCopy(prP2pSpecificBssInfo->aucRnrIeBuffer,
 				   pucIE, IE_SIZE(pucIE));
 			prP2pSpecificBssInfo->u2RnrIeLen = IE_SIZE(pucIE);
