@@ -739,7 +739,8 @@ int osal_timer_stop_sync(P_OSAL_TIMER pTimer)
 int osal_timer_modify(P_OSAL_TIMER pTimer, unsigned int ms)
 {
 
-	mod_timer(&pTimer->timer, jiffies + (ms) / (1000 / HZ));
+	mod_timer(&pTimer->timer,
+		jiffies + max_t(unsigned long, msecs_to_jiffies(ms), 1));
 	return 0;
 }
 
