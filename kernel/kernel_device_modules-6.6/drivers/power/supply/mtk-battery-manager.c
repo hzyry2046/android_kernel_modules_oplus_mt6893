@@ -1937,6 +1937,10 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 		__func__, fgd_msg->cmd, fgd_msg->instance_id, fgd_msg->subcmd,
 		fgd_msg->data_len, fgd_msg->ret_data_len, bm->fgd_legacy);
 
+	/* ret_msg->data[] is only AFW_MSG_MAX_LEN; larger asks can't be filled. */
+	if (fgd_msg->ret_data_len > AFW_MSG_MAX_LEN)
+		fgd_msg->ret_data_len = AFW_MSG_MAX_LEN;
+
 	size = fgd_msg->ret_data_len + AFW_MSG_HEADER_LEN;
 
 	/*
@@ -1946,12 +1950,14 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 	 * ret_data_len=0 even for commands whose handler writes into
 	 * ret_msg->data (e.g. SET_DAEMON_PID stores a 4-byte ino at data[0]),
 	 * so a 32-byte reply buffer overflows and trips FORTIFY_SOURCE
-	 * (mtk_bm_netlink_handler fortify_panic).  For a legacy peer, floor the
-	 * allocation at a full afw_header (data[AFW_MSG_MAX_LEN]) so any
-	 * handler's write fits; the wire reply is still trimmed to data_len in
-	 * mtk_bm_send_to_user, so this does not enlarge what goes out.
+	 * (mtk_bm_netlink_handler fortify_panic).  A non-legacy peer can
+	 * under-declare ret_data_len the same way (SET_PID writes data[0..3]
+	 * unconditionally), so floor every peer's allocation at a full
+	 * afw_header (data[AFW_MSG_MAX_LEN]); the wire reply is still trimmed
+	 * to data_len in mtk_bm_send_to_user, so this does not enlarge what
+	 * goes out.
 	 */
-	if (bm->fgd_legacy && size < sizeof(struct afw_header))
+	if (size < sizeof(struct afw_header))
 		size = sizeof(struct afw_header);
 
 	if (size > (PAGE_SIZE << 1))
