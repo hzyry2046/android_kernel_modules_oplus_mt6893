@@ -1473,6 +1473,7 @@ static signed int connac2x_GetVol(unsigned char *pVol)
 		return ret;
 	}
 
+	*pVol = 0;
 	for (i = 0; i < 16; i++) {
 		if (connac2x_vol_tbl[i] == tmp) {
 			*pVol = i;
