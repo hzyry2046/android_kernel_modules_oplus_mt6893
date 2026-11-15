@@ -1048,6 +1048,7 @@ static inline int adopt_CAMERA_HW_FeatureControl(void *pBuf)
 	struct ACDK_SENSOR_FEATURECONTROL_STRUCT *pFeatureCtrl;
 	struct IMGSENSOR_SENSOR *psensor;
 	unsigned int FeatureParaLen = 0;
+	unsigned int ParaBufLen = 0;
 	void *pFeaturePara = NULL;
 	struct ACDK_KD_SENSOR_SYNC_STRUCT *pSensorSyncInfo = NULL;
 	signed int ret = 0;
@@ -1089,12 +1090,19 @@ static inline int adopt_CAMERA_HW_FeatureControl(void *pBuf)
 	}
 
 	if (FeatureParaLen != 0 && pFeatureCtrl->pFeaturePara != NULL) {
-		pFeaturePara = kmalloc(FeatureParaLen, GFP_KERNEL);
+		/*
+		 * Sensor feature handlers write fixed-size results into
+		 * pFeaturePara without consulting FeatureParaLen (the largest
+		 * fixed result here is under one page), so a tiny user-declared
+		 * length must not shrink the kernel buffer below a page.
+		 */
+		ParaBufLen = max_t(unsigned int, FeatureParaLen, PAGE_SIZE);
+		pFeaturePara = kmalloc(ParaBufLen, GFP_KERNEL);
 		if (pFeaturePara == NULL) {
 			PK_PR_ERR(" ioctl allocate mem failed\n");
 			return -ENOMEM;
 		}
-		memset(pFeaturePara, 0x0, FeatureParaLen);
+		memset(pFeaturePara, 0x0, ParaBufLen);
 
 		if (copy_from_user((void *)pFeaturePara,
 				   (void *)pFeatureCtrl->pFeaturePara,
@@ -2184,7 +2192,7 @@ static inline int adopt_CAMERA_HW_FeatureControl(void *pBuf)
 	    pFeatureCtrl->pFeaturePara != NULL &&
 	    copy_to_user((void __user *)pFeatureCtrl->pFeaturePara,
 			(void *)pFeaturePara,
-			 FeatureParaLen)) {
+			 min(FeatureParaLen, ParaBufLen))) {
 		kfree(pFeaturePara);
 		PK_DBG(
 		"[CAMERA_HW][pSensorRegData] ioctl copy to user failed\n");
