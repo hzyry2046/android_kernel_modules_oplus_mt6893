@@ -2113,7 +2113,7 @@ TdlsDataFrameSend_DISCOVERY_RSP(struct ADAPTER *prAdapter,
 
 	/* make up frame content */
 	prMsduInfoMgmt = (struct MSDU_INFO *) cnmMgtPktAlloc(prAdapter,
-					PUBLIC_ACTION_MAX_LEN);
+					PUBLIC_ACTION_MAX_LEN + AppendIeLen);
 	if (prMsduInfoMgmt == NULL)
 		return TDLS_STATUS_RESOURCES;
 
