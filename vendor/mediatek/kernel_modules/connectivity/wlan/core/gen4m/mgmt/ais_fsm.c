@@ -9347,6 +9347,18 @@ uint32_t aisCollectNeighborAP(struct ADAPTER *prAdapter, uint8_t *pucApBuf,
 						  IE_SIZE(prIe))) {
 		uint8_t fgIsMld = FALSE;
 
+		/* the element must hold its fixed fields and fit in the
+		 * remaining buffer before any of them are read
+		 */
+		if (c2BufLen < IE_SIZE(prIe) ||
+		    IE_SIZE(prIe) < OFFSET_OF(struct IE_NEIGHBOR_REPORT,
+					      aucSubElem)) {
+			DBGLOG(AIS, WARN,
+			       "Bad neighbor report element len %u (left %d)\n",
+			       IE_LEN(prIe), c2BufLen);
+			break;
+		}
+
 		/* BIT0-1: AP reachable, BIT2: same security with current
 		 ** setting,
 		 ** BIT3: same authenticator with current AP
