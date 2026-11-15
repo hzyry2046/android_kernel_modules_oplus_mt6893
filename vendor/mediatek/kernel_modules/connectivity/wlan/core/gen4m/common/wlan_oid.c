@@ -2541,9 +2541,6 @@ wlanSetAddKeyImpl(struct ADAPTER *prAdapter, void *pvSetBuffer,
 					prNewKey->u4KeyLength);
 				DBGLOG_MEM8(RSN, INFO,
 					prAisSpecBssInfo->aucIPN, 6);
-				DBGLOG_MEM8(RSN, INFO,
-					prAisSpecBssInfo->aucIGTK,
-					prCmdKey->ucKeyLen);
 			}
 #endif
 			if (prCmdKey->ucAlgorithmId == CIPHER_SUITE_TKIP) {
