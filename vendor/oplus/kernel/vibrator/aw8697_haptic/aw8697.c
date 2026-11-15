@@ -10519,12 +10519,12 @@ static ssize_t aw8697_i2c_ram_show(struct device *dev, struct device_attribute *
 
     aw8697_i2c_write(aw8697, AW8697_REG_RAMADDRH, (unsigned char)(aw8697->ram.base_addr>>8));
     aw8697_i2c_write(aw8697, AW8697_REG_RAMADDRL, (unsigned char)(aw8697->ram.base_addr&0x00ff));
-    len += snprintf(buf+len, PAGE_SIZE-len, "aw8697_haptic_ram:\n");
-    for(i=0; i<aw8697->ram.len; i++) {
+    len += scnprintf(buf+len, PAGE_SIZE-len, "aw8697_haptic_ram:\n");
+    for(i=0; i<aw8697->ram.len && len < PAGE_SIZE; i++) {
         aw8697_i2c_read(aw8697, AW8697_REG_RAMDATA, &reg_val);
-        len += snprintf(buf+len, PAGE_SIZE-len, "0x%02x,", reg_val);
+        len += scnprintf(buf+len, PAGE_SIZE-len, "0x%02x,", reg_val);
     }
-    len += snprintf(buf+len, PAGE_SIZE-len, "\n");
+    len += scnprintf(buf+len, PAGE_SIZE-len, "\n");
     /* RAMINIT Disable */
     aw8697_i2c_write_bits(aw8697, AW8697_REG_SYSCTRL,
             AW8697_BIT_SYSCTRL_RAMINIT_MASK, AW8697_BIT_SYSCTRL_RAMINIT_OFF);
