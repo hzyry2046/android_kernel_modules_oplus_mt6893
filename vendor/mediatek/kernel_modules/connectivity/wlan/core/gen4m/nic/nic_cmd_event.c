@@ -6902,6 +6902,7 @@ void nicEventHandleFwDropSSN(struct ADAPTER *prAdapter,
 			prSwRfb->ucStaRecIdx, prSSN->ucWlanIdx,
 			prSSN->ucTid, prSSN->u2SSN,
 			prSSN->ucAmsduFormat);
+		nicRxReturnRFB(prAdapter, prSwRfb);
 		return;
 	}
 
