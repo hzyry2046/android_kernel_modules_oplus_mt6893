@@ -10381,6 +10381,13 @@ uint32_t rlmRegTxPwrLimitUpdate(
 		return WLAN_STATUS_NOT_SUPPORTED;
 #endif
 
+	/* a country IE shorter than the 3-byte country string has no
+	 * subbands; without this the u8 subtraction wraps and the loop
+	 * below walks off the element.
+	 */
+	if (prCountryIE->ucLength < 3)
+		return WLAN_STATUS_INVALID_DATA;
+
 	ucRemainLen = prCountryIE->ucLength - 3;
 	prSubBand = &prCountryIE->arCountryStr[0];
 	ucChnlOfst = (eHwBand == BAND_2G4) ? CHNL_SPAN_5 : CHNL_SPAN_20;
