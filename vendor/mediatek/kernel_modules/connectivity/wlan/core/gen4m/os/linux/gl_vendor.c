@@ -5555,7 +5555,7 @@ int mtk_cfg80211_vendor_get_usable_channel(
 	uint32_t max_size = 0;
 	uint32_t rStatus = WLAN_STATUS_SUCCESS;
 	struct nlattr *tb[WIFI_ATTRIBUTE_USABLE_CHANNEL_MAX + 1] = {};
-	struct RF_CHANNEL_INFO *aucChannelList;
+	struct RF_CHANNEL_INFO *aucChannelList = NULL;
 	uint8_t i, usable_channel_nums;
 	uint32_t u4channel_freq;
 	uint8_t ucNumOfChannel = 0;
@@ -5814,8 +5814,13 @@ int mtk_cfg80211_vendor_get_usable_channel(
 	kalMemFree(pr_channel_array,
 		sizeof(struct ANDROID_USABLE_CHANNEL_ARRAY),
 		VIR_MEM_TYPE);
+	kalMemFree(aucChannelList, VIR_MEM_TYPE,
+		sizeof(struct RF_CHANNEL_INFO) * MAX_CHN_NUM);
 	return cfg80211_vendor_cmd_reply(skb);
 end:
+	if (aucChannelList)
+		kalMemFree(aucChannelList, VIR_MEM_TYPE,
+			sizeof(struct RF_CHANNEL_INFO) * MAX_CHN_NUM);
 	if (pr_channel_array)
 		kalMemFree(pr_channel_array,
 			sizeof(struct ANDROID_USABLE_CHANNEL_ARRAY),
