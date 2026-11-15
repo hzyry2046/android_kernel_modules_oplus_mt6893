@@ -8340,6 +8340,11 @@ static ssize_t aw8697_seq_store(struct device *dev,
     unsigned int databuf[2] = {0, 0};
 
     if(2 == sscanf(buf, "%x %x", &databuf[0], &databuf[1])) {
+        if (databuf[0] >= AW8697_SEQUENCER_SIZE) {
+            pr_err("%s: seq index %u over max %d\n", __FUNCTION__,
+                    databuf[0], AW8697_SEQUENCER_SIZE);
+            return -EINVAL;
+        }
         pr_err("%s: seq%d=0x%x\n", __FUNCTION__, databuf[0], databuf[1]);
         mutex_lock(&aw8697->lock);
         aw8697->seq[databuf[0]] = (unsigned char)databuf[1];
@@ -8394,6 +8399,11 @@ static ssize_t aw8697_loop_store(struct device *dev,
     int rc = 0;
     aw8697->rtp_loop = 0;
     if(2 == sscanf(buf, "%x %x", &databuf[0], &databuf[1])) {
+        if (databuf[0] >= AW8697_SEQUENCER_SIZE) {
+            pr_err("%s: loop index %u over max %d\n", __FUNCTION__,
+                    databuf[0], AW8697_SEQUENCER_SIZE);
+            return -EINVAL;
+        }
         pr_err("%s: seq%d loop=0x%x\n", __FUNCTION__, databuf[0], databuf[1]);
         mutex_lock(&aw8697->lock);
         aw8697->loop[databuf[0]] = (unsigned char)databuf[1];
