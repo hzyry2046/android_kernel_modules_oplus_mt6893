@@ -2204,6 +2204,15 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy,
 		    settings->fils_discovery.tmpl_len) {
 			struct MSG_P2P_FILS_DISCOVERY_UPDATE *prFilsDiscovery;
 
+			if (settings->fils_discovery.tmpl_len > MAX_IE_LENGTH) {
+				DBGLOG(P2P, ERROR,
+					"fils tmpl_len %zu over %d\n",
+					settings->fils_discovery.tmpl_len,
+					MAX_IE_LENGTH);
+				i4Rslt = -EINVAL;
+				goto err;
+			}
+
 			u4MsgLen = settings->fils_discovery.tmpl_len;
 			prFilsDiscovery = &prP2pStartAPMsg->rFilsDiscovery;
 			prFilsDiscovery->u4MinInterval =
@@ -2234,6 +2243,13 @@ int mtk_p2p_cfg80211_start_ap(struct wiphy *wiphy,
 		if (presp->interval && presp->tmpl_len) {
 			struct MSG_P2P_UNSOL_PROBE_UPDATE *prUnsolProbe;
 
+			if (presp->tmpl_len > MAX_IE_LENGTH) {
+				DBGLOG(P2P, ERROR,
+					"unsol probe tmpl_len %zu over %d\n",
+					presp->tmpl_len, MAX_IE_LENGTH);
+				i4Rslt = -EINVAL;
+				goto err;
+			}
 			u4MsgLen = presp->tmpl_len;
 			prUnsolProbe = &prP2pStartAPMsg->rUnsolProbe;
 			prUnsolProbe->u4Interval = presp->interval;
