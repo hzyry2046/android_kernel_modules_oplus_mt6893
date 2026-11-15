@@ -3772,6 +3772,15 @@ int mtk_p2p_cfg80211_connect(struct wiphy *wiphy,
 		if (mtk_Netdev_To_RoleIdx(prGlueInfo, dev, &ucRoleIdx) < 0)
 			break;
 
+		/* the join path stores these IEs in a MAX_IE_LENGTH buffer */
+		if (sme->ie_len > MAX_IE_LENGTH) {
+			DBGLOG(P2P, ERROR,
+				"assoc req ie_len %zu over %d\n",
+				sme->ie_len, MAX_IE_LENGTH);
+			i4Rslt = -EINVAL;
+			break;
+		}
+
 		prConnReqMsg =
 		    (struct MSG_P2P_CONNECTION_REQUEST *)
 		    cnmMemAlloc(prGlueInfo->prAdapter,
