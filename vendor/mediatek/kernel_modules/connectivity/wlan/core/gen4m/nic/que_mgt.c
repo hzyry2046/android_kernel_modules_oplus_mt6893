@@ -4460,6 +4460,16 @@ void qmProcessBarFrame(struct ADAPTER *prAdapter,
 	DBGLOG(QM, TRACE, "BAR: STA[%u] TID[%u] SSN[%u]\n",
 		prSwRfb->ucStaRecIdx, prSwRfb->ucTid, prSwRfb->u2SSN);
 
+	/* the BAR TID field is 4 bits but the reorder table only
+	 * holds CFG_RX_MAX_BA_TID_NUM entries
+	 */
+	if (prSwRfb->ucTid >= CFG_RX_MAX_BA_TID_NUM) {
+		DBGLOG(QM, WARN,
+			"QM: (Warning) BAR with out-of-range TID %u\n",
+			prSwRfb->ucTid);
+		return;
+	}
+
 	qmHandleRxReorderWinShift(prAdapter, prSwRfb->ucStaRecIdx,
 		prSwRfb->ucTid, prSwRfb->u2SSN, prReturnedQue);
 }
