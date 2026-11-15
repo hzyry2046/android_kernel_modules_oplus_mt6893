@@ -202,12 +202,12 @@ int consys_hw_pwr_off(unsigned int curr_status, unsigned int off_radio)
 		pr_info("[%s] Part 0: only subsys (%d) off (curr_status=0x%x, next_status = 0x%x)\n",
 			__func__, off_radio, curr_status, next_status);
 		ret = _consys_hw_conninfra_wakeup();
-		if (consys_hw_ops->consys_plt_subsys_status_update)
+		if (ret == 0 && consys_hw_ops->consys_plt_subsys_status_update)
 			consys_hw_ops->consys_plt_subsys_status_update(false, off_radio);
 		_consys_hw_raise_voltage(off_radio, false, true);
-		if (consys_hw_ops->consys_plt_spi_master_cfg)
+		if (ret == 0 && consys_hw_ops->consys_plt_spi_master_cfg)
 			consys_hw_ops->consys_plt_spi_master_cfg(curr_status, next_status);
-		if (consys_hw_ops->consys_plt_low_power_setting)
+		if (ret == 0 && consys_hw_ops->consys_plt_low_power_setting)
 			consys_hw_ops->consys_plt_low_power_setting(curr_status, next_status);
 		if (ret == 0)
 			_consys_hw_conninfra_sleep();
