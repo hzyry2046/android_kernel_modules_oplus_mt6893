@@ -1953,7 +1953,7 @@ static int sensor_feature_read_func(struct seq_file *s, void *v)
 
 static ssize_t sensor_feature_write(struct file *filp, const char *ubuf, size_t cnt, loff_t *data)
 {
-	char buf[64];
+	char buf[64] = {0};
 	void *buf_str = buf;
 	long val = 0;
 	int ret = 0;
