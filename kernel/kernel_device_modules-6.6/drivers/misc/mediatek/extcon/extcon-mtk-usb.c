@@ -294,14 +294,20 @@ static int mtk_usb_extcon_set_vbus_charger(struct mtk_extcon_info *extcon,
 	}
 
 	/* Resolve at runtime; see the note on the declaration above for why
-	 * this must not be a direct call. */
+	 * this must not be a direct call.  A missing pump is the normal case
+	 * on this device, so it only contributes an error when the boost
+	 * path itself succeeded. */
 	otg_en = symbol_request(op6893_otg_boost_enable);
 	if (otg_en) {
-		ret = otg_en(is_on);
+		int pump_ret = otg_en(is_on);
+
 		symbol_put(op6893_otg_boost_enable);
+		if (ret >= 0)
+			ret = pump_ret;
 	}
 
-	extcon->vbus_on = is_on;
+	if (ret >= 0)
+		extcon->vbus_on = is_on;
 	return ret;
 }
 
