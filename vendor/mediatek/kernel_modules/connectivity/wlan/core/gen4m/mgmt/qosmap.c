@@ -294,6 +294,7 @@ void qosParseQosMapSet(struct ADAPTER *prAdapter, struct STA_RECORD *prStaRec,
 	const uint8_t *dscp_exception = qosMapSet + 2;
 	const uint8_t *dscp_range = qosMapSet + 2 + IE_LEN(qosMapSet)
 				- WMM_UP_INDEX_NUM * 2;
+	const uint8_t *p;
 	uint8_t ie_len;
 
 	if (IE_ID(qosMapSet) != ELEM_ID_QOS_MAP_SET) {
@@ -307,6 +308,18 @@ void qosParseQosMapSet(struct ADAPTER *prAdapter, struct STA_RECORD *prStaRec,
 		DBGLOG(INIT, WARN,
 			"Error in QosMapSet IE len: %d\n", IE_LEN(qosMapSet));
 		return;
+	}
+
+	/* a DSCP exception UP has to be 0..7; anything larger becomes an
+	 * out-of-range index when the map is used to pick a queue
+	 */
+	for (p = dscp_exception; p < dscp_range; p += 2) {
+		if (p[1] >= WMM_UP_INDEX_NUM) {
+			DBGLOG(INIT, WARN,
+				"QosMapSet DSCP exception UP %d over %d\n",
+				p[1], WMM_UP_INDEX_NUM);
+			return;
+		}
 	}
 
 	qosBuildQosMapTable(prStaRec, dscp_exception, dscp_range);
