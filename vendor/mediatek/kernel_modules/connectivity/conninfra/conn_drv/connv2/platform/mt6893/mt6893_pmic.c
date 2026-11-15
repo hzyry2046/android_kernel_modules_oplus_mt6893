@@ -192,7 +192,10 @@ int consys_plt_pmic_get_from_dts(struct platform_device *pdev, struct conninfra_
 	g_dev_cb = dev_cb;
 //#if CONSYS_PMIC_CTRL_ENABLE
 	reg_VCN13 = devm_regulator_get_optional(&pdev->dev, "vcn13");
-	if (!reg_VCN13)
+	if (IS_ERR(reg_VCN13)) {
+		pr_err("Regulator_get VCN_13 fail\n");
+		reg_VCN13 = NULL;
+	} else if (!reg_VCN13)
 		pr_err("Regulator_get VCN_13 fail\n");
 	else {
 		vcn13_nb.notifier_call = consys_vcn13_oc_notify;
@@ -221,16 +224,28 @@ int consys_plt_pmic_get_from_dts(struct platform_device *pdev, struct conninfra_
 #endif
 	}
 	reg_VCN18 = regulator_get(&pdev->dev, "vcn18");
-	if (!reg_VCN18)
+	if (IS_ERR(reg_VCN18)) {
+		pr_err("Regulator_get VCN_18 fail\n");
+		reg_VCN18 = NULL;
+	} else if (!reg_VCN18)
 		pr_err("Regulator_get VCN_18 fail\n");
 	reg_VCN33_1_BT = regulator_get(&pdev->dev, "vcn33_1_bt");
-	if (!reg_VCN33_1_BT)
+	if (IS_ERR(reg_VCN33_1_BT)) {
+		pr_err("Regulator_get VCN33_1_BT fail\n");
+		reg_VCN33_1_BT = NULL;
+	} else if (!reg_VCN33_1_BT)
 		pr_err("Regulator_get VCN33_1_BT fail\n");
 	reg_VCN33_1_WIFI = regulator_get(&pdev->dev, "vcn33_1_wifi");
-	if (!reg_VCN33_1_WIFI)
+	if (IS_ERR(reg_VCN33_1_WIFI)) {
+		pr_err("Regulator_get VCN33_1_WIFI fail\n");
+		reg_VCN33_1_WIFI = NULL;
+	} else if (!reg_VCN33_1_WIFI)
 		pr_err("Regulator_get VCN33_1_WIFI fail\n");
 	reg_VCN33_2_WIFI = regulator_get(&pdev->dev, "vcn33_2_wifi");
-	if (!reg_VCN33_2_WIFI)
+	if (IS_ERR(reg_VCN33_2_WIFI)) {
+		pr_err("Regulator_get VCN33_WIFI fail\n");
+		reg_VCN33_2_WIFI = NULL;
+	} else if (!reg_VCN33_2_WIFI)
 		pr_err("Regulator_get VCN33_WIFI fail\n");
 //#endif
 	g_voltage_change_timer.timeoutHandler = consys_plt_pmic_raise_voltage_timer_handler;
@@ -262,7 +277,8 @@ int consys_pmic_vcn33_1_power_ctl(bool enable, struct regulator *reg_VCN33_1)
 			/* SW_LP =0 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN33_1_LP, 0);
 #endif
-			regulator_set_voltage(reg_VCN33_1, 3300000, 3300000);
+			if (reg_VCN33_1)
+				regulator_set_voltage(reg_VCN33_1, 3300000, 3300000);
 			/* SW_EN=0 */
 			/* For RC mode, we don't have to control VCN33_1 & VCN33_2 */
 		#if 0
@@ -284,17 +300,21 @@ int consys_pmic_vcn33_1_power_ctl(bool enable, struct regulator *reg_VCN33_1)
 			/* SW_LP =0 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN33_1_LP, 0);
 #endif
-			regulator_set_voltage(reg_VCN33_1, 3300000, 3300000);
+			if (reg_VCN33_1)
+				regulator_set_voltage(reg_VCN33_1, 3300000, 3300000);
 			/* SW_EN=1 */
-			ret = regulator_enable(reg_VCN33_1);
-			if (ret)
-				pr_err("Enable VCN33_1 fail. ret=%d\n", ret);
+			if (reg_VCN33_1) {
+				ret = regulator_enable(reg_VCN33_1);
+				if (ret)
+					pr_err("Enable VCN33_1 fail. ret=%d\n", ret);
+			}
 		}
 	} else {
 		if (consys_is_rc_mode_enable_mt6893()) {
 			/* Do nothing */
 		} else {
-			regulator_disable(reg_VCN33_1);
+			if (reg_VCN33_1)
+				regulator_disable(reg_VCN33_1);
 		}
 	}
 	return 0;
@@ -322,11 +342,13 @@ int consys_pmic_vcn33_2_power_ctl(bool enable)
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN33_2_LP, 0);
 #endif
 
-			regulator_set_voltage(reg_VCN33_2_WIFI, 3300000, 3300000);
+			if (reg_VCN33_2_WIFI)
+				regulator_set_voltage(reg_VCN33_2_WIFI, 3300000, 3300000);
 			/* SW_EN=0 */
 			/* For RC mode, we don't have to control VCN33_1 & VCN33_2 */
 		#if 0
-			regulator_disable(reg_VCN33_2_WIFI);
+			if (reg_VCN33_2_WIFI)
+				regulator_disable(reg_VCN33_2_WIFI);
 		#endif
 		} else  {
 
@@ -345,17 +367,21 @@ int consys_pmic_vcn33_2_power_ctl(bool enable)
 			/* SW_LP =0 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN33_2_LP, 0);
 #endif
-			regulator_set_voltage(reg_VCN33_2_WIFI, 3300000, 3300000);
+			if (reg_VCN33_2_WIFI)
+				regulator_set_voltage(reg_VCN33_2_WIFI, 3300000, 3300000);
 			/* SW_EN=1 */
-			ret = regulator_enable(reg_VCN33_2_WIFI);
-			if (ret)
-				pr_err("Enable VCN33_2 fail. ret=%d\n", ret);
+			if (reg_VCN33_2_WIFI) {
+				ret = regulator_enable(reg_VCN33_2_WIFI);
+				if (ret)
+					pr_err("Enable VCN33_2 fail. ret=%d\n", ret);
+			}
 		}
 	} else {
 		if (consys_is_rc_mode_enable_mt6893()) {
 			/* Do nothing */
 		} else {
-			regulator_disable(reg_VCN33_2_WIFI);
+			if (reg_VCN33_2_WIFI)
+				regulator_disable(reg_VCN33_2_WIFI);
 		}
 	}
 	return 0;
@@ -395,10 +421,13 @@ int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_sta
 			/* SW_LP =1 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN18_LP, 1);
 #endif
-			regulator_set_voltage(reg_VCN18, 1800000, 1800000);
-			ret = regulator_enable(reg_VCN18);
-			if (ret)
-				pr_err("Enable VCN18 fail. ret=%d\n", ret);
+			if (reg_VCN18)
+				regulator_set_voltage(reg_VCN18, 1800000, 1800000);
+			if (reg_VCN18) {
+				ret = regulator_enable(reg_VCN18);
+				if (ret)
+					pr_err("Enable VCN18 fail. ret=%d\n", ret);
+			}
 
 			/* VCN13 */
 #if COMMON_KERNEL_PMIC_SUPPORT
@@ -425,10 +454,13 @@ int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_sta
 			/* SW_LP =1 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN13_LP, 1);
 #endif
-			regulator_set_voltage(reg_VCN13, 1300000, 1300000);
-			ret = regulator_enable(reg_VCN13);
-			if (ret)
-				pr_err("Enable VCN13 fail. ret=%d\n", ret);
+			if (reg_VCN13)
+				regulator_set_voltage(reg_VCN13, 1300000, 1300000);
+			if (reg_VCN13) {
+				ret = regulator_enable(reg_VCN13);
+				if (ret)
+					pr_err("Enable VCN13 fail. ret=%d\n", ret);
+			}
 
 		} else {
 			/* Legacy mode */
@@ -447,11 +479,14 @@ int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_sta
 			/* SW_LP=0 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN18_LP, 0);
 #endif
-			regulator_set_voltage(reg_VCN18, 1800000, 1800000);
+			if (reg_VCN18)
+				regulator_set_voltage(reg_VCN18, 1800000, 1800000);
 			/* SW_EN=1 */
-			ret = regulator_enable(reg_VCN18);
-			if (ret)
-				pr_err("Enable VCN18 fail. ret=%d\n", ret);
+			if (reg_VCN18) {
+				ret = regulator_enable(reg_VCN18);
+				if (ret)
+					pr_err("Enable VCN18 fail. ret=%d\n", ret);
+			}
 
 #if COMMON_KERNEL_PMIC_SUPPORT
 			/* HW_OP_EN = 1, HW_OP_CFG = 1 */
@@ -468,17 +503,22 @@ int consys_plt_pmic_common_power_ctrl(unsigned int enable, unsigned int curr_sta
 			/* SW_LP=0 */
 			KERNEL_pmic_set_register_value(PMIC_RG_LDO_VCN13_LP, 0);
 #endif
-			regulator_set_voltage(reg_VCN13, 1300000, 1300000);
+			if (reg_VCN13)
+				regulator_set_voltage(reg_VCN13, 1300000, 1300000);
 			/* SW_EN=1 */
-			ret = regulator_enable(reg_VCN13);
-			if (ret)
-				pr_err("Enable VCN13 fail. ret=%d\n", ret);
+			if (reg_VCN13) {
+				ret = regulator_enable(reg_VCN13);
+				if (ret)
+					pr_err("Enable VCN13 fail. ret=%d\n", ret);
+			}
 		}
 	} else {
 		if (next_status != 0)
 			return 0;
-		regulator_disable(reg_VCN13);
-		regulator_disable(reg_VCN18);
+		if (reg_VCN13)
+			regulator_disable(reg_VCN13);
+		if (reg_VCN18)
+			regulator_disable(reg_VCN18);
 	}
 	return 0;
 }
