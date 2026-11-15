@@ -2013,14 +2013,12 @@ static ssize_t sensor_feature_write(struct file *filp, const char *ubuf, size_t 
 				msleep(100);
 				sensor_read_oplus_custom(g_cali_data);
 			}
-			for (index = 0; index < 12; index++) {
+			for (index = 0; index < 6; index++) {
 				cfg_data[index] = g_cali_data->cct_cali_data[index];
 			}
-			DEVINFO_LOG("cct_cali_data [%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+			DEVINFO_LOG("cct_cali_data [%d,%d,%d,%d,%d,%d]\n",
 				cfg_data[0], cfg_data[1], cfg_data[2],
-				cfg_data[3], cfg_data[4], cfg_data[5],
-				cfg_data[6], cfg_data[7], cfg_data[8],
-				cfg_data[9], cfg_data[10], cfg_data[11]);
+				cfg_data[3], cfg_data[4], cfg_data[5]);
 			ret = oplus_sensor_cfg_to_hub(ID_CCT, (uint8_t *)cfg_data, sizeof(cfg_data));
 			if (ret < 0) {
 				DEVINFO_LOG("send cct config fail\n");
