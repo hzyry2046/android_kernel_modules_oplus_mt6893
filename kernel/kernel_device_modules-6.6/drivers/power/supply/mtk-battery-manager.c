@@ -1871,6 +1871,9 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 		return;
 
 	nlh = (struct nlmsghdr *)skb->data;
+	if (!nlmsg_ok(nlh, skb->len) ||
+	    nlmsg_len(nlh) < AFW_MSG_HEADER_LEN - 4)
+		return;
 	seq = nlh->nlmsg_seq;
 
 	data = NLMSG_DATA(nlh);
@@ -1893,7 +1896,8 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 	 * -4 shift on the reply lives in mtk_bm_send_to_user, gated by the
 	 * same bm->fgd_legacy flag set here.  (kprobe-confirmed 2026-09-21.)
 	 */
-	if (fgd_msg->identity != AFW_MAGIC) {
+	if (nlmsg_len(nlh) < AFW_MSG_HEADER_LEN ||
+	    fgd_msg->identity != AFW_MAGIC) {
 		u32 *w = data;
 		int plen = nlmsg_len(nlh);
 		const int legacy_hdr = AFW_MSG_HEADER_LEN - 4; /* 28 */
@@ -1922,7 +1926,8 @@ void mtk_bm_netlink_handler(struct sk_buff *skb)
 			data = xlat;
 		} else {
 			pr_err("[%s]not correct MTKFG netlink packet!%d\n",
-				__func__, fgd_msg->identity);
+				__func__,
+				plen >= AFW_MSG_HEADER_LEN ? fgd_msg->identity : 0);
 			return;
 		}
 	}
