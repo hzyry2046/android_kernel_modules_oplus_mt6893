@@ -956,6 +956,11 @@ static void imx682_set_lsc_reg_setting(
 
 	LOG_DEBUG("E! index:%d, regNum:%d\n", index, regNum);
 
+	if (index >= ARRAY_SIZE(startAddr)) {
+		LOG_DEBUG("E! invalid index:%d\n", index);
+		return;
+	}
+
 	write_cmos_sensor_8(0x0B00, 0x01); /*lsc enable*/
 	write_cmos_sensor_8(0x9014, 0x01);
 	write_cmos_sensor_8(0x4439, 0x01);
